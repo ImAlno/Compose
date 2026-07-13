@@ -12,7 +12,7 @@ from .models.compatible import openai_compatible
 from .runs import Budget, Run
 from .tools import tool
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 __all__ = [
     "Budget",

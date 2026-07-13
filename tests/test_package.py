@@ -3,7 +3,7 @@ from composeai.models.compatible import OpenAICompatibleModel
 
 
 def test_version():
-    assert composeai.__version__ == "0.1.0"
+    assert composeai.__version__ == "0.1.1"
 
 
 def test_openai_compatible_is_exported():
