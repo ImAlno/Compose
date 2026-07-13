@@ -263,6 +263,13 @@ The contracts composeai holds you to — and the ones it holds itself to:
 | **Durability & HITL** | Separate checkpointer/orchestrator machinery | Journaled `@flow` + named interrupts, one `resume()` |
 | **Dependencies** | Heavy transitive footprint | pydantic + stdlib; provider SDKs as optional extras |
 
+## Releasing (maintainers)
+
+Two equivalent paths:
+
+- **Local**: put a project-scoped PyPI token in `.env` (git-ignored; see the placeholder), commit your work, then `scripts/release.sh X.Y.Z` — it bumps the version, runs the full gate, builds, and uploads. Commit the bump and tag `vX.Y.Z` afterwards.
+- **GitHub**: publish a GitHub Release and `.github/workflows/release.yml` tests, builds, and publishes via PyPI trusted publishing (no stored token). One-time setup: add this repo as a trusted publisher on pypi.org (workflow `release.yml`, environment `pypi`).
+
 ## Roadmap
 
 - OpenTelemetry exporter (the span model already tracks `gen_ai.*` attribute conventions)
