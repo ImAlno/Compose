@@ -735,3 +735,20 @@ def test_run_messages_include_tool_call_and_tool_result_parts():
     all_parts = [part for msg in run.messages for part in msg.parts]
     assert any(isinstance(p, ToolCallPart) for p in all_parts)
     assert any(isinstance(p, ToolResultPart) for p in all_parts)
+
+
+def test_prompt_helper_is_a_typed_noop():
+    """compose.prompt() returns its argument unchanged and satisfies type checkers."""
+    import composeai as compose
+    from composeai.messages import Message
+
+    assert compose.prompt("hello") == "hello"
+    msgs = [Message.user("hi")]
+    assert compose.prompt(msgs) is msgs
+
+    @compose.agent(model=FakeModel(script=[{"json": {"result": ["a", "b"]}}]))
+    def lister(topic: str) -> list[str]:
+        """List things."""
+        return compose.prompt(f"List: {topic}")
+
+    assert lister("x") == ["a", "b"]

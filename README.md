@@ -53,13 +53,13 @@ def count_words(text: str) -> int:
 @compose.agent(model="anthropic/claude-sonnet-5", tools=[count_words])
 def researcher(topic: str) -> FactSheet:
     """You are a meticulous researcher. Extract crisp, verifiable facts."""
-    return f"Build a fact sheet about: {topic}"
+    return compose.prompt(f"Build a fact sheet about: {topic}")
 
 
 facts = researcher("quantum computing")   # -> FactSheet (or raises)
 ```
 
-The decorated function *is* the agent: docstring → system prompt, body → user prompt (or a full `list[Message]` conversation), return annotation → structured output schema, validated back into the type. Tools run in a loop until the model produces the final answer.
+The decorated function *is* the agent: docstring → system prompt, body → user prompt (or a full `list[Message]` conversation), return annotation → structured output schema, validated back into the type. `compose.prompt(...)` marks the body's return value as the prompt — it's a typed no-op that keeps static type checkers happy about the body returning a prompt where the annotation declares the output type (a bare `str` works identically at runtime). Tools run in a loop until the model produces the final answer.
 
 Need more than the output? `.run()` returns the whole `Run`:
 
@@ -218,7 +218,7 @@ model = FakeModel([
 @compose.agent(model=model, tools=[count_words])
 def researcher(topic: str) -> FactSheet:
     """You are a meticulous researcher."""
-    return f"Build a fact sheet about: {topic}"
+    return compose.prompt(f"Build a fact sheet about: {topic}")
 ```
 
 Plain strings script text turns; `.stream()` synthesizes word-level deltas from the same script. Every request the agent made is recorded in `model.requests` for assertions.

@@ -4,7 +4,7 @@ Typed agent functions, pipe/aggregate/map composition with build-time type
 checks, always-on local tracing, and durable, resumable flows.
 """
 
-from .agentfn import agent
+from .agentfn import agent, prompt
 from .combinators import aggregate, map, pipe
 from .flow import flow, resume, task
 from .hitl import Interrupt, approve, ask_human
@@ -12,7 +12,7 @@ from .models.compatible import openai_compatible
 from .runs import Budget, Run
 from .tools import tool
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"
 
 __all__ = [
     "Budget",
@@ -26,6 +26,7 @@ __all__ = [
     "map",
     "openai_compatible",
     "pipe",
+    "prompt",
     "resume",
     "task",
     "tool",

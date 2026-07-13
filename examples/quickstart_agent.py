@@ -55,7 +55,9 @@ def pick_model():
 def researcher(topic: str) -> FactSheet:
     """You are a meticulous researcher. Extract crisp, verifiable facts.
     Use the count_words tool to report how long your fact list is."""
-    return f"Build a fact sheet about: {topic}"
+    # compose.prompt() marks this as the USER PROMPT (the annotation above
+    # declares the agent's output type) -- it keeps type checkers happy.
+    return compose.prompt(f"Build a fact sheet about: {topic}")
 
 
 if __name__ == "__main__":

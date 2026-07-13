@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "composeai"
-version = "0.1.0.dev0"
+version = "0.1.0"
 description = "Radically simple, functional framework for multi-agent AI workflows — typed agent functions, pipe composition, always-on local tracing, durable flows."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -31,7 +31,7 @@ target-version = "py310"
 select = ["E", "F", "I", "UP", "B"]
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "examples"]
 typeCheckingMode = "standard"
 venvPath = "."
 venv = ".venv"

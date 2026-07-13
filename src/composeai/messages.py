@@ -193,6 +193,10 @@ class StopReason(str, enum.Enum):
 # never encoding a `Usage` before it needs to decode one) reads `spans.
 # usage_json` back via `from_jsonable` -- the same "decode before any
 # encode in this process" gap, just hit by a new caller.
-for _cls in (TextPart, ImagePart, ToolCallPart, ToolResultPart, ThinkingPart, Message, Usage):
-    register_serializable(_cls)
-del _cls
+register_serializable(TextPart)
+register_serializable(ImagePart)
+register_serializable(ToolCallPart)
+register_serializable(ToolResultPart)
+register_serializable(ThinkingPart)
+register_serializable(Message)
+register_serializable(Usage)

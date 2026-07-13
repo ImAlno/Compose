@@ -131,6 +131,28 @@ class AgentFunction:
         return _stream_agent(self, args, kwargs, budget=budget)
 
 
+def prompt(text_or_messages: str | Sequence[Message]) -> Any:
+    """Mark a value as the user prompt an ``@agent`` body is returning.
+
+    An ``@agent`` function's return *annotation* declares the agent's output
+    type (e.g. ``-> FactSheet``) while its *body* returns the user prompt --
+    a ``str`` (or a full ``list[Message]`` conversation). That is the core
+    ``@agent`` idiom, but to a static type checker the bare ``return
+    f"..."`` looks like returning ``str`` where ``FactSheet`` was promised.
+    Wrapping the prompt in this no-op (declared ``-> Any``) keeps type
+    checkers satisfied and makes the intent explicit::
+
+        @agent(model="anthropic/claude-sonnet-5")
+        def researcher(topic: str) -> FactSheet:
+            \"\"\"You are a meticulous researcher.\"\"\"
+            return prompt(f"Build a fact sheet about: {topic}")
+
+    Returning the bare ``str``/``list[Message]`` works identically at
+    runtime; this wrapper only exists for type-checker ergonomics.
+    """
+    return text_or_messages
+
+
 def agent(
     *,
     model: str | Model,
