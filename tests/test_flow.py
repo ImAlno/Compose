@@ -26,16 +26,6 @@ from composeai.hitl import approve
 from composeai.runs import Budget
 from composeai.testing import FakeModel
 
-
-@pytest.fixture(autouse=True)
-def _clear_flow_registry():
-    # Flow names are unique per-process (ConfigError on duplicate); tests
-    # define plenty of small flows, so drop registrations between tests to
-    # avoid bleed between them re-registering the same function name.
-    yield
-    _FLOW_REGISTRY.clear()
-
-
 # --- @task outside a flow ----------------------------------------------------
 
 
@@ -786,6 +776,36 @@ def test_flow_budget_persists_across_resume_and_still_enforces():
         resume(run.id, {"continue": True})
 
 
+def test_budget_accumulates_across_resume_attempts():
+    from composeai.errors import BudgetExceededError
+    from composeai.messages import Usage
+
+    model = FakeModel(
+        ["first", "second"], usage=Usage(input_tokens=5, output_tokens=5)
+    )
+
+    @agent(model=model)
+    def task7_spender(prompt: str) -> str:
+        return prompt
+
+    @flow
+    def task7_two_step() -> str:
+        task7_spender("one")          # 10 tokens -- under the 15 cap
+        if not approve("continue"):
+            return "stopped"
+        task7_spender("two")          # 10 more -- lifetime total 20 > 15
+        return "done"
+
+    run = task7_two_step.run(budget=Budget(tokens=15))
+    assert run.status == "paused"
+
+    # Before the fix, the resumed attempt started a fresh in-memory trace,
+    # so its own 10 tokens stayed under the cap and the run completed --
+    # every resume silently granted a fresh budget window.
+    with pytest.raises(BudgetExceededError):
+        resume(run.id, {"continue": True})
+
+
 # --- resume() validates before journaling answers ---------------------------
 
 
@@ -950,3 +970,44 @@ def test_pipe_nested_as_a_flow_stage_can_pause_and_resume_normally():
 
     run2 = resume(run.id, {"go3": True})
     assert run2.output == ["sent:hello"]
+
+
+def test_resume_with_budget_override_allows_recovery():
+    import json as _json
+
+    from composeai.errors import BudgetExceededError
+    from composeai.messages import Usage
+    from composeai.runs import open_default
+
+    model = FakeModel(
+        ["first", "second", "second-retry"],
+        usage=Usage(input_tokens=5, output_tokens=5),
+    )
+
+    @agent(model=model)
+    def task8_spender(prompt: str) -> str:
+        return prompt
+
+    @flow
+    def task8_capped() -> str:
+        task8_spender("one")
+        task8_spender("two")
+        return "done"
+
+    with pytest.raises(BudgetExceededError):
+        task8_capped.run(budget=Budget(tokens=15))
+
+    store = open_default()
+    row = store.list_runs(kind="flow", limit=1)[0]
+    run_id = row["run_id"]
+
+    # A budget-killed run is recoverable with a raised cap; completed steps
+    # replay free, and the override counts prior real spend (Task 7).
+    run = resume(run_id, budget=Budget(tokens=60))
+    assert run.status == "completed"
+    assert run.output == "done"
+
+    # The override persisted -- a future resume sees the new budget.
+    stored = store.get_run(run_id)
+    assert stored is not None
+    assert _json.loads(stored["budget_json"]) == {"usd": None, "tokens": 60}

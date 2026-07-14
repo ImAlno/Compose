@@ -15,18 +15,11 @@ import pytest
 from composeai import runs
 from composeai.agentfn import agent
 from composeai.errors import ConfigError
-from composeai.flow import _FLOW_REGISTRY, flow, resume
+from composeai.flow import flow, resume
 from composeai.hitl import Interrupt
 from composeai.messages import ToolResultPart
 from composeai.testing import FakeModel
 from composeai.tools import tool
-
-
-@pytest.fixture(autouse=True)
-def _clear_flow_registry():
-    yield
-    _FLOW_REGISTRY.clear()
-
 
 # --- approval-gated tool pauses a standalone agent -------------------------------
 

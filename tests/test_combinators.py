@@ -683,3 +683,56 @@ def test_map_span_names_use_task_name_not_repr():
     assert trace is not None
     names = [s.name for s in trace.spans if s.kind == "aggregate"]
     assert names == ["map(fetch)"]
+
+
+def test_map_timeout_per_item_raises():
+    import time as _time
+
+    from composeai.errors import TaskTimeoutError
+
+    def task9_slow(x: int) -> int:
+        if x == 1:
+            _time.sleep(10)
+        return x
+
+    with pytest.raises(TaskTimeoutError):
+        compose.map(task9_slow, [0, 1], timeout_per_item=0.2)
+
+
+def test_map_collect_returns_per_item_results():
+    from composeai import MapResult
+
+    def task9_flaky(x: int) -> int:
+        if x == 1:
+            raise ValueError("boom")
+        return x * 2
+
+    results = compose.map(task9_flaky, [0, 1, 2], on_error="collect")
+    assert [r.ok for r in results] == [True, False, True]
+    assert results[0] == MapResult(ok=True, value=0)
+    assert results[2].value == 4
+    assert results[1].error_type == "ValueError"
+    assert "boom" in results[1].error
+
+
+def test_map_collect_captures_timeouts_too():
+    import time as _time
+
+    def task9_slow_collect(x: int) -> int:
+        if x == 1:
+            _time.sleep(10)
+        return x
+
+    results = compose.map(
+        task9_slow_collect, [0, 1], timeout_per_item=0.2, on_error="collect"
+    )
+    assert results[0].ok is True
+    assert results[1].ok is False
+    assert results[1].error_type == "TaskTimeoutError"
+
+
+def test_map_invalid_on_error_rejected():
+    from composeai.errors import ConfigError
+
+    with pytest.raises(ConfigError):
+        compose.map(lambda x: x, [1], on_error="ignore")

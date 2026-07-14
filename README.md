@@ -28,6 +28,27 @@ pip install "composeai[openai]"        # + the OpenAI SDK
 pip install "composeai[all]"           # both
 ```
 
+## Providers
+
+A `"provider/model-id"` string (`"anthropic/claude-sonnet-5"`, `"openai/gpt-5.6-luna"`) resolves lazily against the matching extra. Any other OpenAI-compatible Chat Completions server — Ollama, vLLM, LM Studio, ollama.com, a self-hosted proxy — goes through an explicit factory instead, since it needs a `base_url`:
+
+```python
+import composeai as compose
+
+model = compose.openai_compatible(
+    "https://ollama.com/v1", "kimi-k2.6",
+    api_key="...", timeout=120,
+    input_price=0.60, output_price=2.50,   # USD per million tokens -- ollama.com bills real usage
+)
+
+@compose.agent(model=model)
+def researcher(topic: str) -> FactSheet: ...
+```
+
+- **`timeout=`** (seconds) bounds each HTTP request at the SDK-client level — the only real guard against a hung call (`@agent(timeout=...)` only checks turn boundaries, so it can't interrupt one already in flight; see Quickstart). Also accepted directly by the `AnthropicModel`/`OpenAIModel` constructors.
+- **`input_price=`/`output_price=`** (USD per **million** tokens, both together or neither — else `ConfigError`) register this model's price by calling the public `composeai.register_price(provider, model, composeai.ModelPrice(input=..., output=...))` on your behalf. Without a registered price, `compose costs` and `Budget(usd=...)` can't see the spend at all (unpriced calls always report `cost_usd=None` — see "Rules of the road"); `register_price`/`ModelPrice` are also available directly, for the string `"provider/model-id"` form.
+- **`schema_mode="prompt"`** — some compat servers accept `response_format: json_schema` but silently ignore it, returning free-form text or markdown instead of the constrained shape (verified against ollama.com for every model tested). Prompt mode embeds the schema in the last user message instead and parses the reply leniently (strips code fences, extracts the first balanced JSON object). Reasoning models can burn thousands of hidden tokens before any visible content — keep `max_tokens` generous, or a structured call comes back empty (composeai raises a targeted error naming `reasoning_tokens` when that happens, instead of a bare JSON-decode failure). The same reasoning-tokens hint is folded into the ordinary "hit max_tokens" error too, for any provider — not just prompt mode.
+
 ## Quickstart
 
 ```python
@@ -72,6 +93,10 @@ run.trace.print()   # the tree shown above
 
 Every agent also takes an optional spend cap: `researcher.run(topic, budget=compose.Budget(usd=0.50, tokens=200_000))` raises `BudgetExceededError` at the first LLM-call boundary past the cap.
 
+Failed structured output doesn't have to be fatal: `@agent(max_repairs=2)` appends the validation error as a corrective user message and re-asks within the same conversation before giving up — each repair is a full-price turn and counts against `max_turns`, but it's far cheaper (and more effective against small/local models) than a cold re-run. Every validation failure that reaches you, repaired or not, is a `ComposeError` — a raw pydantic `ValidationError` never leaks out of `@agent`. `name=`/`replace=` on `@agent` (mirrored on `@flow`/`@task`) override the registered name and allow rebinding it instead of raising — useful for runtime-bound factories and test fixtures; `replace=True` on an agent carries one caveat: a paused run resumed after the replace continues silently against the *new* definition (no fingerprint/staleness check, unlike `@flow`).
+
+Note that `@agent(timeout=...)` and a model constructor's `timeout=` are unrelated: the agent's `timeout` is a turn-boundary watchdog (checked between turns, so it can't interrupt a single in-flight call), while the model's `timeout` bounds each individual HTTP request at the SDK-client level — see [Providers](#providers) above.
+
 ## Composition
 
 ```python
@@ -104,7 +129,16 @@ compose.map(summarize, sources)      # one stage over many items, order preserve
 
 Stages are agents, pipelines, aggregates, or plain Python callables — routing is an `if` statement, not a graph edge class.
 
-`aggregate()`/`map()`/an agent's parallel tool calls have no *per-branch* timeout of their own — a single hung branch (a tool body blocked on a network call with no read timeout, a provider HTTP call that never returns) blocks the whole combinator, and therefore the enclosing run, until it finishes or the process is killed. Give an individual stage its own bound with `@task(timeout=...)` (or build one into a tool/agent body) if it needs one; there's no combinator-level equivalent.
+`map(fn, items, *, max_workers=None, timeout_per_item=None, on_error="raise")` takes two knobs beyond the basic fan-out: `timeout_per_item` (seconds) races each item on its own thread and raises `TaskTimeoutError` for just that one instead of blocking every other item forever, and `on_error="collect"` replaces the default "raise the first failure by index" behavior with a `list[MapResult]` (`ok`, `value`, `error`, `error_type`) — one entry per item, in input order, with nothing raised — so a caller can keep whatever succeeded instead of writing its own try/except-and-tag wrapper:
+
+```python
+results = compose.map(summarize, sources, on_error="collect", timeout_per_item=30)
+ok = [r.value for r in results if r.ok]
+```
+
+Inside a `@flow`, `map()` already journals each item individually as it completes — a failed item (whether it raises, under the default `on_error="raise"`, or is just recorded as a failed `MapResult` under `"collect"`) never discards its siblings' completed work; only the unfinished tail re-runs on `resume()`. That's true when each item is itself a journaling stage (`@task`/`@agent`/nested `@flow`/`pipe`/`aggregate`); a plain Python callable has no journal entry of its own to replay, so its item just re-runs on `resume()` like any other unwrapped code.
+
+`aggregate()`/an agent's parallel tool calls have no *per-branch* timeout of their own — a single hung branch (a tool body blocked on a network call with no read timeout, a provider HTTP call that never returns) blocks the whole combinator, and therefore the enclosing run, until it finishes or the process is killed. Give an individual stage its own bound with `@task(timeout=...)` (or build one into a tool/agent body) if it needs one; `map()`'s `timeout_per_item` (above) is the one combinator-level exception.
 
 ## Durable flows & human-in-the-loop
 
@@ -144,6 +178,8 @@ On resume, finished steps replay from the journal (the `editor` agent's LLM call
 ```
 
 Interrupts are *named* (`approve("publish")`, `ask_human("style", "Formal or casual?")`), never positional — answers are journaled under that name, so resuming is idempotent and order-independent. The same mechanism gates tools: `@compose.tool(requires_approval=True)` pauses the agent mid-loop until `resume(run_id, answers={"tool_name": True})` (or `False` to deny — the model sees "denied by user" and carries on). The same crash-recovery works with no interrupt at all: if a flow dies halfway, `resume(run_id)` re-runs it and the journal skips what already happened.
+
+A `budget=` passed to the original `.run()` stays enforced across every `resume()` of that run — spend already persisted by earlier attempts counts against the cap (replayed steps themselves cost nothing), so a run can't dodge its budget by dying and getting resumed. If a run legitimately needs more room, override it explicitly: `resume(run_id, budget=Budget(usd=5.0))` replaces the stored budget for this attempt and every later one (a plain last-write-wins update, not journaled — the journal is first-write-wins and would otherwise freeze the first override forever). Prior attempts' real spend still counts against the new cap; omitting `budget=` keeps whatever was already stored.
 
 ## Streaming
 
@@ -203,6 +239,22 @@ diff 01KXC6RD -> 01KXC6RD
 
 `compose trace` on a paused run also prints its pending interrupts and the exact `resume(...)` call to answer them. `compose runs -q "search terms"` full-text-searches span payloads; `compose export RUN_ID --cassette x.json` turns a run's recorded LLM calls into a replayable test fixture (below). `compose path` prints the state directory.
 
+The CLI runs standalone — it never imports your app's code, so a run whose payloads reference your own pydantic/dataclass/enum types can't decode them out of the box:
+
+```console
+$ compose trace 01KXC6RD...
+compose: Cannot decode unregistered type 'research_agent.schemas:SubQuestion': import the
+module that defines it ... Types are never imported automatically, by design (security).
+```
+
+Pass `--import your_module` (repeatable) on `runs`, `trace`, `diff`, and `export` to import it first and register every pydantic model/dataclass/enum found in its namespace:
+
+```console
+$ compose trace --import research_agent.schemas 01KXC6RD...
+```
+
+The same registration is available programmatically — `composeai.register_module_types(module)` scans a module's namespace (handy for a barrel/schemas module that re-exports types from elsewhere), and `composeai.register_serializable` registers one class directly (the decorator form: `@composeai.register_serializable`). Both are what `--import` calls under the hood.
+
 ## Test kit
 
 `FakeModel` scripts an agent without a provider or network — each item is one model turn:
@@ -238,6 +290,20 @@ def test_researcher(cassette):
 Run once with `COMPOSE_RECORD=1` against the real provider and commit the JSON; afterwards the test replays it with no key, no network, and no SDK constructed. (`compose export` builds the same file from an already-persisted run.)
 
 **`@compose.agent(model=..., cache=True)`** is for iterating locally against a real provider: identical requests are answered from a filesystem cache under `{COMPOSE_DIR}/cache/`, report zero usage (a hit is never re-billed), and tag their span `cached=true`. Applies to non-streaming calls only.
+
+`@agent`/`@flow`/`@task` names are unique per process (so `resume()` can route a run back to its definition), which collides with test suites that redefine the same function across test modules/parametrized cases. `composeai.testing.reset_registries()` clears all three registries between tests instead of reaching into the private `_AGENT_REGISTRY`/`_FLOW_REGISTRY`/`_TASK_REGISTRY` dicts by hand:
+
+```python
+import pytest
+from composeai.testing import reset_registries
+
+@pytest.fixture(autouse=True)
+def _reset():
+    reset_registries()
+    yield
+```
+
+(`replace=True` on any of the three decorators is the other option, for a single deliberate rebind rather than a blanket per-test reset.)
 
 ## Rules of the road
 

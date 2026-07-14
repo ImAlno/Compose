@@ -254,3 +254,37 @@ def test_seal_schema_recurses_into_the_preserved_dict_value_schema_too():
     }
     seal_schema(schema)
     assert schema["additionalProperties"]["additionalProperties"] is False
+
+
+# --- register_module_types: the whole-module companion to register_annotation_types --
+
+
+def test_register_module_types_scans_a_module_namespace():
+    import types as _types
+
+    from pydantic import BaseModel
+
+    from composeai import register_module_types
+    from composeai._encoding import _REGISTRY, _type_tag
+
+    class ScannedWidget(BaseModel):
+        name: str
+
+    fake_module = _types.ModuleType("fake_app_schemas")
+    # setattr(), not `fake_module.ScannedWidget = ...`: ModuleType has no
+    # statically-declared attributes, so a direct assignment is a pyright
+    # reportAttributeAccessIssue; setattr()'s Any-typed second arg sidesteps
+    # that at the cost of ruff's B010 (constant-attribute setattr), silenced
+    # here since this dynamic-namespace test is exactly the justified case.
+    setattr(fake_module, "ScannedWidget", ScannedWidget)  # noqa: B010
+
+    _REGISTRY.pop(_type_tag(ScannedWidget), None)
+    register_module_types(fake_module)
+    assert _REGISTRY[_type_tag(ScannedWidget)] is ScannedWidget
+
+
+def test_register_serializable_is_public():
+    import composeai
+
+    assert "register_serializable" in composeai.__all__
+    assert "register_module_types" in composeai.__all__

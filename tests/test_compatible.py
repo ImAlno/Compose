@@ -15,6 +15,7 @@ import httpx
 import openai
 import pytest
 from conformance import contract
+from pydantic import BaseModel
 
 from composeai.errors import ProviderError
 from composeai.messages import (
@@ -961,3 +962,259 @@ def test_contract_sdk_failure_raises_provider_error():
 
     model = _model(raiser)
     contract.assert_sdk_failure_raises_provider_error(model, model_id="llama3-test")
+
+
+def test_timeout_passed_to_sdk_client(monkeypatch):
+    import openai
+
+    captured: dict = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+    model = OpenAICompatibleModel("llama3.2", base_url="http://localhost:11434/v1", timeout=90)
+    model._get_client()
+    assert captured["timeout"] == 90
+
+
+def test_no_timeout_omits_sdk_kwarg(monkeypatch):
+    import openai
+
+    captured: dict = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+    model = OpenAICompatibleModel("llama3.2", base_url="http://localhost:11434/v1")
+    model._get_client()
+    assert "timeout" not in captured
+
+
+def test_construction_prices_register_for_cost_tracking():
+    from composeai.models.prices import get_price
+
+    openai_compatible(
+        "http://x/v1", "kimi-priced-task2", input_price=0.6, output_price=2.5
+    )
+    price = get_price("openai-compatible", "kimi-priced-task2")
+    assert price is not None
+    assert price.input == 0.6
+    assert price.output == 2.5
+
+
+def test_construction_price_requires_both_sides():
+    from composeai.errors import ConfigError
+
+    with pytest.raises(ConfigError):
+        openai_compatible("http://x/v1", "kimi-halfpriced-task2", input_price=0.6)
+
+
+# --- schema_mode="prompt" ------------------------------------------------------
+
+_TASK3_SCHEMA = {
+    "type": "object",
+    "properties": {"answer": {"type": "string"}},
+    "required": ["answer"],
+    "additionalProperties": False,
+}
+
+
+def _prompt_mode_client(content: str, captured: dict):
+    class Completions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            msg = SimpleNamespace(content=content, refusal=None, tool_calls=None)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=msg, finish_reason="stop")],
+                usage=None,
+            )
+
+    return SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+
+def _structured_request() -> ModelRequest:
+    return ModelRequest(
+        model="m",
+        messages=[Message.user("hi")],
+        system=None,
+        tools=None,
+        output_schema=_TASK3_SCHEMA,
+        max_tokens=100,
+        temperature=None,
+        provider="openai-compatible",
+    )
+
+
+def test_prompt_mode_embeds_schema_and_drops_response_format():
+    captured: dict = {}
+    client = _prompt_mode_client('{"answer": "ok"}', captured)
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=client, schema_mode="prompt"
+    )
+    response = model.complete(_structured_request())
+    assert "response_format" not in captured
+    last = captured["messages"][-1]
+    assert last["role"] == "user"
+    assert "JSON Schema" in last["content"][-1]["text"]
+    assert response.parsed == {"answer": "ok"}
+
+
+def test_prompt_mode_strips_markdown_fences():
+    captured: dict = {}
+    client = _prompt_mode_client('```json\n{"answer": "ok"}\n```', captured)
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=client, schema_mode="prompt"
+    )
+    response = model.complete(_structured_request())
+    assert response.parsed == {"answer": "ok"}
+
+
+def test_prompt_mode_extracts_first_balanced_object_from_prose():
+    captured: dict = {}
+    client = _prompt_mode_client(
+        'Sure! Here is the JSON you asked for: {"answer": "ok"} Hope that helps.',
+        captured,
+    )
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=client, schema_mode="prompt"
+    )
+    response = model.complete(_structured_request())
+    assert response.parsed == {"answer": "ok"}
+
+
+def test_prompt_mode_skips_non_json_braces_before_object():
+    captured: dict = {}
+    client = _prompt_mode_client(
+        'use {placeholder} then {"answer": "ok"}',
+        captured,
+    )
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=client, schema_mode="prompt"
+    )
+    response = model.complete(_structured_request())
+    assert response.parsed == {"answer": "ok"}
+
+
+def test_prompt_mode_unparseable_returns_parsed_none():
+    captured: dict = {}
+    client = _prompt_mode_client("no json here at all", captured)
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=client, schema_mode="prompt"
+    )
+    response = model.complete(_structured_request())
+    assert response.parsed is None
+    assert response.message.text == "no json here at all"
+
+
+def test_prompt_mode_empty_content_reasoning_error_still_raises():
+    captured: dict = {}
+
+    class Completions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            msg = SimpleNamespace(content=None, refusal=None, tool_calls=None)
+            usage = SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=500,
+                prompt_tokens_details=None,
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=500),
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=msg, finish_reason="stop")],
+                usage=usage,
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=client, schema_mode="prompt"
+    )
+    with pytest.raises(ProviderError, match="only reasoning tokens"):
+        model.complete(_structured_request())
+
+
+class _Task2Answer(BaseModel):
+    # Module-level (not local to the test): a locally-defined pydantic model
+    # would have its own string annotations (this file uses `from __future__
+    # import annotations`) fail to resolve later, from inside agentfn.py, since
+    # get_type_hints() can't see an enclosing test function's local scope --
+    # see composeai._schema.resolve_annotations's docstring for the same issue
+    # one level up (the agent function's own `-> _Task2Answer` return
+    # annotation), which module-level placement sidesteps for both.
+    answer: str
+
+
+def test_prompt_mode_garbage_is_repairable_via_max_repairs():
+    from composeai import prompt
+    from composeai.agentfn import agent
+
+    calls: list[dict] = []
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                content = "Sure, here's some prose with no JSON object in it at all."
+            else:
+                content = '{"answer": "ok"}'
+            msg = SimpleNamespace(content=content, refusal=None, tool_calls=None)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=msg, finish_reason="stop")],
+                usage=None,
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=client, schema_mode="prompt"
+    )
+
+    @agent(model=model, max_repairs=1)
+    def task2_answerer(question: str) -> _Task2Answer:
+        return prompt(question)
+
+    result = task2_answerer("go")
+    assert result == _Task2Answer(answer="ok")
+    assert len(calls) == 2
+    assert "did not match the required output schema" in str(calls[1]["messages"])
+
+
+def test_invalid_schema_mode_raises_config_error():
+    from composeai.errors import ConfigError
+
+    with pytest.raises(ConfigError):
+        OpenAICompatibleModel("m", base_url="http://x/v1", schema_mode="auto")
+
+
+def test_native_mode_unchanged_sends_response_format():
+    captured: dict = {}
+    client = _prompt_mode_client('{"answer": "ok"}', captured)
+    model = OpenAICompatibleModel("m", base_url="http://x/v1", client=client)
+    model.complete(_structured_request())
+    assert captured["response_format"]["type"] == "json_schema"
+
+
+def test_reasoning_only_empty_content_raises_targeted_error():
+    captured: dict = {}
+
+    class Completions:
+        def create(self, **kwargs):
+            captured.update(kwargs)
+            msg = SimpleNamespace(content=None, refusal=None, tool_calls=None)
+            usage = SimpleNamespace(
+                prompt_tokens=10,
+                completion_tokens=500,
+                prompt_tokens_details=None,
+                completion_tokens_details=SimpleNamespace(reasoning_tokens=500),
+            )
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=msg, finish_reason="stop")],
+                usage=usage,
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    model = OpenAICompatibleModel("m", base_url="http://x/v1", client=client)
+    with pytest.raises(ProviderError, match="only reasoning tokens"):
+        model.complete(_structured_request())

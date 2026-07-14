@@ -12,6 +12,7 @@ import time
 import pytest
 from pydantic import BaseModel
 
+from composeai import prompt
 from composeai.agentfn import agent
 from composeai.errors import (
     AgentTimeoutError,
@@ -752,3 +753,93 @@ def test_prompt_helper_is_a_typed_noop():
         return compose.prompt(f"List: {topic}")
 
     assert lister("x") == ["a", "b"]
+
+
+def test_max_tokens_error_mentions_reasoning_tokens():
+    from composeai.messages import Message, StopReason, Usage
+    from composeai.models.base import ModelResponse
+
+    response = ModelResponse(
+        message=Message.assistant(""),
+        stop_reason=StopReason.MAX_TOKENS,
+        raw_stop_reason="length",
+        usage=Usage(input_tokens=10, output_tokens=500, reasoning_tokens=500),
+        model_id="fake",
+    )
+    model = FakeModel([response])
+
+    @agent(model=model)
+    def thinker(question: str) -> str:
+        return question
+
+    with pytest.raises(ComposeError, match="internal reasoning"):
+        thinker("hi")
+
+
+def test_output_validation_failure_raises_compose_error():
+    from pydantic import BaseModel
+
+    class Task5Point(BaseModel):
+        x: int
+        y: int
+
+    model = FakeModel([{"json": {"x": "not-an-int", "y": 2}}])
+
+    @agent(model=model)
+    def task5_pointer(question: str) -> Task5Point:
+        return prompt(question)
+
+    with pytest.raises(ComposeError, match="failed validation"):
+        task5_pointer("go")
+
+
+class _Task6Point(BaseModel):
+    x: int
+    y: int
+
+
+def test_repair_turn_recovers_from_invalid_output():
+    model = FakeModel([
+        {"json": {"x": "bad", "y": 2}},
+        {"json": {"x": 1, "y": 2}},
+    ])
+
+    @agent(model=model, max_repairs=1)
+    def task6_repairer(question: str) -> _Task6Point:
+        return prompt(question)
+
+    result = task6_repairer("go")
+    assert result == _Task6Point(x=1, y=2)
+    # the second request carried the validation error back to the model
+    assert len(model.requests) == 2
+    assert "did not match the required output schema" in model.requests[1].messages[-1].text
+
+
+def test_repair_exhaustion_reraises():
+    model = FakeModel([
+        {"json": {"x": "bad", "y": 2}},
+        {"json": {"x": "still-bad", "y": 2}},
+    ])
+
+    @agent(model=model, max_repairs=1)
+    def task6_exhauster(question: str) -> _Task6Point:
+        return prompt(question)
+
+    with pytest.raises(ComposeError, match="failed validation"):
+        task6_exhauster("go")
+    assert len(model.requests) == 2
+
+
+def test_no_repair_by_default():
+    model = FakeModel([
+        {"json": {"x": "bad", "y": 2}},
+        {"json": {"x": 1, "y": 2}},
+    ])
+
+    @agent(model=model)
+    def task6_default(question: str) -> _Task6Point:
+        return prompt(question)
+
+    with pytest.raises(ComposeError):
+        task6_default("go")
+    assert len(model.requests) == 1

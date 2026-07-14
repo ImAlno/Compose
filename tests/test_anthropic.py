@@ -1099,3 +1099,20 @@ def test_contract_sdk_failure_raises_provider_error():
 
     model = _model(raiser)
     contract.assert_sdk_failure_raises_provider_error(model, model_id="claude-sonnet-5")
+
+
+def test_anthropic_model_timeout_passed_to_sdk_client(monkeypatch):
+    import anthropic
+
+    from composeai.models.anthropic import AnthropicModel
+
+    captured: dict = {}
+
+    class FakeAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(anthropic, "Anthropic", FakeAnthropic)
+    model = AnthropicModel("claude-sonnet-5", api_key="k", timeout=45)
+    model._get_client()
+    assert captured["timeout"] == 45

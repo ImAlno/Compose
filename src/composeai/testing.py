@@ -640,6 +640,23 @@ class CachingModel:
         return response
 
 
+def reset_registries() -> None:
+    """Clear the global ``@agent``/``@flow``/``@task`` name registries.
+
+    For test fixtures and REPL/notebook redefinition -- the supported
+    replacement for reaching into ``composeai.agentfn._AGENT_REGISTRY`` /
+    ``composeai.flow._FLOW_REGISTRY``/``_TASK_REGISTRY`` by hand. After a
+    reset, ``resume()`` cannot route a run back to a definition until its
+    module re-registers it (re-import or re-decoration).
+    """
+    from .agentfn import _AGENT_REGISTRY
+    from .flow import _FLOW_REGISTRY, _TASK_REGISTRY
+
+    _AGENT_REGISTRY.clear()
+    _FLOW_REGISTRY.clear()
+    _TASK_REGISTRY.clear()
+
+
 __all__ = [
     "CachingModel",
     "FakeModel",
@@ -650,4 +667,5 @@ __all__ = [
     "compute_message_hash",
     "record_cassette",
     "replay_cassette",
+    "reset_registries",
 ]

@@ -57,12 +57,14 @@ class AnthropicModel:
         api_key: str | None = None,
         max_retries: int = 2,
         base_url: str | None = None,
+        timeout: float | None = None,
     ) -> None:
         self.model_id = model_id
         self._client = client
         self._api_key = api_key
         self._max_retries = max_retries
         self._base_url = base_url
+        self._timeout = timeout
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -75,11 +77,16 @@ class AnthropicModel:
                 "Missing Anthropic API key: set the ANTHROPIC_API_KEY environment "
                 "variable, or pass api_key=... / client=... to AnthropicModel."
             )
-        self._client = anthropic.Anthropic(
-            api_key=api_key,
-            max_retries=self._max_retries,
-            base_url=self._base_url,
-        )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "max_retries": self._max_retries,
+            "base_url": self._base_url,
+        }
+        # Only pass timeout when set: the SDK's own default is a NOT_GIVEN
+        # sentinel, and an explicit None would mean "no timeout at all".
+        if self._timeout is not None:
+            client_kwargs["timeout"] = self._timeout
+        self._client = anthropic.Anthropic(**client_kwargs)
         return self._client
 
     def complete(self, request: ModelRequest) -> ModelResponse:

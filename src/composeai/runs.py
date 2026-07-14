@@ -4,14 +4,17 @@ A durable ``RunStore`` (SQLite-backed) arrives in Phase 7; this module only
 defines the in-memory shape returned by :meth:`~composeai.agentfn.AgentFunction.run`.
 
 This module also defines :class:`Budget` and the machinery that enforces
-it: :func:`budget_scope` pushes a ``(budget, root_span)`` pair onto a
-contextvar stack for the duration of a run, and :func:`check_budgets` --
-called by :mod:`composeai.agentfn` right after every LLM call -- walks that
-stack and raises :class:`~composeai.errors.BudgetExceededError` the moment
-any active entry is exceeded. Living here (rather than in ``agentfn.py`` or
-``tracing.py``) keeps it usable by both ``@agent`` runs and the
-``pipe``/``aggregate`` combinators without either module depending on the
-other.
+it: :func:`budget_scope` pushes a ``(budget, root_span, baseline)`` triple
+onto a contextvar stack for the duration of a run -- ``baseline`` is spend
+from earlier attempts of the same durable run (``None`` for a fresh run),
+added on top of the current attempt's in-memory rollup so a resumed run's
+budget caps lifetime spend rather than just the latest attempt's -- and
+:func:`check_budgets` -- called by :mod:`composeai.agentfn` right after
+every LLM call -- walks that stack and raises
+:class:`~composeai.errors.BudgetExceededError` the moment any active entry
+is exceeded. Living here (rather than in ``agentfn.py`` or ``tracing.py``)
+keeps it usable by both ``@agent`` runs and the ``pipe``/``aggregate``
+combinators without either module depending on the other.
 """
 
 from __future__ import annotations
@@ -141,6 +144,10 @@ class Budget:
     :func:`check_budgets`) -- a ``usd`` budget simply can't see spend it has
     no price for. Pass ``tokens`` too if you need a hard cap regardless of
     pricing.
+
+    Enforcement is cumulative across ``resume()`` attempts: spend persisted
+    by earlier attempts of the same run counts against the cap (replayed
+    steps themselves cost nothing).
     """
 
     usd: float | None = None
@@ -168,24 +175,28 @@ def decode_budget(budget_json: str | None) -> Budget | None:
     return Budget(usd=payload.get("usd"), tokens=payload.get("tokens"))
 
 
-_budget_stack: contextvars.ContextVar[tuple[tuple[Budget, Span], ...]] = contextvars.ContextVar(
-    "_budget_stack", default=()
+_budget_stack: contextvars.ContextVar[tuple[tuple[Budget, Span, Usage | None], ...]] = (
+    contextvars.ContextVar("_budget_stack", default=())
 )
 
 
 @contextmanager
-def budget_scope(budget: Budget | None, root_span: Span) -> Iterator[None]:
-    """Push ``(budget, root_span)`` onto the active-budgets stack for the block.
+def budget_scope(
+    budget: Budget | None, root_span: Span, baseline: Usage | None = None
+) -> Iterator[None]:
+    """Push ``(budget, root_span, baseline)`` onto the active-budgets stack.
 
-    A no-op when ``budget`` is ``None`` -- nothing is pushed, so
-    :func:`check_budgets` sees no new entry and there is no per-call
-    overhead beyond the (already cheap) stack read it always does.
+    ``baseline`` is spend from *earlier attempts* of the same durable run
+    (persisted llm spans -- see :meth:`RunStore.prior_llm_usage`), added on
+    top of the current attempt's in-memory rollup so a ``Budget`` caps a
+    run's lifetime spend, not each attempt's. A no-op when ``budget`` is
+    ``None``.
     """
     if budget is None:
         yield
         return
     stack = _budget_stack.get()
-    token = _budget_stack.set((*stack, (budget, root_span)))
+    token = _budget_stack.set((*stack, (budget, root_span, baseline)))
     try:
         yield
     finally:
@@ -198,14 +209,17 @@ def check_budgets() -> None:
     Checks every entry on the stack (innermost and outermost alike -- a
     nested, tighter budget and an enclosing, looser one are both live at
     once), computing each entry's usage as
-    ``current_trace().rollup_usage(root_span)``. A no-op when there is no
-    active trace or no active budget.
+    ``current_trace().rollup_usage(root_span)`` plus that entry's
+    ``baseline`` (spend from earlier resume attempts, if any). A no-op when
+    there is no active trace or no active budget.
     """
     trace = current_trace()
     if trace is None:
         return
-    for budget, root_span in _budget_stack.get():
+    for budget, root_span, baseline in _budget_stack.get():
         used = trace.rollup_usage(root_span)
+        if baseline is not None:
+            used = used + baseline
         if budget.tokens is not None:
             total_tokens = used.input_tokens + used.output_tokens
             if total_tokens > budget.tokens:
@@ -535,6 +549,32 @@ class RunStore:
             "SELECT step_key, value_json FROM journal WHERE run_id = ?", (run_id,)
         ).fetchall()
         return {row["step_key"]: row["value_json"] for row in rows}
+
+    def prior_llm_usage(self, run_id: str) -> Usage:
+        """Sum of every persisted llm span's usage for ``run_id``.
+
+        This is spend from *earlier attempts*: replayed steps never re-create
+        llm spans, and the current attempt's spans are persisted only as they
+        finish (after this is read at attempt start), so it never
+        double-counts. Used to seed :func:`budget_scope` on resume.
+        """
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT usage_json FROM spans WHERE run_id = ? AND kind = 'llm' "
+            "AND usage_json IS NOT NULL",
+            (run_id,),
+        ).fetchall()
+        total = Usage()
+        for row in rows:
+            payload = json.loads(row["usage_json"])
+            # usage_json is to_jsonable(Usage): {"$kind": "pydantic",
+            # "$type": "composeai.messages:Usage", "value": {...}} --
+            # validated directly rather than via from_jsonable so this
+            # never depends on registry state in a fresh process.
+            value = payload.get("value") if isinstance(payload, dict) else None
+            if isinstance(value, dict):
+                total = total + Usage.model_validate(value)
+        return total
 
     def journal_put(self, run_id: str, step_key: str, value_json: str) -> str:
         """INSERT OR IGNORE (first-write-wins); return the value that ended up stored.

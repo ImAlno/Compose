@@ -21,11 +21,16 @@ if [[ -f .env ]]; then set -a; source .env; set +a; fi
 }
 
 CURRENT=$(.venv/bin/python -c "import tomllib; print(tomllib.load(open('pyproject.toml','rb'))['project']['version'])")
-[[ "$VERSION" != "$CURRENT" ]] || { echo "error: $VERSION is already the current version" >&2; exit 1; }
-echo "bumping $CURRENT -> $VERSION"
-sed -i '' "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" pyproject.toml
-sed -i '' "s/__version__ = \"$CURRENT\"/__version__ = \"$VERSION\"/" src/composeai/__init__.py
-sed -i '' "s/\"$CURRENT\"/\"$VERSION\"/" tests/test_package.py
+if [[ "$VERSION" == "$CURRENT" ]]; then
+    # Tree was committed with the bump already in place (e.g. version bumped
+    # as part of the release branch) -- nothing to rewrite, go straight to gates.
+    echo "version is already $VERSION -- skipping bump"
+else
+    echo "bumping $CURRENT -> $VERSION"
+    sed -i '' "s/^version = \"$CURRENT\"/version = \"$VERSION\"/" pyproject.toml
+    sed -i '' "s/__version__ = \"$CURRENT\"/__version__ = \"$VERSION\"/" src/composeai/__init__.py
+    sed -i '' "s/\"$CURRENT\"/\"$VERSION\"/" tests/test_package.py
+fi
 
 echo "running gates..."
 .venv/bin/pytest -q

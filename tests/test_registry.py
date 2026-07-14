@@ -1,8 +1,11 @@
 import pytest
 
+from composeai.agentfn import agent
 from composeai.errors import ConfigError
+from composeai.flow import flow, task
 from composeai.models import registry
 from composeai.models.base import ModelRequest, ModelResponse
+from composeai.testing import FakeModel
 
 
 @pytest.fixture(autouse=True)
@@ -150,3 +153,93 @@ def test_openai_module_is_not_imported_until_first_resolve():
     assert "composeai.models.openai" not in sys.modules
     registry.resolve("openai/gpt-5.4")
     assert "composeai.models.openai" in sys.modules
+
+
+# --- Task 11: reset_registries() / @agent(name=)/replace= / @flow/@task replace= ---
+
+
+def test_reset_registries_allows_redefinition():
+    from composeai.testing import reset_registries
+
+    @task
+    def task11_dup(x: int) -> int:  # pyright: ignore[reportRedeclaration]
+        return x
+
+    reset_registries()
+
+    @task
+    def task11_dup(x: int) -> int:  # noqa: F811 -- redefinition is the point
+        return x + 1
+
+    assert task11_dup(1) == 2
+
+
+def test_agent_name_override_registers_under_custom_name():
+    from composeai.agentfn import _AGENT_REGISTRY
+
+    model = FakeModel(["hi"])
+
+    @agent(model=model, name="task11_custom_name")
+    def task11_some_fn(question: str) -> str:
+        return question
+
+    assert task11_some_fn.name == "task11_custom_name"
+    assert _AGENT_REGISTRY["task11_custom_name"] is task11_some_fn
+
+
+def test_agent_replace_true_rebinds():
+    from composeai.agentfn import _AGENT_REGISTRY
+
+    m1 = FakeModel(["one"])
+    m2 = FakeModel(["two"])
+
+    @agent(model=m1)
+    def task11_rebind(question: str) -> str:  # pyright: ignore[reportRedeclaration]
+        return question
+
+    @agent(model=m2, replace=True)
+    def task11_rebind(question: str) -> str:  # noqa: F811
+        return question
+
+    assert task11_rebind("x") == "two"
+    assert _AGENT_REGISTRY["task11_rebind"] is task11_rebind
+
+
+def test_duplicate_agent_name_still_raises_without_replace():
+    model = FakeModel([])
+
+    @agent(model=model)
+    def task11_unique(question: str) -> str:
+        return question
+
+    with pytest.raises(ConfigError):
+
+        @agent(model=model)  # noqa: F811
+        def task11_unique(question: str) -> str:
+            return question
+
+
+def test_flow_and_task_replace_true():
+    from composeai.flow import _FLOW_REGISTRY, _TASK_REGISTRY
+
+    @flow
+    def task11_reflow() -> str:  # pyright: ignore[reportRedeclaration]
+        return "a"
+
+    @flow(replace=True)
+    def task11_reflow() -> str:  # noqa: F811
+        return "b"
+
+    assert task11_reflow() == "b"
+    assert _FLOW_REGISTRY["task11_reflow"] is task11_reflow
+
+    @task
+    def task11_retask() -> str:  # pyright: ignore[reportRedeclaration]
+        return "a"
+
+    @task(replace=True)
+    def task11_retask() -> str:  # noqa: F811
+        return "b"
+
+    assert task11_retask() == "b"
+    assert _TASK_REGISTRY["task11_retask"] is task11_retask

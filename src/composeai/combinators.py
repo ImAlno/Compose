@@ -26,13 +26,16 @@ import types
 import typing
 from collections.abc import Callable, Sequence
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from typing import Any
 
 from . import agentfn, runs, tracing
+from ._encoding import register_serializable
 from ._ids import new_ulid
 from ._schema import resolve_annotations
 from .agentfn import AgentFunction
 from .errors import CompositionTypeError, ConfigError
+from .flow import _run_with_timeout
 from .runs import Budget, Run, RunStream, budget_scope
 from .tools import Tool
 
@@ -467,36 +470,93 @@ def aggregate(**branches: Stage) -> Aggregate:
 # --- map ----------------------------------------------------------------------
 
 
-def map(fn: Stage, items: Sequence[Any], *, max_workers: int | None = None) -> list[Any]:
+@register_serializable
+@dataclass
+class MapResult:
+    """One item's settled outcome from ``compose.map(..., on_error="collect")``.
+
+    ``error``/``error_type`` are plain strings (exceptions don't round-trip
+    the journal); registered at import time so a resumed flow in a fresh
+    process can decode journaled values containing these.
+    """
+
+    ok: bool
+    value: Any = None
+    error: str | None = None
+    error_type: str | None = None
+
+
+def map(
+    fn: Stage,
+    items: Sequence[Any],
+    *,
+    max_workers: int | None = None,
+    timeout_per_item: float | None = None,
+    on_error: str = "raise",
+) -> list[Any]:
     """Apply ``fn`` to every item in ``items`` in parallel, preserving order.
 
     Exported so users write ``compose.map(fetch, urls)`` (shadowing the
-    builtin inside composeai's own namespace is intended). Every item
-    settles (success or exception) before this returns; on any failure the
-    first failing item *by index* is raised. Wrapped in
-    ``span("aggregate", f"map({fn_name})")``; a plain-callable ``fn`` gets
-    a ``task`` span per item named ``f"{fn_name}[{i}]"``.
+    builtin inside composeai's own namespace is intended). By default
+    (``on_error="raise"``), every item settles (success or exception)
+    before this returns; on any failure the first failing item *by index*
+    is raised. Wrapped in ``span("aggregate", f"map({fn_name})")``; a
+    plain-callable ``fn`` gets a ``task`` span per item named
+    ``f"{fn_name}[{i}]"``.
 
-    Same "first one wins" rule applies to pauses (see
-    :meth:`Aggregate._run_branches`'s docstring for the human-in-the-loop
-    implication): if several items independently call ``approve()``/
-    ``ask_human()`` unanswered, only the first (by index) raises and pauses
-    this attempt -- the rest simply re-pause on a later ``resume()``.
+    ``timeout_per_item`` bounds each item's run on its own daemon thread
+    (the same race :func:`~composeai.flow._run_with_timeout` uses for
+    ``@task(timeout=)``) -- a single hung branch raises
+    :class:`~composeai.errors.TaskTimeoutError` for that item instead of
+    blocking every other item, and the whole ``map()`` call, forever.
+    ``None`` (the default) means no per-item timeout.
+
+    ``on_error`` controls how failures (including per-item timeouts) are
+    reported:
+
+    - ``"raise"`` (default): the first failure *by index* is re-raised
+      from ``map()`` once every item has settled, exactly as above.
+    - ``"collect"``: every item's outcome is instead returned as a
+      :class:`MapResult` (``ok``, ``value``, ``error``, ``error_type``) --
+      the *whole* ``list[MapResult]`` comes back with no exception raised,
+      one entry per item in input order, so a caller can salvage the
+      items that succeeded even when others failed. Errors are carried as
+      strings (``error``/``error_type``), never as exception objects, so
+      the result is safe to journal and replay. Interrupts (a nested
+      ``approve()``/``ask_human()`` pause) and interpreter-level exits
+      (e.g. ``KeyboardInterrupt``, ``SystemExit``) are never collected --
+      those are ``BaseException``s by design and always propagate even in
+      collect mode.
+
+    Same "first one wins" rule applies to pauses in ``on_error="raise"``
+    mode (see :meth:`Aggregate._run_branches`'s docstring for the
+    human-in-the-loop implication): if several items independently call
+    ``approve()``/``ask_human()`` unanswered, only the first (by index)
+    raises and pauses this attempt -- the rest simply re-pause on a later
+    ``resume()``.
 
     Inside an active ``@flow`` body, each item runs under its own
     deterministic journal scope (``"map#n[i]"``, ``n`` this ``map()``
     call's own step number and ``i`` the item's *input* index -- both
     reserved serially, before any item is dispatched, on this thread --
-    see ``composeai.runs``'s scope-stack module docs). Without this, any
-    ``@task``/``@agent``/nested-``@flow``/nested-``pipe``/nested-``aggregate``
-    call inside ``fn`` would journal under a key assigned by whichever
-    worker thread happened to reach it first -- parallel *completion*
-    order, not input order -- so a crash mid-map followed by a differently-
-    scheduled resume could attach a completed item's cached output to a
-    different item, silently. This applies to *every* stage kind (bare
-    callables, ``@agent`` functions, ``Pipeline``/``Aggregate``), not just
-    ``@task`` -- there is no special-casing by stage type anymore.
+    see ``composeai.runs``'s scope-stack module docs). Every completed
+    item is journaled individually as it finishes, so a failed ``map()``
+    (whether it raises or, with ``on_error="collect"``, records a failed
+    ``MapResult``) never discards its siblings' completed work across a
+    ``resume()`` -- only the unfinished tail actually re-runs. Without
+    per-item scoping, any ``@task``/``@agent``/nested-``@flow``/nested-
+    ``pipe``/nested-``aggregate`` call inside ``fn`` would journal under a
+    key assigned by whichever worker thread happened to reach it first --
+    parallel *completion* order, not input order -- so a crash mid-map
+    followed by a differently-scheduled resume could attach a completed
+    item's cached output to a different item, silently. This applies to
+    *every* stage kind (bare callables, ``@agent`` functions,
+    ``Pipeline``/``Aggregate``), not just ``@task`` -- there is no
+    special-casing by stage type anymore.
     """
+    if on_error not in ("raise", "collect"):
+        raise ConfigError(f"map(): on_error must be 'raise' or 'collect', got {on_error!r}")
+
     items = list(items)
     fn_name = _stage_name(fn)
 
@@ -509,10 +569,23 @@ def map(fn: Stage, items: Sequence[Any], *, max_workers: int | None = None) -> l
 
     def dispatch(i: int, item: Any) -> Any:
         scope = item_scopes[i]
+        name = f"{fn_name}[{i}]"
+
+        def call() -> Any:
+            return _invoke_stage(fn, item, streaming=False, task_name=name)
+
+        def run() -> Any:
+            if timeout_per_item is None:
+                return call()
+            # Same daemon-thread race @task(timeout=) uses -- see
+            # flow._run_with_timeout for why not a ThreadPoolExecutor, and
+            # for the journal abandon-guard the worker gets.
+            return _run_with_timeout(call, (), {}, timeout_per_item, name)
+
         if scope is None:
-            return _invoke_stage(fn, item, streaming=False, task_name=f"{fn_name}[{i}]")
+            return run()
         with runs.push_scope(scope):
-            return _invoke_stage(fn, item, streaming=False, task_name=f"{fn_name}[{i}]")
+            return run()
 
     with tracing.span("aggregate", f"map({fn_name})"):
 
@@ -528,6 +601,21 @@ def map(fn: Stage, items: Sequence[Any], *, max_workers: int | None = None) -> l
                 pool.submit(tracing.propagate(_run_one), i, item) for i, item in enumerate(items)
             ]
             outcomes = [future.result() for future in futures]
+
+        if on_error == "collect":
+            results: list[Any] = []
+            for output, exc in outcomes:
+                if exc is None:
+                    results.append(MapResult(ok=True, value=output))
+                elif isinstance(exc, Exception) and not getattr(exc, "_compose_pause", False):
+                    results.append(
+                        MapResult(ok=False, error=str(exc), error_type=type(exc).__name__)
+                    )
+                else:
+                    # Pauses (BaseException by design) and interpreter-level
+                    # exits always propagate -- collect never swallows them.
+                    raise exc
+            return results
 
         for _output, exc in outcomes:
             if exc is not None:

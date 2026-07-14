@@ -1238,3 +1238,20 @@ def test_contract_sdk_failure_raises_provider_error():
 
     model = _model(raiser)
     contract.assert_sdk_failure_raises_provider_error(model, model_id="gpt-5-test")
+
+
+def test_openai_model_timeout_passed_to_sdk_client(monkeypatch):
+    import openai
+
+    from composeai.models.openai import OpenAIModel
+
+    captured: dict = {}
+
+    class FakeOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(openai, "OpenAI", FakeOpenAI)
+    model = OpenAIModel("gpt-5.5", api_key="k", timeout=45)
+    model._get_client()
+    assert captured["timeout"] == 45

@@ -13,15 +13,17 @@ pre-item.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import subprocess
 import sys
+import textwrap
 import time
 from pathlib import Path
 
 import pytest
 
-from composeai import agent, runs
+from composeai import agent, cli, runs
 from composeai.cli import main
 from composeai.combinators import aggregate, pipe
 from composeai.testing import FakeModel, replay_cassette
@@ -1179,3 +1181,87 @@ def test_cmd_runs_usage_totals_do_not_mix_across_runs(capsys):
     # bulk query accidentally pooled both runs' llm spans together, at
     # least one row would show 60 instead.
     assert all(r["tokens"] == 30 for r in rows)
+
+
+# =====================================================================
+# `compose --import` (Task 10)
+# =====================================================================
+
+
+def test_trace_import_flag_decodes_app_types(tmp_path, monkeypatch, capsys):
+    """The flagship repro from docs/missing-features.md item 3: a flow with an
+    app-defined pydantic output, run in a SEPARATE process, must be traceable
+    only with --import (and fail with the unregistered-type message without).
+
+    The app module is *imported by its real dotted name* in the child
+    process (via `python -c "import cli_import_app_schemas as m; ..."`)
+    rather than executed directly (`python cli_import_app_schemas.py`):
+    running it directly would set the module's `__name__` -- and therefore
+    `CliWidget.__module__`, since that's fixed at class-definition time --
+    to `"__main__"`, a name `--import` can never match by re-importing
+    (`__main__` in any other process refers to *that* process's own entry
+    module, e.g. pytest itself, not this app). This mirrors the real repro
+    in the docs (`research_agent.schemas:SubQuestion`): the type-defining
+    module there is imported by its package path from a separate entry
+    point, never run as the script itself.
+    """
+    module_dir = tmp_path / "appmod"
+    module_dir.mkdir()
+    (module_dir / "cli_import_app_schemas.py").write_text(
+        textwrap.dedent(
+            """
+            from pydantic import BaseModel
+
+            from composeai import flow, task
+
+
+            class CliWidget(BaseModel):
+                name: str
+
+
+            @task
+            def build_widget(name: str) -> CliWidget:
+                return CliWidget(name=name)
+
+
+            @flow
+            def cli_widget_flow() -> CliWidget:
+                return build_widget("w1")
+            """
+        )
+    )
+    state_dir = tmp_path / "state"
+    env = os.environ.copy()
+    env["COMPOSE_DIR"] = str(state_dir)
+    env["PYTHONPATH"] = str(module_dir) + os.pathsep + env.get("PYTHONPATH", "")
+    driver = (
+        "import cli_import_app_schemas as m\n"
+        "run = m.cli_widget_flow.run()\n"
+        "print(run.id)\n"
+    )
+    proc = subprocess.run(
+        [sys.executable, "-c", driver],
+        capture_output=True,
+        text=True,
+        env=env,
+        check=True,
+    )
+    run_id = proc.stdout.strip().splitlines()[-1]
+
+    monkeypatch.setenv("COMPOSE_DIR", str(state_dir))
+    monkeypatch.syspath_prepend(str(module_dir))
+
+    # Without --import: the decode error surfaces as a clean CLI failure.
+    assert cli.main(["trace", run_id]) == 1
+    err = capsys.readouterr().err
+    assert "unregistered type" in err
+
+    # With --import: the trace renders.
+    assert cli.main(["trace", "--import", "cli_import_app_schemas", run_id]) == 0
+    out = capsys.readouterr().out
+    assert "cli_widget_flow" in out
+
+
+def test_import_flag_unknown_module_is_a_clean_error(capsys):
+    assert cli.main(["runs", "--import", "definitely_not_a_module_xyz"]) == 1
+    assert "--import definitely_not_a_module_xyz" in capsys.readouterr().err

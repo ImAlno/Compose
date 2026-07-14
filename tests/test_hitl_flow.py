@@ -17,15 +17,8 @@ import pytest
 from composeai import runs
 from composeai.combinators import map as compose_map
 from composeai.errors import ConfigError
-from composeai.flow import _FLOW_REGISTRY, flow, resume, task
+from composeai.flow import flow, resume, task
 from composeai.hitl import Interrupt, approve, ask_human
-
-
-@pytest.fixture(autouse=True)
-def _clear_flow_registry():
-    yield
-    _FLOW_REGISTRY.clear()
-
 
 # --- approve(): pause + resume round trip --------------------------------------
 

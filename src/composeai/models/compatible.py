@@ -23,7 +23,7 @@ from collections.abc import Iterator
 from types import SimpleNamespace
 from typing import Any
 
-from ..errors import ProviderError
+from ..errors import ConfigError, ProviderError
 from ..messages import (
     ContentPart,
     ImagePart,
@@ -36,7 +36,7 @@ from ..messages import (
     Usage,
 )
 from .base import Model, ModelRequest, ModelResponse, RawStreamEvent, ToolSpec
-from .prices import compute_cost, get_price
+from .prices import ModelPrice, compute_cost, get_price, register_price
 
 _PROVIDER = "openai-compatible"
 
@@ -122,7 +122,17 @@ def _is_strict_compatible(schema: Any) -> bool:
 
 
 class OpenAICompatibleModel:
-    """``Model`` adapter for any OpenAI-compatible Chat Completions server."""
+    """``Model`` adapter for any OpenAI-compatible Chat Completions server.
+
+    ``schema_mode="prompt"`` embeds the output schema in the prompt and
+    parses the reply leniently instead of relying on ``response_format``
+    enforcement. When the reply still doesn't parse, this adapter does
+    *not* raise a provider-level error: it returns the response with
+    ``parsed=None``, and the agent loop's output extraction raises a
+    repairable ``ComposeError`` -- eligible for ``@agent(max_repairs=)``
+    corrective turns, not ``retries=`` (which stays provider-error
+    territory, e.g. a dropped connection).
+    """
 
     def __init__(
         self,
@@ -132,12 +142,20 @@ class OpenAICompatibleModel:
         client: Any = None,
         api_key: str | None = None,
         max_retries: int = 2,
+        timeout: float | None = None,
+        schema_mode: str = "native",
     ) -> None:
+        if schema_mode not in ("native", "prompt"):
+            raise ConfigError(
+                f"schema_mode must be 'native' or 'prompt', got {schema_mode!r}"
+            )
         self.model_id = model_id
         self._base_url = base_url
         self._client = client
         self._api_key = api_key
         self._max_retries = max_retries
+        self._timeout = timeout
+        self._schema_mode = schema_mode
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -148,11 +166,16 @@ class OpenAICompatibleModel:
         # even though they don't check it -- default to a placeholder
         # rather than requiring one like the hosted OpenAI/Anthropic adapters.
         api_key = self._api_key or "unused"
-        self._client = openai.OpenAI(
-            api_key=api_key,
-            base_url=self._base_url,
-            max_retries=self._max_retries,
-        )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "base_url": self._base_url,
+            "max_retries": self._max_retries,
+        }
+        # Only pass timeout when set: the SDK's own default is a NOT_GIVEN
+        # sentinel, and an explicit None would mean "no timeout at all".
+        if self._timeout is not None:
+            client_kwargs["timeout"] = self._timeout
+        self._client = openai.OpenAI(**client_kwargs)
         return self._client
 
     def complete(self, request: ModelRequest) -> ModelResponse:
@@ -300,14 +323,23 @@ class OpenAICompatibleModel:
         if request.tools:
             kwargs["tools"] = [_tool_to_param(spec) for spec in request.tools]
         if request.output_schema is not None:
-            kwargs["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": _schema_name(request.output_schema),
-                    "schema": request.output_schema,
-                    "strict": _is_strict_compatible(request.output_schema),
-                },
-            }
+            if self._schema_mode == "prompt":
+                # Servers that accept response_format but silently ignore it
+                # (Ollama cloud, some vLLM/LM Studio configs) get the schema
+                # embedded in the prompt instead; _finalize parses leniently.
+                # Appended to the last USER message -- a second system
+                # message proved less reliable against long agent system
+                # prompts in live testing.
+                _append_schema_instruction(api_messages, request.output_schema)
+            else:
+                kwargs["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": _schema_name(request.output_schema),
+                        "schema": request.output_schema,
+                        "strict": _is_strict_compatible(request.output_schema),
+                    },
+                }
         return kwargs
 
     def _finalize(
@@ -344,15 +376,36 @@ class OpenAICompatibleModel:
         # for every other stop reason is exactly what it expects.
         parsed: dict[str, Any] | None = None
         if request.output_schema is not None and stop_reason == StopReason.END_TURN:
+            text = message.text
             try:
-                parsed = json.loads(message.text)
+                parsed = json.loads(text)
             except json.JSONDecodeError as exc:
-                raise ProviderError(
-                    "Server returned non-JSON content for a structured-output "
-                    f"request: {exc}",
-                    provider=_PROVIDER,
-                    model=self.model_id,
-                ) from exc
+                if self._schema_mode == "prompt":
+                    parsed = _lenient_json_parse(text)
+                if parsed is None:
+                    if usage.reasoning_tokens and not text.strip():
+                        raise ProviderError(
+                            "Model returned only reasoning tokens with empty "
+                            "content for a structured-output request -- the "
+                            "server likely does not enforce constrained decoding "
+                            "for this model; try openai_compatible(..., "
+                            "schema_mode='prompt') or raise max_tokens.",
+                            provider=_PROVIDER,
+                            model=self.model_id,
+                        ) from exc
+                    if self._schema_mode != "prompt":
+                        raise ProviderError(
+                            "Server returned non-JSON content for a structured-output "
+                            f"request: {exc}",
+                            provider=_PROVIDER,
+                            model=self.model_id,
+                        ) from exc
+                    # Prompt mode: leave parsed=None and fall through instead of
+                    # raising -- ModelResponse(parsed=None) reaches agentfn.py's
+                    # _extract_output, which retries json.loads(message.text) and
+                    # raises a *repairable* ComposeError, letting
+                    # @agent(max_repairs=) recover with a corrective turn instead
+                    # of the run failing outright on a single malformed reply.
 
         return ModelResponse(
             message=message,
@@ -364,15 +417,52 @@ class OpenAICompatibleModel:
         )
 
 
-def openai_compatible(base_url: str, model: str, *, api_key: str | None = None) -> Model:
+def openai_compatible(
+    base_url: str,
+    model: str,
+    *,
+    api_key: str | None = None,
+    timeout: float | None = None,
+    input_price: float | None = None,
+    output_price: float | None = None,
+    schema_mode: str = "native",
+) -> Model:
     """Build a :class:`Model` for any OpenAI-compatible Chat Completions server.
 
-    There is no ``"provider/model-id"`` string form for this adapter (unlike
+    ``timeout`` (seconds) bounds each HTTP request at the SDK-client level --
+    the only in-flight guard against a hung server; ``@agent(timeout=)`` is a
+    turn-boundary watchdog and cannot interrupt a single call. There is no
+    ``"provider/model-id"`` string form for this adapter (unlike
     ``"anthropic/..."`` / ``"openai/..."``) since ``base_url`` is required and
     varies per deployment; ``registry.resolve()`` accepts the returned
     ``Model`` instance directly as a passthrough.
+
+    ``input_price``/``output_price`` (USD per **million** tokens, both
+    together or neither) register this model's price so ``compose costs``,
+    ``Run.usage.cost_usd``, and ``Budget(usd=...)`` work for paid compat
+    providers (ollama.com, hosted vLLM, ...) -- without a price, spend is
+    invisible to a USD budget (see ``Budget``'s docstring). Registration is
+    process-global per ``(provider, model)``: last writer wins.
+
+    ``schema_mode="prompt"`` embeds the output schema in the prompt and
+    parses the reply leniently (fence-stripping, first balanced object) --
+    for servers that accept but ignore ``response_format`` (Ollama cloud
+    does, for every model). Reasoning models burn hidden tokens before
+    content in this mode: keep ``max_tokens`` generous. When the reply
+    still doesn't parse, that surfaces as a repairable ``ComposeError``
+    from the agent loop -- eligible for ``@agent(max_repairs=)`` turns,
+    not ``retries=`` (which stays provider-error territory).
     """
-    return OpenAICompatibleModel(model, base_url=base_url, api_key=api_key)
+    if (input_price is None) != (output_price is None):
+        raise ConfigError(
+            "openai_compatible(): pass both input_price and output_price "
+            "(USD per million tokens), or neither"
+        )
+    if input_price is not None and output_price is not None:
+        register_price(_PROVIDER, model, ModelPrice(input=input_price, output=output_price))
+    return OpenAICompatibleModel(
+        model, base_url=base_url, api_key=api_key, timeout=timeout, schema_mode=schema_mode
+    )
 
 
 # --- request-side mapping ----------------------------------------------------
@@ -476,6 +566,87 @@ def _schema_name(schema: dict[str, Any]) -> str:
     if isinstance(title, str) and _SCHEMA_NAME_RE.match(title):
         return title
     return _DEFAULT_SCHEMA_NAME
+
+
+_FENCE_RE = re.compile(r"^```[A-Za-z0-9_-]*\s*\n?(.*?)\n?\s*```\s*$", re.DOTALL)
+
+
+def _append_schema_instruction(
+    api_messages: list[dict[str, Any]], schema: dict[str, Any]
+) -> None:
+    instruction = (
+        "Respond ONLY with a single JSON object that conforms to this JSON "
+        "Schema -- no markdown fences, no commentary:\n" + json.dumps(schema)
+    )
+    part = {"type": "text", "text": instruction}
+    for message in reversed(api_messages):
+        if message["role"] == "user" and isinstance(message.get("content"), list):
+            message["content"].append(part)
+            return
+    api_messages.append({"role": "user", "content": [part]})
+
+
+def _strip_fences(text: str) -> str:
+    match = _FENCE_RE.match(text.strip())
+    return match.group(1).strip() if match else text.strip()
+
+
+def _iter_balanced_objects(text: str) -> Iterator[str]:
+    """Yield every balanced top-level ``{...}`` substring in ``text``, left to right.
+
+    Tracks JSON string state so braces inside string values don't unbalance
+    the scan. A candidate that never balances (an opening ``{`` with no
+    matching close) simply ends the scan from that point. Callers that only
+    want the first candidate can call ``next(iter, None)``; ``_lenient_json_parse``
+    walks the whole sequence so a false lead (balanced but not valid JSON,
+    e.g. ``{placeholder}``) doesn't stop it from finding a real object later
+    in the same text.
+    """
+    start = text.find("{")
+    while start != -1:
+        depth = 0
+        in_string = False
+        escaped = False
+        for i in range(start, len(text)):
+            ch = text[i]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif ch == "\\":
+                    escaped = True
+                elif ch == '"':
+                    in_string = False
+            elif ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    yield text[start : i + 1]
+                    break
+        start = text.find("{", start + 1)
+
+
+def _lenient_json_parse(text: str) -> dict[str, Any] | None:
+    """Best-effort JSON recovery for ``schema_mode="prompt"`` responses."""
+    candidate = _strip_fences(text)
+    try:
+        result = json.loads(candidate)
+        return result if isinstance(result, dict) else None
+    except json.JSONDecodeError:
+        pass
+    # Try every balanced `{...}` substring in turn, not just the first -- a
+    # balanced-but-invalid lead (e.g. prose containing a literal `{placeholder}`)
+    # would otherwise mask a real JSON object appearing later in the text.
+    for balanced in _iter_balanced_objects(candidate):
+        try:
+            result = json.loads(balanced)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(result, dict):
+            return result
+    return None
 
 
 # --- response-side mapping ----------------------------------------------------

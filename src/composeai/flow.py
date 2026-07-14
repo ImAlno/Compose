@@ -142,6 +142,7 @@ class Task:
         retries: int,
         timeout: float | None,
         name: str | None,
+        replace: bool,
     ) -> None:
         self._fn = fn
         self.name = name or fn.__name__
@@ -152,7 +153,11 @@ class Task:
         # RunContext.reserve_scope_segment) -- two @task objects sharing one
         # name would silently share one counter/namespace inside any flow
         # that calls both, the same reason @flow/@agent names are unique.
-        if self.name in _TASK_REGISTRY:
+        # `replace=True` re-binds an existing name instead of raising --
+        # only affects steps not yet journaled (a replaced @task's changed
+        # body has no fingerprint/staleness check of its own; the enclosing
+        # @flow's fingerprint check is what protects already-journaled runs).
+        if not replace and self.name in _TASK_REGISTRY:
             raise ConfigError(
                 f"@task name {self.name!r} is already registered -- task names "
                 "must be unique per process (they key the durable journal's "
@@ -216,7 +221,11 @@ def task(fn: Callable[..., Any]) -> Task: ...
 
 @overload
 def task(
-    *, retries: int = 0, timeout: float | None = None, name: str | None = None
+    *,
+    retries: int = 0,
+    timeout: float | None = None,
+    name: str | None = None,
+    replace: bool = False,
 ) -> Callable[[Callable[..., Any]], Task]: ...
 
 
@@ -226,15 +235,22 @@ def task(
     retries: int = 0,
     timeout: float | None = None,
     name: str | None = None,
+    replace: bool = False,
 ) -> Task | Callable[[Callable[..., Any]], Task]:
     """Decorate a plain function into a :class:`Task` -- journaled when called inside a ``@flow``.
 
     Usable bare (``@task``) or with arguments (``@task(retries=2,
     timeout=30, name=...)``).
+
+    ``replace=True`` re-binds an existing task name instead of raising
+    ``ConfigError``. A replaced task only affects steps not yet journaled --
+    an already-journaled step's stored value still replays unchanged; the
+    enclosing ``@flow``'s own fingerprint check (not this) is what guards
+    against replaying stale journal entries against changed flow code.
     """
 
     def decorator(f: Callable[..., Any]) -> Task:
-        return Task(f, retries=retries, timeout=timeout, name=name)
+        return Task(f, retries=retries, timeout=timeout, name=name, replace=replace)
 
     if fn is not None:
         return decorator(fn)
@@ -277,12 +293,19 @@ class Flow:
     existing one (by ``run_id``), in this process or a fresh one.
     """
 
-    def __init__(self, fn: Callable[..., Any], *, name: str | None) -> None:
+    def __init__(self, fn: Callable[..., Any], *, name: str | None, replace: bool) -> None:
         self._fn = fn
         self.name = name or fn.__name__
         self.fingerprint = _compute_fingerprint(fn)
         register_annotation_types(fn)
-        if self.name in _FLOW_REGISTRY:
+        # `replace=True` re-binds an existing name instead of raising -- safe
+        # for already-journaled/paused runs: `resume()` compares the run's
+        # stored fingerprint against *this* (the currently-registered)
+        # flow's fingerprint and raises ResumeMismatchError on a mismatch
+        # (see `resume()`'s docstring), so a replaced flow's changed source
+        # is still caught there, not silently resumed like a replaced
+        # standalone @agent would be.
+        if not replace and self.name in _FLOW_REGISTRY:
             raise ConfigError(
                 f"@flow name {self.name!r} is already registered -- flow names must be "
                 "unique per process; pass an explicit name=... to disambiguate"
@@ -333,11 +356,13 @@ def flow(fn: Callable[..., Any]) -> Flow: ...
 
 
 @overload
-def flow(*, name: str | None = None) -> Callable[[Callable[..., Any]], Flow]: ...
+def flow(
+    *, name: str | None = None, replace: bool = False
+) -> Callable[[Callable[..., Any]], Flow]: ...
 
 
 def flow(
-    fn: Callable[..., Any] | None = None, *, name: str | None = None
+    fn: Callable[..., Any] | None = None, *, name: str | None = None, replace: bool = False
 ) -> Flow | Callable[[Callable[..., Any]], Flow]:
     """Decorate a plain function into a :class:`Flow` -- a durable, journaled run.
 
@@ -345,10 +370,16 @@ def flow(
     Registers ``name -> Flow`` in a module-level registry (duplicate names
     raise :class:`~composeai.errors.ConfigError`) so :func:`resume` can
     look a flow up by name from a run row.
+
+    ``replace=True`` re-binds an existing flow name instead of raising
+    ``ConfigError``. Safe for already-paused/journaled runs: a replaced
+    flow's changed source still gets caught on resume by the fingerprint
+    check (:class:`~composeai.errors.ResumeMismatchError`, unless
+    ``allow_code_change=True`` -- see :func:`resume`).
     """
 
     def decorator(f: Callable[..., Any]) -> Flow:
-        return Flow(f, name=name)
+        return Flow(f, name=name, replace=replace)
 
     if fn is not None:
         return decorator(fn)
@@ -368,11 +399,16 @@ def _execute_flow(
     preloaded = store.journal_all(run_id)
     ctx = RunContext(run_id=run_id, store=store, preloaded=preloaded)
 
+    # Budget enforcement is cumulative across attempts: seed with spend
+    # already persisted by earlier attempts of this run (zero for a fresh
+    # run -- no spans exist yet; skipped entirely when there's no budget).
+    baseline = store.prior_llm_usage(run_id) if budget is not None else None
+
     with use_run_context(ctx), tracing.use_trace(trace_id):
         root_span: tracing.Span | None = None
         try:
             with tracing.span("flow", flow_obj.name) as root_span:
-                with budget_scope(budget, root_span):
+                with budget_scope(budget, root_span, baseline=baseline):
                     output = flow_obj._fn(*args, **kwargs)
                 trace = tracing.current_trace()
                 assert trace is not None
@@ -507,7 +543,11 @@ def _run_flow_journaled(
 
 
 def resume(
-    run_id: str, answers: dict[str, Any] | None = None, *, allow_code_change: bool = False
+    run_id: str,
+    answers: dict[str, Any] | None = None,
+    *,
+    budget: Budget | None = None,
+    allow_code_change: bool = False,
 ) -> Run:
     """Resume a durable run (``@flow`` or standalone ``@agent``) by ``run_id``.
 
@@ -543,7 +583,13 @@ def resume(
         steps replay, the rest actually runs -- an unanswered (or newly
         reached) interrupt pauses again, with the same ``Run`` shape. The
         run's original ``budget`` (if any -- see ``Flow.run``) is decoded
-        from the row and reapplied for this attempt too.
+        from the row and reapplied for this attempt too. ``budget`` (if
+        given) replaces the run's stored budget for this attempt and every
+        later one -- persisted as a plain last-write-wins column update
+        (deliberately not journaled: the journal is first-write-wins and
+        would freeze the first override). Prior attempts' real spend still
+        counts against the new cap. ``None`` keeps the stored budget;
+        clearing one via resume is not supported.
     """
     store = _open_default_store()
     row = store.get_run(run_id)
@@ -551,7 +597,7 @@ def resume(
         raise ConfigError(f"no run found with run_id {run_id!r}")
 
     if row["kind"] == "agent":
-        return agentfn.resume_standalone_agent(run_id, row, answers)
+        return agentfn.resume_standalone_agent(run_id, row, answers, budget=budget)
 
     flow_obj = _FLOW_REGISTRY.get(row["name"])
     if flow_obj is None:
@@ -580,11 +626,22 @@ def resume(
             "(the journal may no longer match the new code's call sequence)"
         )
 
+    if budget is not None:
+        # Persist AFTER every abort-check above, same reasoning as answers:
+        # an override alongside an impossible resume must not be locked in.
+        store.update_run(
+            run_id, budget_json=runs.encode_budget(budget), updated_at=time.time()
+        )
     apply_resume_answers(store, run_id, answers)
     args, kwargs = _decode_call(row["args_json"])
-    budget = runs.decode_budget(row.get("budget_json"))
+    effective_budget = budget if budget is not None else runs.decode_budget(row.get("budget_json"))
     return _execute_flow(
-        flow_obj, run_id=run_id, trace_id=row["trace_id"], args=args, kwargs=kwargs, budget=budget
+        flow_obj,
+        run_id=run_id,
+        trace_id=row["trace_id"],
+        args=args,
+        kwargs=kwargs,
+        budget=effective_budget,
     )
 
 

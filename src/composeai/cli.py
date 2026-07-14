@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib
 import json
 import os
 import re
@@ -42,6 +43,7 @@ from typing import Any
 
 from . import tracing
 from ._encoding import from_jsonable, to_jsonable
+from ._schema import register_module_types
 from .errors import ComposeError
 from .messages import Message, StopReason, Usage
 from .models.base import ModelResponse
@@ -808,6 +810,25 @@ def _export_entry(row: sqlite3.Row) -> dict[str, Any]:
 # --- argparse wiring -----------------------------------------------------------
 
 
+def _apply_imports(args: argparse.Namespace) -> None:
+    """Import app modules named via --import and register their types.
+
+    Runs each module's top-level code -- the same trust model as the decode
+    error's own "import the module that defines it" instruction; the module
+    name comes from the operator's command line, never from stored data.
+    """
+    for module_name in getattr(args, "imports", None) or []:
+        try:
+            module = importlib.import_module(module_name)
+        except Exception as exc:
+            # Not just ImportError: a module whose top-level code raises
+            # anything else (SyntaxError, a bad decorator call, ...) must
+            # still exit via the clean CLI error path below rather than an
+            # unhandled traceback.
+            raise ComposeError(f"--import {module_name}: {exc}") from exc
+        register_module_types(module)
+
+
 def _positive_int(value: str) -> int:
     """``argparse`` ``type=`` for ``-n/--limit``: a plain positive integer.
 
@@ -843,16 +864,40 @@ def _build_parser() -> argparse.ArgumentParser:
     p_runs.add_argument("--kind", choices=["agent", "flow", "pipe", "aggregate"])
     p_runs.add_argument("--since")
     p_runs.add_argument("-q", "--query", dest="query")
+    p_runs.add_argument(
+        "--import",
+        dest="imports",
+        action="append",
+        metavar="MODULE",
+        help="Import MODULE and register its pydantic/dataclass/enum types "
+        "before decoding stored data (repeatable).",
+    )
     p_runs.set_defaults(func=cmd_runs)
 
     p_trace = sub.add_parser("trace", help="Render one run's trace.")
     p_trace.add_argument("run_id", nargs="?")
     p_trace.add_argument("--last", action="store_true")
+    p_trace.add_argument(
+        "--import",
+        dest="imports",
+        action="append",
+        metavar="MODULE",
+        help="Import MODULE and register its pydantic/dataclass/enum types "
+        "before decoding stored data (repeatable).",
+    )
     p_trace.set_defaults(func=cmd_trace)
 
     p_diff = sub.add_parser("diff", help="Structurally diff two runs' traces.")
     p_diff.add_argument("run_a")
     p_diff.add_argument("run_b")
+    p_diff.add_argument(
+        "--import",
+        dest="imports",
+        action="append",
+        metavar="MODULE",
+        help="Import MODULE and register its pydantic/dataclass/enum types "
+        "before decoding stored data (repeatable).",
+    )
     p_diff.set_defaults(func=cmd_diff)
 
     p_costs = sub.add_parser("costs", help="Group-by spend report over llm spans.")
@@ -866,6 +911,14 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export = sub.add_parser("export", help="Export a run's llm spans as a cassette.")
     p_export.add_argument("run_id")
     p_export.add_argument("--cassette", required=True)
+    p_export.add_argument(
+        "--import",
+        dest="imports",
+        action="append",
+        metavar="MODULE",
+        help="Import MODULE and register its pydantic/dataclass/enum types "
+        "before decoding stored data (repeatable).",
+    )
     p_export.set_defaults(func=cmd_export)
 
     return parser
@@ -875,6 +928,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
     try:
+        _apply_imports(args)
         return int(args.func(args))
     except ComposeError as exc:
         print(f"compose: {exc}", file=sys.stderr)

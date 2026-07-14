@@ -73,6 +73,23 @@ def register_annotation_types(fn: Callable[..., Any]) -> None:
         _register_type_recursive(value, seen)
 
 
+def register_module_types(module: Any) -> None:
+    """Register every pydantic model / dataclass / enum in ``module``'s namespace.
+
+    The whole-module companion to :func:`register_annotation_types`, for
+    processes that decode data they never encoded -- ``compose --import``
+    (see :mod:`composeai.cli`) and app-side trace tooling. Scans
+    ``vars(module)`` and recurses into field types the same way decoration-
+    time registration does. Re-exported types register under their *true*
+    defining module (the registry key comes from ``cls.__module__``), so
+    scanning a barrel/schemas module that re-exports types works. Never
+    imports anything itself -- the caller chose to import ``module``.
+    """
+    seen: set[type] = set()
+    for value in vars(module).values():
+        _register_type_recursive(value, seen)
+
+
 def _register_type_recursive(annotation: Any, seen: set[type]) -> None:
     if isinstance(annotation, type):
         if annotation in seen:

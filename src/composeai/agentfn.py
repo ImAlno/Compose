@@ -25,7 +25,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
-from pydantic import TypeAdapter
+from pydantic import TypeAdapter, ValidationError
 
 from . import events, runs, tracing
 from ._encoding import from_jsonable, to_jsonable
@@ -77,23 +77,26 @@ class AgentFunction:
         max_tokens: int,
         max_turns: int,
         retries: int,
+        max_repairs: int,
         timeout: float | None,
         fallback: str | Model | None,
         cache: bool,
+        name: str | None,
+        replace: bool,
     ) -> None:
         self._fn = fn
-        self.name = fn.__name__
+        self.name = name or fn.__name__
         # Phase 8 (human-in-the-loop): register by name so `resume()` can route
         # a paused/crashed standalone agent run back to its definition (mirrors
-        # `composeai.flow.Flow`'s own registry). Duplicate names -- agents don't
-        # take an explicit `name=` override the way `@flow`/`@task` do, so this
-        # means giving the function itself a different name.
-        if self.name in _AGENT_REGISTRY:
+        # `composeai.flow.Flow`'s own registry). `replace=True` re-binds an
+        # existing name instead of raising (see `agent()`'s docstring for the
+        # standalone-resume caveat that comes with doing so).
+        if not replace and self.name in _AGENT_REGISTRY:
             raise ConfigError(
                 f"@agent name {self.name!r} is already registered -- agent names "
                 "must be unique per process (needed so resume() can route a "
-                "paused agent run back to its definition); give the function a "
-                "different name"
+                "paused agent run back to its definition); pass name=... or "
+                "replace=True, or rename the function"
             )
         _AGENT_REGISTRY[self.name] = self
         # Phase 7 (durable flows): register every pydantic model/dataclass/enum
@@ -116,6 +119,7 @@ class AgentFunction:
         self._max_tokens = max_tokens
         self._max_turns = max_turns
         self._retries = retries
+        self._max_repairs = max_repairs
         self._timeout = timeout
         self._fallback = fallback
         self._cache = cache
@@ -161,9 +165,12 @@ def agent(
     max_tokens: int = 16000,
     max_turns: int = 10,
     retries: int = 0,
+    max_repairs: int = 0,
     timeout: float | None = None,
     fallback: str | Model | None = None,
     cache: bool = False,
+    name: str | None = None,
+    replace: bool = False,
 ) -> Callable[[Callable[..., Any]], AgentFunction]:
     """Decorate a function into an :class:`AgentFunction` -- a typed, runnable agent.
 
@@ -195,6 +202,26 @@ def agent(
     for identical calls) -- for deterministic, offline test fixtures,
     prefer a cassette (``composeai.testing.record_cassette``/
     ``replay_cassette``/the ``cassette`` pytest fixture) instead.
+
+    ``max_repairs`` (structured-output agents only): when the model's final
+    reply fails JSON parsing or schema validation, instead of raising
+    immediately, append the error as a corrective user message and re-ask --
+    up to ``max_repairs`` times per run. Each repair is a full-price LLM
+    turn (the whole conversation is re-sent) and counts against
+    ``max_turns``. Dramatically more effective than a cold re-run for small
+    local models; keep the default ``0`` when you'd rather fail fast.
+
+    ``name`` overrides the registered/routing name (default: the decorated
+    function's ``__name__``) -- the same escape hatch ``@flow``/``@task``
+    already have, e.g. for two agents that would otherwise share a
+    function name.
+
+    ``replace=True`` re-binds an existing agent name instead of raising
+    ``ConfigError``. WARNING: standalone-agent resume has no fingerprint/
+    staleness check (unlike ``@flow`` -- see ``resume_standalone_agent``),
+    so a paused run resumed after a replace continues silently against the
+    NEW definition. Meant for tests and deliberate rebinding, not for
+    multi-tenant factories -- those want distinct ``name=``s.
     """
 
     def decorator(fn: Callable[..., Any]) -> AgentFunction:
@@ -206,9 +233,12 @@ def agent(
             max_tokens=max_tokens,
             max_turns=max_turns,
             retries=retries,
+            max_repairs=max_repairs,
             timeout=timeout,
             fallback=fallback,
             cache=cache,
+            name=name,
+            replace=replace,
         )
 
     return decorator
@@ -296,7 +326,17 @@ def _extract_output(agent_fn: AgentFunction, response: ModelResponse) -> Any:
         payload = payload["result"]
 
     adapter = TypeAdapter(agent_fn.output_type)
-    return adapter.validate_python(payload)
+    try:
+        return adapter.validate_python(payload)
+    except ValidationError as exc:
+        # Normalized so callers (and the repair turn) can catch one exception
+        # type for every "the model's own output was wrong" case -- the
+        # JSON-decode and missing-'result' branches above already raise
+        # ComposeError; a raw pydantic error escaping here was the odd one out.
+        raise ComposeError(
+            f"@agent {agent_fn.name!r}: model output failed validation for "
+            f"{agent_fn.output_type!r}: {exc}"
+        ) from exc
 
 
 # --- model resolution (primary + lazy fallback) ------------------------------
@@ -863,7 +903,10 @@ def _run_agent_journaled(
 
 
 def resume_standalone_agent(
-    run_id: str, row: dict[str, Any], answers: dict[str, Any] | None = None
+    run_id: str,
+    row: dict[str, Any],
+    answers: dict[str, Any] | None = None,
+    budget: Budget | None = None,
 ) -> Run:
     """Resume a paused (or crashed) standalone ``@agent`` run.
 
@@ -873,9 +916,15 @@ def resume_standalone_agent(
     the originally-encoded call args if no snapshot exists yet -- only
     possible if the process died before the very first turn boundary), and
     continues the loop under the *same* ``trace_id`` as the original run --
-    with the same ``budget`` (if any) the original ``.run(budget=...)`` call
-    used, decoded from the row (see ``composeai.runs.encode_budget``/
-    ``decode_budget``).
+    with the ``budget`` the original ``.run(budget=...)`` call used, decoded
+    from the row (see ``composeai.runs.encode_budget``/``decode_budget``),
+    *unless* this call's own ``budget=`` argument overrides it: an explicit
+    override here is persisted back onto the run row (``store.update_run``,
+    last-write-wins -- a later resume without an override then sees the new
+    budget) before the loop resumes, and either way the cap is applied on
+    top of a ``baseline`` of spend from earlier attempts (see
+    ``RunStore.prior_llm_usage``) so it bounds the run's lifetime spend, not
+    just this attempt's.
 
     ``answers`` are journaled (see
     :func:`~composeai.runs.apply_resume_answers`) only *after* the checks
@@ -924,18 +973,29 @@ def resume_standalone_agent(
         )
 
     store = runs.open_default()
+    if budget is not None:
+        store.update_run(
+            run_id, budget_json=runs.encode_budget(budget), updated_at=time.time()
+        )
     runs.apply_resume_answers(store, run_id, answers)
     call_args, call_kwargs = (
         _decode_agent_call(row["args_json"]) if row["args_json"] else ((), {})
     )
-    budget = runs.decode_budget(row.get("budget_json"))
+    if budget is None:
+        budget = runs.decode_budget(row.get("budget_json"))
+    budget_baseline = store.prior_llm_usage(run_id) if budget is not None else None
     trace_id = row["trace_id"] or new_ulid()
     with runs.use_run_id(run_id), tracing.use_trace(trace_id):
         return runs.settle_agent_run(
             store,
             run_id,
             lambda: _run_agent_uncached(
-                agent_fn, call_args, call_kwargs, budget=budget, scope_key=""
+                agent_fn,
+                call_args,
+                call_kwargs,
+                budget=budget,
+                budget_baseline=budget_baseline,
+                scope_key="",
             ),
         )
 
@@ -947,6 +1007,7 @@ def _run_agent_uncached(
     *,
     streaming: bool = False,
     budget: Budget | None = None,
+    budget_baseline: Usage | None = None,
     scope_key: str = "",
     step_key: str | None = None,
 ) -> Run:
@@ -978,7 +1039,7 @@ def _run_agent_uncached(
     try:
         with tracing.span(
             "agent", agent_fn.name, attributes=span_attributes
-        ) as agent_span, budget_scope(budget, agent_span):
+        ) as agent_span, budget_scope(budget, agent_span, baseline=budget_baseline):
             state = _RunState(_make_slot(agent_fn._model, cache=agent_fn._cache))
             tool_specs = [t.spec for t in agent_fn._tools] or None
             # `start_time` is *this call's* clock, not the run's -- there is
@@ -1018,6 +1079,8 @@ def _run_agent_uncached(
             else:
                 conversation = _build_conversation(agent_fn, call_args, call_kwargs)
                 turn = 0
+
+            repairs_used = 0
 
             while True:
                 turn += 1
@@ -1066,9 +1129,17 @@ def _run_agent_uncached(
                     continue
 
                 if response.stop_reason == StopReason.MAX_TOKENS:
+                    reasoning_hint = ""
+                    if response.usage.reasoning_tokens:
+                        reasoning_hint = (
+                            f" (it spent {response.usage.reasoning_tokens} tokens "
+                            "on internal reasoning before any visible output -- "
+                            "reasoning models can need a much larger max_tokens)"
+                        )
                     raise ComposeError(
                         f"@agent {agent_fn.name!r} hit max_tokens={agent_fn._max_tokens} "
-                        "before finishing its response; raise max_tokens to give it more room"
+                        "before finishing its response; raise max_tokens to give it "
+                        "more room" + reasoning_hint
                     )
 
                 if response.stop_reason == StopReason.REFUSAL:
@@ -1078,7 +1149,27 @@ def _run_agent_uncached(
                     )
 
                 if response.stop_reason == StopReason.END_TURN:
-                    output = _extract_output(agent_fn, response)
+                    try:
+                        output = _extract_output(agent_fn, response)
+                    except ComposeError as exc:
+                        # Repair turn: give the model its own validation error
+                        # and re-ask within the same conversation. Bounded by
+                        # max_repairs, and each pass still runs through the
+                        # max_turns / timeout checks at the top of the loop.
+                        if repairs_used >= agent_fn._max_repairs:
+                            raise
+                        repairs_used += 1
+                        agent_span.attributes.setdefault("repairs", []).append(str(exc))
+                        conversation.append(
+                            Message.user(
+                                "Your previous reply did not match the required "
+                                f"output schema. Error: {exc}\n"
+                                "Reply again with ONLY a corrected JSON object "
+                                "matching the schema -- no markdown fences, no "
+                                "commentary."
+                            )
+                        )
+                        continue
                     break
 
                 # Only StopReason.OTHER reaches here in practice (TOOL_USE,

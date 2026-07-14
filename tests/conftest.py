@@ -31,28 +31,11 @@ def _redirect_compose_dir(tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
-def _clear_agent_registry():
-    """Function-scoped, global: ``@agent`` names are unique per-process (Phase 8,
-    mirroring ``@flow``'s registry -- see ``composeai.agentfn._AGENT_REGISTRY``),
-    and test functions across many files reuse common agent names (``researcher``,
-    ``runner``, ``greeter``, ...). Without clearing between every test, the second
-    test to define e.g. ``researcher`` would raise ConfigError on decoration.
-    """
+def _reset_registries():
+    """Function-scoped, global: @agent/@flow/@task names are unique per
+    process, and tests across files reuse common names. Uses the public
+    helper -- dogfooding composeai.testing.reset_registries()."""
     yield
-    from composeai.agentfn import _AGENT_REGISTRY
+    from composeai.testing import reset_registries
 
-    _AGENT_REGISTRY.clear()
-
-
-@pytest.fixture(autouse=True)
-def _clear_task_registry():
-    """Function-scoped, global: ``@task`` names are unique per-process (mirroring
-    ``@flow``/``@agent``'s own registries -- see ``composeai.flow._TASK_REGISTRY``),
-    and test functions across many files reuse common task names (``process``,
-    ``record``, ``t1``, ...). Without clearing between every test, the second
-    test to define e.g. ``record`` would raise ConfigError on decoration.
-    """
-    yield
-    from composeai.flow import _TASK_REGISTRY
-
-    _TASK_REGISTRY.clear()
+    reset_registries()
