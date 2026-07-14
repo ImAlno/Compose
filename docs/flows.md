@@ -113,6 +113,10 @@ On this second run, `fetch_sources`, `map(summarize)`, and `editor` all replay f
    └─ • publish [0ms]
 ```
 
+### Ctrl-C mid-run
+
+A sync `@flow`/`@agent` call is a facade over composeai's own always-running background engine. Pressing Ctrl-C raises `KeyboardInterrupt` in **your** code immediately, but the current attempt isn't cancelled — it keeps executing on composeai's runtime thread, unobserved by you from that point on; in a long-lived process (a notebook, a REPL) it can run all the way to completion. Either way the durable row lands cleanly — `"completed"`, `"failed"`, or still `"running"` if the process exits first — never a corrupt or half-written one, and every outcome is resumable. Don't `resume()` the same run in the *same* process right after a Ctrl-C expecting the prior attempt to already be gone: it may still be finishing, and it's first-write-wins on the journal (not timing) that keeps the two attempts from stepping on each other. True cancellation of the in-flight attempt isn't implemented today — this is the accepted trade-off of a synchronous facade over an async engine, not a bug.
+
 ## The determinism rule, and `compose.now()`/`compose.random()`
 
 Replay works by re-running the flow body and substituting journaled step results, in call order, wherever they occur. That only produces the right answer if **the flow body is a deterministic function of its journaled step results** — side effects, randomness, and clock reads belong inside `@task`/`@agent` calls, never directly in the flow body. Nothing detects a violation of this contract; a body that breaks it just won't replay correctly.

@@ -105,6 +105,42 @@ def _model(responses, model_id: str = "claude-sonnet-5") -> AnthropicModel:
     return AnthropicModel(model_id, client=_StubClient(responses))
 
 
+class _AsyncStubMessages:
+    """Async twin of ``_StubMessages``: duck-typed stand-in for
+    ``anthropic.AsyncAnthropic().messages`` (``create`` is a coroutine;
+    ``stream`` stays a plain method that returns an async context manager,
+    mirroring the real SDK's ``AsyncMessages.stream``)."""
+
+    def __init__(self, responses, stream_responses: Any = None) -> None:
+        self._responses = responses
+        self._stream_responses = stream_responses
+        self.calls: list[dict[str, Any]] = []
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any):
+        self.calls.append(kwargs)
+        if callable(self._responses):
+            return self._responses(kwargs)
+        return self._responses.pop(0)
+
+    def stream(self, **kwargs: Any):
+        self.stream_calls.append(kwargs)
+        if callable(self._stream_responses):
+            return self._stream_responses(kwargs)
+        return self._stream_responses.pop(0)
+
+
+class _AsyncStubClient:
+    def __init__(self, responses, stream_responses: Any = None) -> None:
+        self.messages = _AsyncStubMessages(responses, stream_responses)
+
+
+def _amodel(responses, model_id: str = "claude-sonnet-5") -> AnthropicModel:
+    model = AnthropicModel(model_id)
+    model._async_client = _AsyncStubClient(responses)  # type: ignore[attr-defined]
+    return model
+
+
 # --- stream() stub helpers ----------------------------------------------------
 
 
@@ -167,6 +203,37 @@ def _derived_text_event(text: str, snapshot: str) -> SimpleNamespace:
 
 def _model_stream(stream_responses, model_id: str = "claude-sonnet-5") -> AnthropicModel:
     return AnthropicModel(model_id, client=_StubClient([], stream_responses))
+
+
+class _AsyncStubMessageStream:
+    """Async twin of ``_StubMessageStream``: an async-context-manager whose
+    ``__aenter__`` returns an async-iterable over the same scripted raw
+    events, with an awaitable ``get_final_message()`` (mirroring the real
+    SDK's ``AsyncMessageStream``).
+    """
+
+    def __init__(self, raw_events, final_message) -> None:
+        self._raw_events = raw_events
+        self._final_message = final_message
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+    async def __aiter__(self):
+        for event in self._raw_events:
+            yield event
+
+    async def get_final_message(self):
+        return self._final_message
+
+
+def _amodel_stream(stream_responses, model_id: str = "claude-sonnet-5") -> AnthropicModel:
+    model = AnthropicModel(model_id)
+    model._async_client = _AsyncStubClient([], stream_responses)  # type: ignore[attr-defined]
+    return model
 
 
 # --- constructor / lazy client / missing key --------------------------------
@@ -427,7 +494,7 @@ def test_non_json_text_with_output_schema_raises_provider_error():
 
 def test_tool_use_stop_with_output_schema_does_not_crash_and_parsed_is_none():
     # Regression: an @agent combining tools=[...] with a non-str output_type
-    # sends output_schema on every turn (agentfn.py's _perform_turn), so a
+    # sends output_schema on every turn (agentfn.py's _aperform_turn), so a
     # tool_use-only turn has empty message.text -- json.loads('') must not
     # be attempted (it would raise and mask the real TOOL_USE stop reason
     # behind a spurious ProviderError).
@@ -1116,3 +1183,127 @@ def test_anthropic_model_timeout_passed_to_sdk_client(monkeypatch):
     model = AnthropicModel("claude-sonnet-5", api_key="k", timeout=45)
     model._get_client()
     assert captured["timeout"] == 45
+
+
+# --- async twins (acomplete / astream) ---------------------------------------
+
+
+def test_acomplete_maps_response_like_complete():
+    import asyncio
+
+    content = [_text_block("hello there")]
+    usage = _usage(input_tokens=11, output_tokens=22)
+
+    # complete() path
+    complete_model = _model([_response(content, usage=usage)])
+    complete_resp = complete_model.complete(
+        ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")])
+    )
+
+    # acomplete() path, same wire response
+    async_model = _amodel([_response(content, usage=usage)])
+
+    async def drive():
+        return await async_model.acomplete(
+            ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")])
+        )
+
+    async_resp = asyncio.run(drive())
+
+    assert async_resp.message.text == complete_resp.message.text
+    assert async_resp.stop_reason == complete_resp.stop_reason
+    assert async_resp.usage == complete_resp.usage
+
+
+def test_astream_events_match_stream():
+    import asyncio
+
+    events = [
+        _cb_start(0, _text_block("")),
+        _cb_delta(0, _text_delta("hello")),
+        _derived_text_event("hello", "hello"),
+        _cb_delta(0, _text_delta(" there")),
+        _cb_stop(0),
+    ]
+    final = _response([_text_block("hello there")])
+
+    # stream() path
+    sync_model = _model_stream([_StubMessageStream(events, final)])
+    sync_events = list(
+        sync_model.stream(ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")]))
+    )
+
+    # astream() path, same scripted event sequence
+    async_model = _amodel_stream([_AsyncStubMessageStream(events, final)])
+
+    async def drive():
+        result = []
+        async for event in async_model.astream(
+            ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")])
+        ):
+            result.append(event)
+        return result
+
+    async_events = asyncio.run(drive())
+
+    assert [e.kind for e in async_events] == [e.kind for e in sync_events]
+    async_resp = async_events[-1].response
+    sync_resp = sync_events[-1].response
+    assert async_resp is not None
+    assert sync_resp is not None
+    assert async_resp.message.text == sync_resp.message.text
+
+
+def test_async_client_constructed_with_same_kwargs(monkeypatch):
+    captured: dict = {}
+
+    class FakeAsyncAnthropic:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeAsyncAnthropic)
+    model = AnthropicModel("claude-sonnet-5", api_key="k", timeout=45)
+    model._get_async_client()
+    assert captured["api_key"] == "k"
+    assert captured["timeout"] == 45
+
+    captured_no_timeout: dict = {}
+
+    class FakeAsyncAnthropicNoTimeout:
+        def __init__(self, **kwargs):
+            captured_no_timeout.update(kwargs)
+
+    monkeypatch.setattr(anthropic, "AsyncAnthropic", FakeAsyncAnthropicNoTimeout)
+    model_no_timeout = AnthropicModel("claude-sonnet-5", api_key="k")
+    model_no_timeout._get_async_client()
+    assert "timeout" not in captured_no_timeout
+
+
+# --- injected sync client vs. the async engine's acomplete/astream discovery -
+
+
+def test_injected_sync_client_used_by_async_engine():
+    """A ``client=`` injected at construction is a SYNC client -- the async
+    engine's ``getattr(model, "acomplete", None)`` discovery (models/base.py)
+    must not route to ``acomplete``/``astream`` (which would silently build
+    an unrelated ``AsyncAnthropic`` from env/api_key instead, see
+    ``AnthropicModel.__init__``). It must fall back to running the injected
+    client's sync ``complete()`` off-thread, exactly as it would for a model
+    with no async methods at all.
+    """
+    from composeai.agentfn import agent
+
+    model = _model([_response([_text_block("Hello there.")])])
+    assert model.acomplete is None
+    assert model.astream is None
+
+    @agent(model=model, max_turns=2, name="anthropic_injected_client_agent")
+    def greeter(name: str) -> str:
+        """You are a friendly greeter."""
+        return f"Greet {name}"
+
+    run = greeter.run("Ann")
+
+    assert run.output == "Hello there."
+    assert run.status == "completed"
+    assert len(model._client.messages.calls) == 1  # type: ignore[attr-defined]

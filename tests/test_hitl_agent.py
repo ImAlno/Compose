@@ -487,7 +487,7 @@ def test_pause_persists_snapshot_and_pending_interrupts_in_one_atomic_call(monke
     pending = {p["interrupt_id"] for p in store.pending_interrupts_all(run.id)}
     assert pending == {"tool:gate_1:call_1", "tool:gate_2:call_2"}
 
-    # `persist_pause` (inside `_process_tool_use`, atomically writing both
+    # `persist_pause` (inside `_aprocess_tool_use`, atomically writing both
     # interrupts + the snapshot + status) fires first; the one, single
     # `persist_pending_interrupt` call afterward is `settle_agent_run`'s own
     # *outer* top-level pause handling (idempotent -- re-writing the row for

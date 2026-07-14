@@ -19,7 +19,7 @@ anthropic = ["anthropic>=0.40"]
 openai = ["openai>=1.60"]
 mcp = ["mcp>=1.27,<2"]
 all = ["composeai[anthropic,openai,mcp]"]
-dev = ["pytest>=8", "ruff>=0.5", "pyright>=1.1.380", "anthropic>=0.40", "openai>=1.60", "mcp>=1.27,<2", "build"]
+dev = ["pytest>=8", "ruff>=0.5", "pyright>=1.1.380", "anthropic>=0.40", "openai>=1.60", "mcp>=1.27,<2", "build", "twine"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/composeai"]

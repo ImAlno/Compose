@@ -150,6 +150,42 @@ def _model(responses, model_id: str = "gpt-5-test") -> OpenAIModel:
     return OpenAIModel(model_id, client=_StubClient(responses))
 
 
+class _AsyncStubResponses:
+    """Async twin of ``_StubResponses``: duck-typed stand-in for
+    ``openai.AsyncOpenAI().responses`` (``create`` is a coroutine; ``stream``
+    stays a plain method that returns an async context manager, mirroring
+    the real SDK's ``AsyncResponses.stream``)."""
+
+    def __init__(self, responses, stream_responses: Any = None) -> None:
+        self._responses = responses
+        self._stream_responses = stream_responses
+        self.calls: list[dict[str, Any]] = []
+        self.stream_calls: list[dict[str, Any]] = []
+
+    async def create(self, **kwargs: Any):
+        self.calls.append(kwargs)
+        if callable(self._responses):
+            return self._responses(kwargs)
+        return self._responses.pop(0)
+
+    def stream(self, **kwargs: Any):
+        self.stream_calls.append(kwargs)
+        if callable(self._stream_responses):
+            return self._stream_responses(kwargs)
+        return self._stream_responses.pop(0)
+
+
+class _AsyncStubClient:
+    def __init__(self, responses, stream_responses: Any = None) -> None:
+        self.responses = _AsyncStubResponses(responses, stream_responses)
+
+
+def _amodel(responses, model_id: str = "gpt-5-test") -> OpenAIModel:
+    model = OpenAIModel(model_id)
+    model._async_client = _AsyncStubClient(responses)  # type: ignore[attr-defined]
+    return model
+
+
 # --- stream() stub helpers ----------------------------------------------------
 
 
@@ -248,6 +284,37 @@ def _response_error(code: str = "server_error", message: str = "boom") -> Simple
 
 def _model_stream(stream_responses, model_id: str = "gpt-5-test") -> OpenAIModel:
     return OpenAIModel(model_id, client=_StubClient([], stream_responses))
+
+
+class _AsyncStubResponseStream:
+    """Async twin of ``_StubResponseStream``: an async-context-manager whose
+    ``__aenter__`` returns an async-iterable over the same scripted raw
+    events, with an awaitable ``get_final_response()`` (mirroring the real
+    SDK's ``AsyncResponseStream``).
+    """
+
+    def __init__(self, raw_events, final_response) -> None:
+        self._raw_events = raw_events
+        self._final_response = final_response
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> bool:
+        return False
+
+    async def __aiter__(self):
+        for event in self._raw_events:
+            yield event
+
+    async def get_final_response(self):
+        return self._final_response
+
+
+def _amodel_stream(stream_responses, model_id: str = "gpt-5-test") -> OpenAIModel:
+    model = OpenAIModel(model_id)
+    model._async_client = _AsyncStubClient([], stream_responses)  # type: ignore[attr-defined]
+    return model
 
 
 # --- constructor / lazy client / missing key --------------------------------
@@ -1255,3 +1322,125 @@ def test_openai_model_timeout_passed_to_sdk_client(monkeypatch):
     model = OpenAIModel("gpt-5.5", api_key="k", timeout=45)
     model._get_client()
     assert captured["timeout"] == 45
+
+
+# --- async twins (acomplete / astream) ---------------------------------------
+
+
+def test_acomplete_maps_response_like_complete():
+    import asyncio
+
+    output = [_message_item(_output_text_content("hello there"))]
+    usage = _usage(input_tokens=11, output_tokens=22)
+
+    # complete() path
+    complete_model = _model([_response(output, usage=usage)])
+    complete_resp = complete_model.complete(
+        ModelRequest(model="gpt-5-test", messages=[Message.user("hi")])
+    )
+
+    # acomplete() path, same wire response
+    async_model = _amodel([_response(output, usage=usage)])
+
+    async def drive():
+        return await async_model.acomplete(
+            ModelRequest(model="gpt-5-test", messages=[Message.user("hi")])
+        )
+
+    async_resp = asyncio.run(drive())
+
+    assert async_resp.message.text == complete_resp.message.text
+    assert async_resp.stop_reason == complete_resp.stop_reason
+    assert async_resp.usage == complete_resp.usage
+
+
+def test_astream_events_match_stream():
+    import asyncio
+
+    final = _response([_message_item(_output_text_content("hello there"))])
+    events = [_stream_text_delta("hello"), _stream_text_delta(" there"), _stream_completed(final)]
+
+    # stream() path
+    sync_model = _model_stream([_StubResponseStream(events, final)])
+    sync_events = list(
+        sync_model.stream(ModelRequest(model="gpt-5-test", messages=[Message.user("hi")]))
+    )
+
+    # astream() path, same scripted event sequence
+    async_model = _amodel_stream([_AsyncStubResponseStream(events, final)])
+
+    async def drive():
+        result = []
+        async for event in async_model.astream(
+            ModelRequest(model="gpt-5-test", messages=[Message.user("hi")])
+        ):
+            result.append(event)
+        return result
+
+    async_events = asyncio.run(drive())
+
+    assert [e.kind for e in async_events] == [e.kind for e in sync_events]
+    async_resp = async_events[-1].response
+    sync_resp = sync_events[-1].response
+    assert async_resp is not None
+    assert sync_resp is not None
+    assert async_resp.message.text == sync_resp.message.text
+
+
+def test_async_client_constructed_with_same_kwargs(monkeypatch):
+    import openai
+
+    from composeai.models.openai import OpenAIModel
+
+    captured: dict = {}
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeAsyncOpenAI)
+    model = OpenAIModel("gpt-5-test", api_key="k", timeout=45)
+    model._get_async_client()
+    assert captured["api_key"] == "k"
+    assert captured["timeout"] == 45
+
+    captured_no_timeout: dict = {}
+
+    class FakeAsyncOpenAINoTimeout:
+        def __init__(self, **kwargs):
+            captured_no_timeout.update(kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeAsyncOpenAINoTimeout)
+    model_no_timeout = OpenAIModel("gpt-5-test", api_key="k")
+    model_no_timeout._get_async_client()
+    assert "timeout" not in captured_no_timeout
+
+
+# --- injected sync client vs. the async engine's acomplete/astream discovery -
+
+
+def test_injected_sync_client_used_by_async_engine():
+    """A ``client=`` injected at construction is a SYNC client -- the async
+    engine's ``getattr(model, "acomplete", None)`` discovery (models/base.py)
+    must not route to ``acomplete``/``astream`` (which would silently build
+    an unrelated ``AsyncOpenAI`` from env/api_key instead, see
+    ``OpenAIModel.__init__``). It must fall back to running the injected
+    client's sync ``complete()`` off-thread, exactly as it would for a model
+    with no async methods at all.
+    """
+    from composeai.agentfn import agent
+
+    model = _model([_response([_message_item(_output_text_content("Hello there."))])])
+    assert model.acomplete is None
+    assert model.astream is None
+
+    @agent(model=model, max_turns=2, name="openai_injected_client_agent")
+    def greeter(name: str) -> str:
+        """You are a friendly greeter."""
+        return f"Greet {name}"
+
+    run = greeter.run("Ann")
+
+    assert run.output == "Hello there."
+    assert run.status == "completed"
+    assert len(model._client.responses.calls) == 1  # type: ignore[attr-defined]

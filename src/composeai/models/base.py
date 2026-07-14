@@ -122,7 +122,19 @@ class Model(Protocol):
     path) must keep satisfying that check. Call sites that want to stream
     look for the method with ``getattr(model, "stream", None)`` and degrade
     to plain ``complete()`` when it's absent (see
-    ``composeai.agentfn._invoke_model``).
+    ``composeai.agentfn._ainvoke_model``).
+
+    Async capability follows the same duck-discovered pattern, not a
+    Protocol member: an adapter may *additionally* implement ``async def
+    acomplete(self, request: ModelRequest) -> ModelResponse`` and/or ``def
+    astream(self, request: ModelRequest) -> AsyncIterator[RawStreamEvent]``
+    (an async generator, mirroring ``stream()``). The engine prefers
+    ``acomplete``/``astream`` when present -- checked with
+    ``getattr(model, "acomplete", None) is not None`` -- and otherwise
+    falls back to running the sync methods off-thread: ``asyncio.to_thread(
+    model.complete, request)`` for a single call, or iterating sync
+    ``stream()`` via ``to_thread`` hops when only sync streaming is
+    available.
     """
 
     def complete(self, request: ModelRequest) -> ModelResponse: ...

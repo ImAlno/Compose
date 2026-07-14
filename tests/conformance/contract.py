@@ -91,7 +91,7 @@ def assert_tool_use_with_output_schema_does_not_crash(
     Regression for the "structured-output parse crash on any non-END_TURN
     stop reason" critical: an ``@agent`` combining ``tools=[...]`` with a
     non-``str`` ``output_type`` sends ``output_schema`` on *every* turn
-    (``agentfn.py``'s ``_perform_turn``), including the first turn where the
+    (``agentfn.py``'s ``_aperform_turn``), including the first turn where the
     model just calls a tool and returns no text at all. Adapters must only
     attempt to JSON-decode the response text when ``stop_reason`` is
     ``END_TURN`` -- for ``TOOL_USE`` (this scenario), ``parsed`` must stay

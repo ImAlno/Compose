@@ -327,3 +327,47 @@ def test_stream_thinking_part_response_done_still_carries_full_message():
     events = list(fake.stream(_req()))
     assert events[-1].kind == "response_done"
     assert events[-1].response == response
+
+
+# --- async twins (acomplete / astream) ---
+
+
+def test_fake_model_acomplete_consumes_script_in_order():
+    import asyncio
+
+    from composeai.models.base import ModelRequest
+
+    model = FakeModel(["one", "two"])
+    request = ModelRequest(
+        model="fake", messages=[Message.user("hi")], system=None, tools=None,
+        output_schema=None, max_tokens=10, temperature=None, provider=None,
+    )
+
+    async def drive():
+        first = await model.acomplete(request)
+        second = await model.acomplete(request)
+        return first.message.text, second.message.text
+
+    assert asyncio.run(drive()) == ("one", "two")
+
+
+def test_fake_model_astream_yields_response_done_last():
+    import asyncio
+
+    from composeai.models.base import ModelRequest
+
+    model = FakeModel(["hello world"])
+    request = ModelRequest(
+        model="fake", messages=[Message.user("hi")], system=None, tools=None,
+        output_schema=None, max_tokens=10, temperature=None, provider=None,
+    )
+
+    async def drive():
+        events = []
+        async for event in model.astream(request):
+            events.append(event)
+        return events
+
+    events = asyncio.run(drive())
+    assert events[-1].kind == "response_done"
+    assert events[-1].response is not None

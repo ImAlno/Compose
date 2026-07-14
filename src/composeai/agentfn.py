@@ -21,16 +21,17 @@ import json
 import threading
 import time
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 
-from . import events, runs, tracing
+from . import _runtime, events, runs, tracing
+from ._dispatch import _run_sync_on_own_thread, gather_settled, run_stage
 from ._encoding import from_jsonable, to_jsonable
 from ._ids import new_ulid
 from ._schema import register_annotation_types, resolve_annotations, seal_schema
+from ._storeasync import worker_for
 from .errors import (
     AgentTimeoutError,
     ComposeError,
@@ -376,28 +377,91 @@ class _RunState:
         self.fallback_active = False
 
 
-def _invoke_model(
+# Sentinel for `_ainvoke_model`'s own-thread `next()` hops (see
+# `_dispatch._run_sync_on_own_thread`) over a sync `stream()` iterator --
+# `None` can't be used because a legitimate `RawStreamEvent` is never `None`
+# but we still need a value that can never collide with one, and
+# `next(iterator, default)` needs *a* default to avoid `StopIteration`
+# (which can't propagate through a thread boundary cleanly).
+_STREAM_SENTINEL = object()
+
+
+async def _ainvoke_model(
     slot: _ModelSlot, request: ModelRequest, streaming: bool, llm_span: tracing.Span
 ) -> ModelResponse:
     """Call ``slot.model`` for one request, streaming deltas onto the bus if possible.
 
-    When ``streaming`` is true and the model has a ``stream`` method (an
-    optional extension -- see :class:`~composeai.models.base.Model`), drives
-    it and forwards each :class:`~composeai.models.base.RawStreamEvent` onto
-    the ambient event bus as an :class:`~composeai.events.Event` (a no-op
-    when there's no ambient bus), using the model's final ``response_done``
-    event as the result. Otherwise (non-streaming, or a model lacking
-    ``stream``) this is exactly ``slot.model.complete(request)``.
-    """
-    stream_fn = getattr(slot.model, "stream", None) if streaming else None
-    if stream_fn is None:
-        return slot.model.complete(request)
+    When ``streaming`` is true and the model has an ``astream``/``stream``
+    method (an optional extension -- see
+    :class:`~composeai.models.base.Model`), drives it and forwards each
+    :class:`~composeai.models.base.RawStreamEvent` onto the ambient event
+    bus as an :class:`~composeai.events.Event` (a no-op when there's no
+    ambient bus), using the model's final ``response_done`` event as the
+    result. Otherwise this is ``await slot.model.acomplete(request)`` when
+    the model exposes it, or ``slot.model.complete(request)`` run off the
+    event loop on its own dedicated thread when it doesn't (see
+    :func:`~composeai._dispatch._run_sync_on_own_thread`).
 
-    response: ModelResponse | None = None
-    for raw_event in stream_fn(request):
+    Model invocation prefers the model's ``acomplete``/``astream`` when it
+    exposes them (the duck-discovery rule); otherwise it falls back to
+    running the sync ``complete``/``stream`` off the event loop via
+    :func:`~composeai._dispatch._run_sync_on_own_thread` -- deliberately NOT
+    ``asyncio.to_thread``, whose shared, bounded default executor a custom
+    sync ``Model`` that re-enters a composeai facade (e.g. calls another
+    ``@agent`` synchronously from inside ``complete()``) could starve at
+    fan-out >= pool size, same class of deadlock ``run_stage``'s module
+    docstring documents for sync stage bodies. A sync ``stream()`` is an
+    ordinary (blocking) iterator, so it's consumed via repeated
+    ``_run_sync_on_own_thread(next, (iterator, sentinel), {})`` hops -- one
+    dedicated thread per event -- rather than a single call, so control
+    returns to the loop between events instead of draining the whole stream
+    off-loop in one go. Event handling (the ``events.emit`` call for every
+    non-``response_done`` event) is factored into :func:`_forward_raw_event`
+    and shared verbatim by both branches.
+    """
+    if streaming:
+        astream_fn = getattr(slot.model, "astream", None)
+        stream_fn = getattr(slot.model, "stream", None) if astream_fn is None else None
+    else:
+        astream_fn = None
+        stream_fn = None
+
+    if astream_fn is None and stream_fn is None:
+        acomplete_fn = getattr(slot.model, "acomplete", None)
+        if acomplete_fn is not None:
+            return await acomplete_fn(request)
+
+        def _complete_sync() -> ModelResponse:
+            response = slot.model.complete(request)
+            # `CachingModel.last_was_hit` (composeai.testing) is
+            # thread-local by design (correct for the sync engine, where
+            # the same thread calls `complete()` and later reads the
+            # flag). Routed through `to_thread`, that read would instead
+            # happen on the runtime loop thread in `_acall_llm` right
+            # after this returns -- a *different* thread than the one that
+            # actually ran `complete()` -- and would always see the
+            # thread-local default of `False`. Tag the span here instead,
+            # on the very thread the call ran on, while the flag is still
+            # visible; `_acall_llm`'s own (now-redundant for this path,
+            # still correct for a real `acomplete`) check is left as-is.
+            if getattr(slot.model, "last_was_hit", False):
+                llm_span.attributes["cached"] = True
+            return response
+
+        # NOT asyncio.to_thread: that helper hands the call to the loop's
+        # shared, bounded default executor (min(32, cpu+4) threads) -- a
+        # custom sync Model.complete() that itself re-enters a composeai
+        # facade (e.g. calls another @agent synchronously) would pin one of
+        # those slots while the nested call needs a slot of the *same* pool,
+        # starving forever at fan-out >= pool size; otherwise it's just a
+        # hard cap on model-call throughput. A dedicated thread per call has
+        # no shared bound, so nesting can never starve it -- same rationale
+        # as `_dispatch.run_stage`'s module docstring for sync stage bodies.
+        return await _run_sync_on_own_thread(_complete_sync, (), {})
+
+    def _forward_raw_event(raw_event: Any) -> ModelResponse | None:
         if raw_event.kind == "response_done":
-            response = raw_event.response
-            continue
+            return raw_event.response
         name = raw_event.tool_name if raw_event.tool_name is not None else slot.label
         data = {"id": raw_event.tool_call_id} if raw_event.tool_call_id is not None else None
         events.emit(
@@ -410,6 +474,28 @@ def _invoke_model(
                 data=data,
             )
         )
+        return None
+
+    response: ModelResponse | None = None
+    if astream_fn is not None:
+        async for raw_event in astream_fn(request):
+            result = _forward_raw_event(raw_event)
+            if result is not None:
+                response = result
+    elif stream_fn is not None:
+        iterator = stream_fn(request)
+        while True:
+            # NOT asyncio.to_thread, for the same reason as `_complete_sync`
+            # above: its shared, bounded default executor could starve if a
+            # custom sync Model.stream() re-enters a composeai facade from
+            # inside its iterator. One dedicated thread per hop has no
+            # shared bound to starve.
+            raw_event = await _run_sync_on_own_thread(next, (iterator, _STREAM_SENTINEL), {})
+            if raw_event is _STREAM_SENTINEL:
+                break
+            result = _forward_raw_event(raw_event)
+            if result is not None:
+                response = result
     if response is None:
         raise ComposeError(
             f"Model.stream() for {slot.label!r} ended without yielding a "
@@ -419,7 +505,7 @@ def _invoke_model(
     return response
 
 
-def _call_llm(
+async def _acall_llm(
     slot: _ModelSlot,
     system: str | None,
     messages: list[Message],
@@ -430,6 +516,17 @@ def _call_llm(
     retries: int,
     streaming: bool = False,
 ) -> ModelResponse:
+    """Call ``slot.model`` once inside its own ``llm`` span, with retry/fallback bookkeeping.
+
+    Builds the :class:`~composeai.models.base.ModelRequest`, opens the
+    ``llm`` span, and calls :func:`_ainvoke_model` -- retrying on
+    ``ProviderError`` (and on a response whose own ``stop_reason`` reports
+    ``ERROR``, normalized into one here) up to ``retries`` times, recording
+    each attempt on the span's ``retries`` attribute. On success, records
+    usage, budget-checks, and tags the span ``cached`` when the model's
+    ``last_was_hit`` says so (Phase 9's ``@agent(cache=True)``).
+    ``tracing.span``/``check_budgets`` stay synchronous -- neither awaits.
+    """
     request = ModelRequest(
         model=slot.bare_id,
         messages=list(messages),
@@ -448,7 +545,7 @@ def _call_llm(
         attempt = 0
         while True:
             try:
-                response = _invoke_model(slot, request, streaming, llm_span)
+                response = await _ainvoke_model(slot, request, streaming, llm_span)
             except ProviderError as exc:
                 llm_span.attributes.setdefault("retries", []).append(
                     {"type": type(exc).__name__, "message": str(exc)}
@@ -458,14 +555,14 @@ def _call_llm(
                     continue
                 raise
             if response.stop_reason == StopReason.ERROR:
-                # A *successful* call (no exception -- `_invoke_model` returned
+                # A *successful* call (no exception -- `_ainvoke_model` returned
                 # normally) whose own stop_reason nonetheless reports failure:
                 # no adapter shipped with composeai emits this today, but a
                 # custom `Model` might, and treating it as terminal would
                 # silently discard the retries/fallback a user configured
                 # specifically for resilience against provider failures.
                 # Converting it into a `ProviderError` here reuses the exact
-                # retry loop above and `_perform_turn`'s existing fallback
+                # retry loop above and `_aperform_turn`'s existing fallback
                 # path below, uniformly -- no separate mechanism needed.
                 message = (
                     f"model returned stop_reason=ERROR (raw={response.raw_stop_reason!r})"
@@ -480,10 +577,6 @@ def _call_llm(
                     message, provider=attributes.get("provider"), model=slot.bare_id
                 )
             llm_span.usage = response.usage
-            # Phase 9 (@agent(cache=True)): duck-typed, so this module never
-            # needs to import composeai.testing.CachingModel just to check --
-            # see that class's docstring for why usage is already zeroed on
-            # the response itself by the time we get here.
             if getattr(slot.model, "last_was_hit", False):
                 llm_span.attributes["cached"] = True
             check_budgets()
@@ -491,7 +584,7 @@ def _call_llm(
             return response
 
 
-def _perform_turn(
+async def _aperform_turn(
     agent_fn: AgentFunction,
     agent_span: tracing.Span,
     state: _RunState,
@@ -501,8 +594,19 @@ def _perform_turn(
     output_schema: dict[str, Any] | None,
     streaming: bool = False,
 ) -> ModelResponse:
+    """Run one model turn, retrying against ``agent_fn._fallback`` on a ``ProviderError``.
+
+    Calls :func:`_acall_llm` against the currently active model slot; if
+    that raises ``ProviderError`` and a fallback is configured (and hasn't
+    already been switched to for this run), resolves it via ``_make_slot``,
+    marks it active on ``state``, tags the enclosing agent span's
+    ``fallback_used`` attribute, and retries once against the fallback.
+    ``_make_slot`` (fallback model resolution) stays a plain sync call --
+    it's in-memory registry/client-construction work, not I/O the loop
+    needs protecting from.
+    """
     try:
-        return _call_llm(
+        return await _acall_llm(
             state.slot,
             system,
             conversation,
@@ -521,7 +625,7 @@ def _perform_turn(
         agent_span.attributes["fallback_used"] = (
             agent_fn._fallback if isinstance(agent_fn._fallback, str) else state.slot.label
         )
-        return _call_llm(
+        return await _acall_llm(
             state.slot,
             system,
             conversation,
@@ -539,7 +643,7 @@ def _perform_turn(
 
 class UnknownToolError(Exception):
     """Internal control-flow signal: raised inside the ``tool`` span (see
-    :func:`_execute_one_tool`) when the model calls a name this agent has no
+    :func:`_aexecute_one_tool`) when the model calls a name this agent has no
     ``@tool`` for, then caught right there and turned into the same
     ``is_error`` :class:`ToolResultPart` as before (content ``"unknown
     tool"``, loop continues) -- the only effect of routing it through a real
@@ -551,7 +655,7 @@ class UnknownToolError(Exception):
     """
 
 
-def _execute_one_tool(agent_fn: AgentFunction, call: ToolCallPart) -> ToolResultPart:
+async def _aexecute_one_tool(agent_fn: AgentFunction, call: ToolCallPart) -> ToolResultPart:
     """Run one tool call, wrapped in its own ``tool`` span.
 
     An unknown tool name and a regular ``Exception`` raised by the tool body
@@ -562,6 +666,10 @@ def _execute_one_tool(agent_fn: AgentFunction, call: ToolCallPart) -> ToolResult
     :class:`BaseException`, so it is *not* caught here -- it propagates out
     (through the ``tool`` span, marked ``"paused"`` rather than ``"error"``
     -- see :mod:`composeai.tracing`) to whichever caller is watching for it.
+
+    Execution itself is one call to ``_dispatch.run_stage``, which
+    internally makes the ``timeout is None`` distinction explicitly (see its
+    module docstring) rather than branching on it here.
     """
     tool_obj = agent_fn._tools_by_name.get(call.name)
     try:
@@ -570,17 +678,14 @@ def _execute_one_tool(agent_fn: AgentFunction, call: ToolCallPart) -> ToolResult
                 raise UnknownToolError(
                     f"the model called tool {call.name!r} but this agent has no such tool"
                 )
-            if tool_obj.timeout is None:
-                content = tool_obj.execute(call.arguments)
-            else:
-                content = runs._run_with_timeout(
-                    tool_obj.execute,
-                    (call.arguments,),
-                    {},
-                    tool_obj.timeout,
-                    call.name,
-                    kind="@tool",
-                )
+            content = await run_stage(
+                tool_obj.execute,
+                (call.arguments,),
+                {},
+                timeout=tool_obj.timeout,
+                name=call.name,
+                kind="@tool",
+            )
             tool_span.set_output(content)
     except UnknownToolError:
         return ToolResultPart(tool_call_id=call.id, content="unknown tool", is_error=True)
@@ -611,7 +716,7 @@ def _deny_tool_call(call: ToolCallPart) -> ToolResultPart:
 def _pause_for_unanswered_approval(call: ToolCallPart) -> _Pause:
     """Build, span-record, and return (not raise) the pause for an unanswered approval call.
 
-    Does *not* persist anything -- ``_process_tool_use`` collects every
+    Does *not* persist anything -- ``_aprocess_tool_use`` collects every
     pause built this way and, if the batch ends up pausing, persists all of
     them atomically together with the turn's ``agent_state`` snapshot (see
     :meth:`~composeai.runs.RunStore.persist_pause`). Previously this
@@ -633,7 +738,7 @@ def _pause_for_unanswered_approval(call: ToolCallPart) -> _Pause:
         return exc
 
 
-def _process_tool_use(
+async def _aprocess_tool_use(
     agent_fn: AgentFunction,
     calls: list[ToolCallPart],
     conversation: list[Message],
@@ -646,29 +751,44 @@ def _process_tool_use(
     unanswered or any tool body raises ``_Pause`` (``ask_human``).
 
     1. Every non-approval-gated call not already in ``seed_results`` (a
-       restored snapshot's already-completed calls) runs in parallel, same
-       as before Phase 8 -- each under its own ``tool:{call_id}`` journal
-       scope (see ``composeai.runs``'s scope-stack module docs), so a
-       ``@task``/``@agent`` call inside a tool body gets a deterministic key
-       regardless of which worker thread reaches it first.
+       restored snapshot's already-completed calls) runs concurrently --
+       each under its own ``tool:{call_id}`` journal scope (see
+       ``composeai.runs``'s scope-stack module docs), so a ``@task``/
+       ``@agent`` call inside a tool body gets a deterministic key
+       regardless of which coroutine reaches it first. The fan-out is
+       ``_dispatch.gather_settled`` over one ``_arun_one`` coroutine per
+       call: each coroutine catches ``BaseException`` itself and returns a
+       ``(call_id, result, exc)`` triple rather than letting it propagate,
+       so ``gather_settled``'s own exception slot is never actually
+       observed. ``runs.push_scope`` still wraps each call's execution:
+       contextvars are task-local (a coroutine scheduled via ``gather``/
+       ``gather_settled`` gets its own copy of the context at the moment
+       it's scheduled), giving each concurrently dispatched call its own
+       scope isolation.
     2. Approval-gated calls are then checked *in order*: answered True ->
        execute now (same scope); answered False -> a "denied by user"
        ``is_error`` result; unanswered -> build (not yet persist) its pause
        (see :func:`_pause_for_unanswered_approval`) and keep scanning the
        rest (independent calls may still resolve) -- this "keep scanning"
        rule also applies when an *answered* call's own body pauses (e.g.
-       nested ``ask_human()``): that used to ``break`` out of the loop
-       entirely, silently skipping every call after it; it now
-       ``continue``s, matching the unanswered-gate case two lines above and
-       this function's own contract.
+       nested ``ask_human()``): it ``continue``s rather than aborting the
+       batch, matching the unanswered-gate case two lines above.
     3. If anything paused, atomically persist every pending interrupt
        collected in steps 1-2 together with the ``conversation``/``turn``/
        whatever results *did* complete (so a resume doesn't redo them, and
        so a crash right after this point leaves a fully consistent,
        resumable pause -- see :meth:`~composeai.runs.RunStore.persist_pause`)
-       and raise the *first* pause encountered, in call order. Otherwise,
+       -- routed through ``worker_for(store).call(...)`` instead of calling
+       the store directly, so the write happens off the runtime loop thread
+       -- and raise the *first* pause encountered, in call order. Otherwise,
        merge every result into one batched user message, in the calls'
        original order.
+
+    ``runs.interrupt_lookup`` (approval-answer lookup) and
+    ``runs.push_scope`` stay direct sync calls: neither is on this task's
+    conversion list (the former is a shared helper also called from the
+    flow's own sync body), and the latter is pure in-memory contextvar
+    manipulation, not I/O.
     """
     results: dict[str, ToolResultPart] = dict(seed_results) if seed_results else {}
     approval_ids = {call.id for call in calls if _tool_requires_approval(agent_fn, call)}
@@ -680,21 +800,24 @@ def _process_tool_use(
 
     if normal_calls:
 
-        def _run_one(
+        async def _arun_one(
             call: ToolCallPart,
         ) -> tuple[str, ToolResultPart | None, BaseException | None]:
             try:
                 with runs.push_scope(f"tool:{call.id}"):
-                    return call.id, _execute_one_tool(agent_fn, call), None
+                    return call.id, await _aexecute_one_tool(agent_fn, call), None
             except BaseException as exc:  # noqa: BLE001 -- _Pause (or worse) settled below
                 return call.id, None, exc
 
         if len(normal_calls) == 1:
-            outcomes = [_run_one(normal_calls[0])]
+            outcomes = [await _arun_one(normal_calls[0])]
         else:
-            with ThreadPoolExecutor(max_workers=len(normal_calls)) as pool:
-                futures = [pool.submit(tracing.propagate(_run_one), c) for c in normal_calls]
-                outcomes = [f.result() for f in futures]
+            settled = await gather_settled([_arun_one(c) for c in normal_calls])
+            # `_arun_one` catches BaseException itself and always returns its
+            # triple normally, so `gather_settled`'s own exception slot is
+            # never populated in practice -- mirrors the sync version, where
+            # `f.result()` never raises from `_run_one`'s own body either.
+            outcomes = [outcome for outcome, _exc in settled]
 
         for call_id, result, exc in outcomes:
             if exc is None:
@@ -720,7 +843,7 @@ def _process_tool_use(
         if bool(value):
             try:
                 with runs.push_scope(f"tool:{call.id}"):
-                    results[call.id] = _execute_one_tool(agent_fn, call)
+                    results[call.id] = await _aexecute_one_tool(agent_fn, call)
             except _Pause as exc:
                 if pause_exc is None:
                     pause_exc = exc
@@ -730,7 +853,8 @@ def _process_tool_use(
 
     if pause_exc is not None:
         if run_id is not None:
-            runs.open_default().persist_pause(
+            await worker_for(runs.open_default()).call(
+                "persist_pause",
                 run_id=run_id,
                 interrupts=pending_interrupts,
                 scope_key=scope_key,
@@ -753,11 +877,20 @@ class _RestoredAgentState:
     partial_results: dict[str, ToolResultPart]
 
 
-def _load_agent_state(run_id: str | None, scope_key: str) -> _RestoredAgentState | None:
+async def _aload_agent_state(run_id: str | None, scope_key: str) -> _RestoredAgentState | None:
+    """Restore a run's saved ``agent_state`` snapshot, if one exists.
+
+    ``None`` when ``run_id`` is ``None`` (no durable run to restore from --
+    e.g. an agent nested directly in a bare pipe/aggregate, with no flow) or
+    when no snapshot row exists yet. The store read (``agent_state_get``)
+    routes through ``worker_for(store).call(...)`` instead of calling the
+    store directly, so it happens off the runtime loop thread (same
+    reasoning as :func:`_asnapshot_agent_state` below).
+    """
     if run_id is None:
         return None
     store = runs.open_default()
-    row = store.agent_state_get(run_id, scope_key)
+    row = await worker_for(store).call("agent_state_get", run_id, scope_key)
     if row is None:
         return None
     conversation = from_jsonable(json.loads(row["messages_json"]))
@@ -771,7 +904,7 @@ def _load_agent_state(run_id: str | None, scope_key: str) -> _RestoredAgentState
     )
 
 
-def _snapshot_agent_state(
+async def _asnapshot_agent_state(
     run_id: str | None,
     scope_key: str,
     conversation: list[Message],
@@ -791,11 +924,20 @@ def _snapshot_agent_state(
     ``COMPOSE_DIR``/``COMPOSE_TRACE_CONTENT`` note) -- making resume work
     with it disabled would require a different mechanism entirely (e.g.
     encrypting the snapshot at rest), not attempted here.
+
+    The write (``agent_state_put``) routes through
+    ``worker_for(store).call(...)`` -- the dedicated store writer thread
+    (:mod:`composeai._storeasync`) -- rather than calling the store directly
+    from the runtime loop thread, so one turn's snapshot write never blocks
+    every other coroutine the runtime loop is concurrently driving. Call
+    ordering is preserved (each ``await`` here still happens exactly where
+    the sync call did), so durability timing is unchanged.
     """
     if run_id is None:
         return
     store = runs.open_default()
-    store.agent_state_put(
+    await worker_for(store).call(
+        "agent_state_put",
         run_id=run_id,
         scope_key=scope_key,
         messages_json=json.dumps(to_jsonable(conversation)),
@@ -858,6 +1000,56 @@ def _run_agent(
     )
 
 
+async def _arun_agent(
+    agent_fn: AgentFunction,
+    call_args: tuple[Any, ...],
+    call_kwargs: dict[str, Any],
+    *,
+    streaming: bool = False,
+    budget: Budget | None = None,
+) -> Run:
+    """Async twin of :func:`_run_agent` (v0.4.0 Plan A, Task 8).
+
+    Same three-way routing, each branch calling its own async twin:
+    journaled-flow-step (:func:`_arun_agent_journaled`) when nested in a
+    ``@flow``, the plain uncached loop (:func:`_arun_agent_uncached`)
+    otherwise. ``composeai.combinators._ainvoke_stage`` is this function's
+    only caller today, and it only ever calls it from inside an ALREADY-OPEN
+    span (``map()``'s own "aggregate" span, or the "pipe"/"aggregate" span
+    ``_run_top`` opens before invoking any stage) -- so the
+    ``tracing.current_span() is None`` trace-root-standalone-agent branch
+    below is, in practice, unreachable from that caller -- mirroring the
+    sync ``_run_agent``'s identical branch, equally unreachable now that
+    every stage dispatch runs through :func:`~composeai.combinators._ainvoke_stage`
+    (the old sync ``combinators._invoke_stage`` had the same property before
+    it was removed as dead code). Kept here anyway for structural parity
+    with ``_run_agent``: if it were ever somehow reached from a
+    coroutine already running on the composeai runtime loop, its call to
+    ``runs.run_standalone_agent`` (fully sync) would reach the sync facade
+    ``_run_agent_uncached`` -- which would immediately raise
+    (``_runtime.run_sync``'s re-entry guard) rather than deadlock, a loud
+    failure rather than a silent hang.
+    """
+    ctx = runs.current_run_context()
+    if ctx is not None:
+        return await _arun_agent_journaled(
+            agent_fn, call_args, call_kwargs, ctx, streaming=streaming, budget=budget
+        )
+    if tracing.current_span() is None:
+        args_json = _encode_agent_call(call_args, call_kwargs)
+        return runs.run_standalone_agent(
+            agent_fn.name,
+            args_json,
+            lambda: _run_agent_uncached(
+                agent_fn, call_args, call_kwargs, streaming=streaming, budget=budget, scope_key=""
+            ),
+            budget=budget,
+        )
+    return await _arun_agent_uncached(
+        agent_fn, call_args, call_kwargs, streaming=streaming, budget=budget, scope_key=""
+    )
+
+
 def _run_agent_journaled(
     agent_fn: AgentFunction,
     call_args: tuple[Any, ...],
@@ -877,7 +1069,7 @@ def _run_agent_journaled(
     ``scope_key``) and journal its output value. If the agent pauses,
     ``_run_agent_uncached`` raises ``_Pause`` -- deliberately not caught
     here, so it propagates to the enclosing flow's own pause handling (see
-    ``composeai.flow._execute_flow``); nothing is journaled for this step
+    ``composeai.flow._aexecute_flow``); nothing is journaled for this step
     (a miss again next time), and the agent's own state is already saved
     under ``(run_id, key)`` for when this same call site is reached again.
     """
@@ -914,6 +1106,84 @@ def _run_agent_journaled(
         step_key=key,
     )
     recorded = ctx.journal_record(key, run.output)
+    run.output = recorded
+    return run
+
+
+async def _arun_agent_journaled(
+    agent_fn: AgentFunction,
+    call_args: tuple[Any, ...],
+    call_kwargs: dict[str, Any],
+    ctx: runs.JournalScope,
+    *,
+    streaming: bool,
+    budget: Budget | None,
+) -> Run:
+    """Async twin of :func:`_run_agent_journaled` (v0.4.0 Plan A, Task 8) --
+    see its docstring for the replay/miss contract, byte-identical here.
+
+    Two things differ from the sync version, both because this runs on the
+    composeai runtime loop (inside ``composeai.combinators``'s async
+    engine), never on an arbitrary caller thread:
+
+    - The miss path's journal write goes through ``ctx.ajournal_record``
+      (:meth:`~composeai.runs.RunContext.ajournal_record`) instead of
+      ``ctx.journal_record`` -- it awaits
+      ``worker_for(store).call("journal_put", ...)`` (the dedicated SQLite
+      writer thread, :mod:`composeai._storeasync`) rather than calling the
+      store directly, so this never blocks the runtime loop with SQLite
+      I/O. First-write-wins is unaffected: ``RunStore.journal_put``'s
+      ``INSERT OR IGNORE`` (see its docstring) is still the single atomic
+      operation that decides a race's winner -- only which thread executes
+      that SQL statement changes, not how the race resolves or what gets
+      returned (the winner's own decoded value, same as the sync path).
+    - The budget baseline read (``prior_llm_usage_for_step``) likewise
+      routes through ``worker_for(...).call(...)`` rather than calling the
+      store directly -- mirroring :func:`_aload_agent_state`'s identical
+      reasoning for a *read* (not just writes) made inside the async
+      engine.
+
+    ``ctx.next_key``/``ctx.journal_lookup`` stay direct, synchronous calls
+    (as in the sync version): both only ever touch the in-memory
+    ``preloaded`` dict and a ``threading.Lock``-guarded counter, never the
+    store/disk, so there is nothing to await and no risk of blocking the
+    loop.
+    """
+    key = ctx.next_key(agent_fn.name)
+    hit, value = ctx.journal_lookup(key)
+    if hit:
+        with tracing.span("agent", agent_fn.name, attributes={"step_key": key}) as agent_span:
+            agent_span.replayed = True
+            agent_span.set_output(value)
+        trace = tracing.current_trace()
+        assert trace is not None
+        return Run(
+            id=new_ulid(),
+            status="completed",
+            output=value,
+            usage=Usage(),
+            trace=trace,
+            messages=[],
+            pending=None,
+        )
+    budget_baseline = (
+        await worker_for(runs.open_default()).call(
+            "prior_llm_usage_for_step", ctx.run_id, key
+        )
+        if budget is not None
+        else None
+    )
+    run = await _arun_agent_uncached(
+        agent_fn,
+        call_args,
+        call_kwargs,
+        streaming=streaming,
+        budget=budget,
+        budget_baseline=budget_baseline,
+        scope_key=key,
+        step_key=key,
+    )
+    recorded = await ctx.ajournal_record(key, run.output)
     run.output = recorded
     return run
 
@@ -1027,8 +1297,60 @@ def _run_agent_uncached(
     scope_key: str = "",
     step_key: str | None = None,
 ) -> Run:
+    """Sync facade over the async engine (:func:`_arun_agent_uncached`) --
+    see its docstring for the full loop contract.
+
+    Every existing caller (the journaled path, the standalone path,
+    ``resume_standalone_agent``, and ``.stream(...)``'s background worker
+    thread) reaches the loop through this one name, unchanged -- so all of
+    them are routed through the async engine with zero call-site changes.
+    Legal to call from any thread, including one already running inside the
+    async engine itself (e.g. a sync ``@tool`` body calling another agent
+    synchronously): :func:`~composeai._runtime.run_sync` hops back onto the
+    runtime loop from the dedicated per-call worker thread
+    :func:`~composeai._dispatch._run_sync_on_own_thread` started for that
+    sync tool body, without deadlocking, since the loop is merely awaiting
+    that worker thread's future and is free to run the new submission
+    concurrently (documented extra latency, not a deadlock).
+    """
+    return _runtime.run_sync(
+        _arun_agent_uncached(
+            agent_fn,
+            call_args,
+            call_kwargs,
+            streaming=streaming,
+            budget=budget,
+            budget_baseline=budget_baseline,
+            scope_key=scope_key,
+            step_key=step_key,
+        )
+    )
+
+
+async def _arun_agent_uncached(
+    agent_fn: AgentFunction,
+    call_args: tuple[Any, ...],
+    call_kwargs: dict[str, Any],
+    *,
+    streaming: bool = False,
+    budget: Budget | None = None,
+    budget_baseline: Usage | None = None,
+    scope_key: str = "",
+    step_key: str | None = None,
+) -> Run:
     """The actual agent loop -- shared by standalone runs, resumed standalone
-    runs, and agents nested in a flow (see the three callers above).
+    runs, and agents nested in a flow (see the three callers of the sync
+    facade :func:`_run_agent_uncached` above). Driven by that facade via
+    :func:`~composeai._runtime.run_sync`, which snapshots the calling
+    thread's contextvars into this coroutine's task -- so
+    ``runs.current_run_id()``/``tracing.current_span()``/the scope and
+    budget stacks below all see exactly what the sync caller saw. Nothing
+    in this function mutates one of those *ambient* contextvars for the
+    caller to observe afterward: it only ever *reads* ``current_run_id()``,
+    and the one contextvar push it does perform (``budget_scope`` below) is
+    ``with``-scoped entirely within this coroutine's own body, so it is
+    task-local and never needs to escape back to the caller (mirrors the
+    sync engine's identical scoping, unchanged).
 
     ``run_id``/``scope_key`` (Phase 8) address this call's ``agent_state``
     row: ``runs.current_run_id()`` is the flow's run_id when nested, or this
@@ -1048,7 +1370,7 @@ def _run_agent_uncached(
     anything (e.g. ``compose trace``) that reads it off the span.
     """
     run_id = runs.current_run_id()
-    restored = _load_agent_state(run_id, scope_key)
+    restored = await _aload_agent_state(run_id, scope_key)
 
     span_attributes = {"step_key": step_key} if step_key is not None else None
     agent_span: tracing.Span | None = None
@@ -1081,7 +1403,7 @@ def _run_agent_uncached(
                     else []
                 )
                 if pending_calls:
-                    tool_message = _process_tool_use(
+                    tool_message = await _aprocess_tool_use(
                         agent_fn,
                         pending_calls,
                         conversation,
@@ -1091,7 +1413,7 @@ def _run_agent_uncached(
                         seed_results=restored.partial_results,
                     )
                     conversation.append(tool_message)
-                    _snapshot_agent_state(run_id, scope_key, conversation, turn, {})
+                    await _asnapshot_agent_state(run_id, scope_key, conversation, turn, {})
             else:
                 conversation = _build_conversation(agent_fn, call_args, call_kwargs)
                 turn = 0
@@ -1114,7 +1436,7 @@ def _run_agent_uncached(
                         "never interrupted)"
                     )
 
-                response = _perform_turn(
+                response = await _aperform_turn(
                     agent_fn,
                     agent_span,
                     state,
@@ -1137,11 +1459,11 @@ def _run_agent_uncached(
                             "tool call parts (a provider/adapter bug) -- refusing "
                             "to append an empty tool-results message"
                         )
-                    tool_message = _process_tool_use(
+                    tool_message = await _aprocess_tool_use(
                         agent_fn, calls, conversation, turn, run_id, scope_key
                     )
                     conversation.append(tool_message)
-                    _snapshot_agent_state(run_id, scope_key, conversation, turn, {})
+                    await _asnapshot_agent_state(run_id, scope_key, conversation, turn, {})
                     continue
 
                 if response.stop_reason == StopReason.MAX_TOKENS:
@@ -1191,7 +1513,7 @@ def _run_agent_uncached(
                 # Only StopReason.OTHER reaches here in practice (TOOL_USE,
                 # MAX_TOKENS, REFUSAL, END_TURN are all handled above; ERROR
                 # is converted into a retried/fallback-eligible ProviderError
-                # inside `_call_llm`, so it never comes back as a response at
+                # inside `_acall_llm`, so it never comes back as a response at
                 # all) -- terminal, but the message includes the provider's
                 # own raw stop-reason string so it's actionable rather than
                 # just naming the normalized enum member.

@@ -665,7 +665,7 @@ def test_aggregate_branches_in_flow_get_deterministic_per_branch_scope():
     # An Aggregate used directly as a flow's own top-level call (`agg(x)`/
     # `agg.run(x)`) goes through `_run_top` (a fresh run/trace of its own --
     # not the pattern this fix targets); the intended "nested stage" path is
-    # exercised via `_invoke_stage`, e.g. an Aggregate mapped/piped as one
+    # exercised via `_ainvoke_stage`, e.g. an Aggregate mapped/piped as one
     # stage of an outer combinator -- here, `compose.map` over a single item
     # whose stage is the aggregate itself.
     @task

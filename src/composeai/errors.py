@@ -103,5 +103,5 @@ class MCPToolError(ComposeError):
 
     Inside an agent run this surfaces exactly like any tool-body
     exception: an ``is_error`` tool result the model can react to -- never
-    a run abort (see ``composeai.agentfn._execute_one_tool``).
+    a run abort (see ``composeai.agentfn._aexecute_one_tool``).
     """

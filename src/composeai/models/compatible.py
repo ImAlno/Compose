@@ -19,7 +19,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -175,11 +175,22 @@ class OpenAICompatibleModel:
         self.model_id = model_id
         self._base_url = base_url
         self._client = client
+        self._async_client: Any = None
         self._api_key = api_key
         self._max_retries = max_retries
         self._timeout = timeout
         self._schema_mode = schema_mode
         self._demoted = False
+
+        if client is not None:
+            # An injected client is a SYNC client: the async twins would
+            # silently build an unrelated AsyncX from env/api_key instead.
+            # Shadowing the methods with None defeats the engine's getattr
+            # discovery (models/base.py), so it falls back to running the
+            # injected client's sync complete()/stream() off-thread --
+            # exactly the 0.3.x behavior an injected client bought you.
+            self.acomplete = None  # type: ignore[assignment]
+            self.astream = None  # type: ignore[assignment]
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -201,6 +212,27 @@ class OpenAICompatibleModel:
             client_kwargs["timeout"] = self._timeout
         self._client = openai.OpenAI(**client_kwargs)
         return self._client
+
+    def _get_async_client(self) -> Any:
+        if self._async_client is not None:
+            return self._async_client
+        import openai
+
+        # Many local servers (Ollama, vLLM, ...) require a non-empty key
+        # even though they don't check it -- default to a placeholder
+        # rather than requiring one like the hosted OpenAI/Anthropic adapters.
+        api_key = self._api_key or "unused"
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "base_url": self._base_url,
+            "max_retries": self._max_retries,
+        }
+        # Only pass timeout when set: the SDK's own default is a NOT_GIVEN
+        # sentinel, and an explicit None would mean "no timeout at all".
+        if self._timeout is not None:
+            client_kwargs["timeout"] = self._timeout
+        self._async_client = openai.AsyncOpenAI(**client_kwargs)
+        return self._async_client
 
     def _effective_schema_mode(self) -> str:
         # A benign race if two threads demote at once (worst case: one
@@ -239,6 +271,44 @@ class OpenAICompatibleModel:
             kwargs = self._build_kwargs(request)
             try:
                 response = client.chat.completions.create(**kwargs)
+            except openai.APIError as exc:
+                raise ProviderError(str(exc), provider=_PROVIDER, model=self.model_id) from exc
+            choice = response.choices[0]
+            usage = _map_usage(getattr(response, "usage", None), self.model_id)
+            return self._finalize(
+                choice.message, choice.finish_reason, wasted_usage + usage, request
+            )
+
+    async def acomplete(self, request: ModelRequest) -> ModelResponse:
+        import openai
+
+        client = self._get_async_client()
+        kwargs = self._build_kwargs(request)
+
+        try:
+            response = await client.chat.completions.create(**kwargs)
+        except openai.APIError as exc:
+            raise ProviderError(str(exc), provider=_PROVIDER, model=self.model_id) from exc
+
+        choice = response.choices[0]
+        usage = _map_usage(getattr(response, "usage", None), self.model_id)
+        try:
+            return self._finalize(choice.message, choice.finish_reason, usage, request)
+        except _NonJsonContentError:
+            if self._schema_mode != "auto" or self._demoted:
+                raise
+            # The server accepted response_format but returned prose: demote
+            # this instance permanently and retry this one call in prompt
+            # mode. At most one wasted native call per instance per process.
+            self._demoted = True
+            # The first (native) call still happened and was real, billed
+            # spend -- its usage must not simply be discarded, or trace/costs/
+            # Budget would silently under-count one full completion. Keep it
+            # and sum it into the retry's usage before finalizing.
+            wasted_usage = usage
+            kwargs = self._build_kwargs(request)
+            try:
+                response = await client.chat.completions.create(**kwargs)
             except openai.APIError as exc:
                 raise ProviderError(str(exc), provider=_PROVIDER, model=self.model_id) from exc
             choice = response.choices[0]
@@ -292,6 +362,111 @@ class OpenAICompatibleModel:
             # method's event mapping wholesale for no behavioral gain.)
             with client.chat.completions.create(**kwargs) as stream:
                 for chunk in stream:
+                    choices = getattr(chunk, "choices", None) or []
+                    if choices:
+                        choice = choices[0]
+                        delta = choice.delta
+                        if delta.content:
+                            content_chunks.append(delta.content)
+                            yield RawStreamEvent(kind="text_delta", text=delta.content)
+                        if getattr(delta, "refusal", None):
+                            refusal_chunks.append(delta.refusal)
+                        for tc_delta in delta.tool_calls or []:
+                            index = tc_delta.index
+                            function = tc_delta.function
+                            if index not in tool_calls:
+                                name = function.name if function is not None else None
+                                tool_calls[index] = {
+                                    "id": tc_delta.id,
+                                    "name": name,
+                                    "arguments": "",
+                                }
+                                yield RawStreamEvent(
+                                    kind="tool_call_started",
+                                    tool_call_id=tc_delta.id,
+                                    tool_name=name,
+                                )
+                            fragment = function.arguments if function is not None else None
+                            if fragment:
+                                tool_calls[index]["arguments"] += fragment
+                                yield RawStreamEvent(
+                                    kind="tool_args_delta",
+                                    text=fragment,
+                                    tool_call_id=tool_calls[index]["id"],
+                                    tool_name=tool_calls[index]["name"],
+                                )
+                        if choice.finish_reason is not None:
+                            finish_reason = choice.finish_reason
+                            if not finished_emitted:
+                                finished_emitted = True
+                                for state in tool_calls.values():
+                                    yield RawStreamEvent(
+                                        kind="tool_call_finished",
+                                        tool_call_id=state["id"],
+                                        tool_name=state["name"],
+                                    )
+                    if getattr(chunk, "usage", None) is not None:
+                        usage_obj = chunk.usage
+        except openai.APIError as exc:
+            raise ProviderError(str(exc), provider=_PROVIDER, model=self.model_id) from exc
+
+        fake_tool_calls = [
+            SimpleNamespace(
+                id=state["id"],
+                type="function",
+                function=SimpleNamespace(name=state["name"], arguments=state["arguments"]),
+            )
+            for state in tool_calls.values()
+        ] or None
+        fake_message = SimpleNamespace(
+            content="".join(content_chunks) or None,
+            refusal="".join(refusal_chunks) or None,
+            tool_calls=fake_tool_calls,
+        )
+        # A missing usage chunk means the server didn't honor include_usage --
+        # unknown, not zero, cost -- so cost_complete is forced False here
+        # rather than going through _map_usage(None, ...), which would
+        # otherwise compute a misleadingly-precise $0.00 for priced models.
+        usage = (
+            _map_usage(usage_obj, self.model_id)
+            if usage_obj is not None
+            else Usage(cost_usd=None, cost_complete=False)
+        )
+        response = self._finalize(fake_message, finish_reason, usage, request)
+        yield RawStreamEvent(kind="response_done", response=response)
+
+    async def astream(self, request: ModelRequest) -> AsyncIterator[RawStreamEvent]:
+        """Async twin of :meth:`stream`; see its docstring for behavior."""
+        import openai
+
+        client = self._get_async_client()
+        kwargs = self._build_kwargs(request)
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+
+        content_chunks: list[str] = []
+        refusal_chunks: list[str] = []
+        # tool-call index -> accumulated {"id", "name", "arguments"}; dicts
+        # preserve insertion order, matching the order calls first appeared.
+        tool_calls: dict[int, dict[str, Any]] = {}
+        finish_reason: str | None = None
+        usage_obj: Any = None
+        finished_emitted = False
+
+        try:
+            # `create(stream=True)` returns the SDK's own `AsyncStream`, which
+            # is itself an async context manager (releases the underlying
+            # HTTP connection on `__aexit__`/`aclose()`) -- use it as one
+            # rather than just iterating over it, same as stream()'s `with
+            # client.chat.completions.create(**kwargs) as stream:`. (The SDK
+            # also offers a *separate*, higher-level `chat.completions.
+            # stream()` helper with its own accumulation/event API -- not
+            # used here: it yields structured events in a different shape
+            # than the raw `ChatCompletionChunk`s this module parses against
+            # verified wire shapes, so adopting it would mean rewriting this
+            # method's event mapping wholesale for no behavioral gain.)
+            async with await client.chat.completions.create(**kwargs) as stream:
+                async for chunk in stream:
                     choices = getattr(chunk, "choices", None) or []
                     if choices:
                         choice = choices[0]

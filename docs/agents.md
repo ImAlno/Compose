@@ -100,7 +100,7 @@ All of these are keyword-only arguments to `@compose.agent(...)`:
 | `max_tokens` | `16000` | Passed to the model on every call; hitting it before the response finishes raises `ComposeError`. |
 | `temperature` | `None` | Passthrough-only — composeai never sets one for you. Modern Claude models reject sampling parameters outright, so leave it unset for Claude. |
 
-Note that `@agent(timeout=...)` is unrelated to a model constructor's own `timeout=`: the agent's `timeout` is a turn-boundary watchdog, while the model's `timeout` bounds each individual HTTP request at the SDK-client level. See [providers](providers.md).
+Note that `@agent(timeout=...)` is unrelated to a model constructor's own `timeout=`: the agent's `timeout` is a turn-boundary watchdog, while the model's `timeout` bounds each individual HTTP request at the SDK-client level. See [providers](providers.md). Pressing Ctrl-C yourself is a different situation again — see [flows](flows.md#ctrl-c-mid-run) for what actually happens to the in-flight attempt.
 
 ## `name=` and `replace=`
 

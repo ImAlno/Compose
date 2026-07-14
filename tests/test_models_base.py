@@ -158,3 +158,13 @@ def test_raw_stream_event_response_done_carries_full_response():
     )
     event = RawStreamEvent(kind="response_done", response=resp)
     assert event.response is resp
+
+
+# --- async discovery ---
+
+
+def test_model_protocol_docs_async_discovery():
+    """The async contract is duck-discovered, like sync stream()."""
+    from composeai.models.base import Model
+
+    assert "acomplete" in (Model.__doc__ or "")

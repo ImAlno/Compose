@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import os
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 from ..errors import ComposeError, ConfigError, ProviderError
@@ -61,10 +61,21 @@ class AnthropicModel:
     ) -> None:
         self.model_id = model_id
         self._client = client
+        self._async_client: Any = None
         self._api_key = api_key
         self._max_retries = max_retries
         self._base_url = base_url
         self._timeout = timeout
+
+        if client is not None:
+            # An injected client is a SYNC client: the async twins would
+            # silently build an unrelated AsyncX from env/api_key instead.
+            # Shadowing the methods with None defeats the engine's getattr
+            # discovery (models/base.py), so it falls back to running the
+            # injected client's sync complete()/stream() off-thread --
+            # exactly the 0.3.x behavior an injected client bought you.
+            self.acomplete = None  # type: ignore[assignment]
+            self.astream = None  # type: ignore[assignment]
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -88,6 +99,29 @@ class AnthropicModel:
             client_kwargs["timeout"] = self._timeout
         self._client = anthropic.Anthropic(**client_kwargs)
         return self._client
+
+    def _get_async_client(self) -> Any:
+        if self._async_client is not None:
+            return self._async_client
+        import anthropic
+
+        api_key = self._api_key or os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise ConfigError(
+                "Missing Anthropic API key: set the ANTHROPIC_API_KEY environment "
+                "variable, or pass api_key=... / client=... to AnthropicModel."
+            )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "max_retries": self._max_retries,
+            "base_url": self._base_url,
+        }
+        # Only pass timeout when set: the SDK's own default is a NOT_GIVEN
+        # sentinel, and an explicit None would mean "no timeout at all".
+        if self._timeout is not None:
+            client_kwargs["timeout"] = self._timeout
+        self._async_client = anthropic.AsyncAnthropic(**client_kwargs)
+        return self._async_client
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         import anthropic
@@ -119,6 +153,68 @@ class AnthropicModel:
         while True:
             try:
                 response = client.messages.create(**kwargs)
+            except anthropic.APIError as exc:
+                raise ProviderError(str(exc), provider="anthropic", model=self.model_id) from exc
+
+            turn_parts = [
+                part
+                for part in (_block_to_part(block, self.model_id) for block in response.content)
+                if part is not None
+            ]
+            accumulated_parts.extend(turn_parts)
+            total_usage = total_usage + _map_usage(response.usage, self.model_id)
+
+            if response.stop_reason != "pause_turn":
+                break
+
+            continuations += 1
+            if continuations > _MAX_PAUSE_CONTINUATIONS:
+                raise ProviderError(
+                    f"Anthropic paused {continuations} times in a row for "
+                    f"model {self.model_id!r} (exceeded the "
+                    f"{_MAX_PAUSE_CONTINUATIONS}-continuation limit)",
+                    provider="anthropic",
+                    model=self.model_id,
+                )
+            continuation_blocks = [
+                block
+                for block in (_part_to_block(part, self.model_id) for part in turn_parts)
+                if block is not None
+            ]
+            kwargs["messages"].append({"role": "assistant", "content": continuation_blocks})
+
+        return self._finalize(accumulated_parts, response.stop_reason, total_usage, request)
+
+    async def acomplete(self, request: ModelRequest) -> ModelResponse:
+        import anthropic
+
+        client = self._get_async_client()
+        api_messages = _build_messages(request.messages, self.model_id)
+
+        kwargs: dict[str, Any] = {
+            "model": self.model_id,
+            "max_tokens": request.max_tokens,
+            "messages": api_messages,
+        }
+        if request.system is not None:
+            kwargs["system"] = request.system
+        if request.temperature is not None:
+            kwargs["temperature"] = request.temperature
+        if request.tools:
+            kwargs["tools"] = [_tool_to_param(spec) for spec in request.tools]
+        if request.output_schema is not None:
+            kwargs["output_config"] = {
+                "format": {"type": "json_schema", "schema": request.output_schema}
+            }
+
+        accumulated_parts: list[ContentPart] = []
+        total_usage = Usage()
+        continuations = 0
+        response: Any = None
+
+        while True:
+            try:
+                response = await client.messages.create(**kwargs)
             except anthropic.APIError as exc:
                 raise ProviderError(str(exc), provider="anthropic", model=self.model_id) from exc
 
@@ -237,6 +333,120 @@ class AnthropicModel:
                         # ThinkingEvent, InputJsonEvent, ...) interleaved
                         # into the same iteration, carry nothing new here.
                     final_message = stream.get_final_message()
+            except anthropic.APIError as exc:
+                raise ProviderError(str(exc), provider="anthropic", model=self.model_id) from exc
+
+            turn_parts = [
+                part
+                for part in (
+                    _block_to_part(block, self.model_id) for block in final_message.content
+                )
+                if part is not None
+            ]
+            accumulated_parts.extend(turn_parts)
+            total_usage = total_usage + _map_usage(final_message.usage, self.model_id)
+
+            if final_message.stop_reason != "pause_turn":
+                break
+
+            continuations += 1
+            if continuations > _MAX_PAUSE_CONTINUATIONS:
+                raise ProviderError(
+                    f"Anthropic paused {continuations} times in a row for "
+                    f"model {self.model_id!r} (exceeded the "
+                    f"{_MAX_PAUSE_CONTINUATIONS}-continuation limit)",
+                    provider="anthropic",
+                    model=self.model_id,
+                )
+            continuation_blocks = [
+                block
+                for block in (_part_to_block(part, self.model_id) for part in turn_parts)
+                if block is not None
+            ]
+            kwargs["messages"].append({"role": "assistant", "content": continuation_blocks})
+
+        response = self._finalize(
+            accumulated_parts, final_message.stop_reason, total_usage, request
+        )
+        yield RawStreamEvent(kind="response_done", response=response)
+
+    async def astream(self, request: ModelRequest) -> AsyncIterator[RawStreamEvent]:
+        """Async twin of :meth:`stream`; see its docstring for behavior."""
+        import anthropic
+
+        client = self._get_async_client()
+        api_messages = _build_messages(request.messages, self.model_id)
+
+        kwargs: dict[str, Any] = {
+            "model": self.model_id,
+            "max_tokens": request.max_tokens,
+            "messages": api_messages,
+        }
+        if request.system is not None:
+            kwargs["system"] = request.system
+        if request.temperature is not None:
+            kwargs["temperature"] = request.temperature
+        if request.tools:
+            kwargs["tools"] = [_tool_to_param(spec) for spec in request.tools]
+        if request.output_schema is not None:
+            kwargs["output_config"] = {
+                "format": {"type": "json_schema", "schema": request.output_schema}
+            }
+
+        accumulated_parts: list[ContentPart] = []
+        total_usage = Usage()
+        continuations = 0
+        final_message: Any = None
+
+        while True:
+            # index -> the content_block seen at content_block_start, so
+            # later content_block_delta/content_block_stop events (which
+            # don't repeat the block's id/name/type) can be correlated back
+            # to the right tool call.
+            block_by_index: dict[int, Any] = {}
+            try:
+                async with client.messages.stream(**kwargs) as stream:
+                    async for raw_event in stream:
+                        event_type = getattr(raw_event, "type", None)
+                        if event_type == "content_block_start":
+                            block = raw_event.content_block
+                            block_by_index[raw_event.index] = block
+                            if getattr(block, "type", None) == "tool_use":
+                                yield RawStreamEvent(
+                                    kind="tool_call_started",
+                                    tool_call_id=block.id,
+                                    tool_name=block.name,
+                                )
+                        elif event_type == "content_block_delta":
+                            delta = raw_event.delta
+                            delta_type = getattr(delta, "type", None)
+                            if delta_type == "text_delta":
+                                yield RawStreamEvent(kind="text_delta", text=delta.text)
+                            elif delta_type == "thinking_delta":
+                                yield RawStreamEvent(kind="thinking_delta", text=delta.thinking)
+                            elif delta_type == "input_json_delta":
+                                block = block_by_index.get(raw_event.index)
+                                yield RawStreamEvent(
+                                    kind="tool_args_delta",
+                                    text=delta.partial_json,
+                                    tool_call_id=getattr(block, "id", None),
+                                    tool_name=getattr(block, "name", None),
+                                )
+                            # citations_delta / signature_delta carry no
+                            # RawStreamEvent kind of their own -- ignored.
+                        elif event_type == "content_block_stop":
+                            block = block_by_index.get(raw_event.index)
+                            if block is not None and getattr(block, "type", None) == "tool_use":
+                                yield RawStreamEvent(
+                                    kind="tool_call_finished",
+                                    tool_call_id=block.id,
+                                    tool_name=block.name,
+                                )
+                        # message_start/message_delta, and any of the SDK's
+                        # own derived per-kind events (TextEvent,
+                        # ThinkingEvent, InputJsonEvent, ...) interleaved
+                        # into the same iteration, carry nothing new here.
+                    final_message = await stream.get_final_message()
             except anthropic.APIError as exc:
                 raise ProviderError(str(exc), provider="anthropic", model=self.model_id) from exc
 

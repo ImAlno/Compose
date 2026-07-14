@@ -32,7 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from typing import Any
 
 from ..errors import ConfigError, ProviderError
@@ -156,10 +156,21 @@ class OpenAIModel:
     ) -> None:
         self.model_id = model_id
         self._client = client
+        self._async_client: Any = None
         self._api_key = api_key
         self._max_retries = max_retries
         self._base_url = base_url
         self._timeout = timeout
+
+        if client is not None:
+            # An injected client is a SYNC client: the async twins would
+            # silently build an unrelated AsyncX from env/api_key instead.
+            # Shadowing the methods with None defeats the engine's getattr
+            # discovery (models/base.py), so it falls back to running the
+            # injected client's sync complete()/stream() off-thread --
+            # exactly the 0.3.x behavior an injected client bought you.
+            self.acomplete = None  # type: ignore[assignment]
+            self.astream = None  # type: ignore[assignment]
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -184,6 +195,29 @@ class OpenAIModel:
         self._client = openai.OpenAI(**client_kwargs)
         return self._client
 
+    def _get_async_client(self) -> Any:
+        if self._async_client is not None:
+            return self._async_client
+        import openai
+
+        api_key = self._api_key or os.environ.get("OPENAI_API_KEY")
+        if not api_key:
+            raise ConfigError(
+                "Missing OpenAI API key: set the OPENAI_API_KEY environment "
+                "variable, or pass api_key=... / client=... to OpenAIModel."
+            )
+        client_kwargs: dict[str, Any] = {
+            "api_key": api_key,
+            "max_retries": self._max_retries,
+            "base_url": self._base_url,
+        }
+        # Only pass timeout when set: the SDK's own default is a NOT_GIVEN
+        # sentinel, and an explicit None would mean "no timeout at all".
+        if self._timeout is not None:
+            client_kwargs["timeout"] = self._timeout
+        self._async_client = openai.AsyncOpenAI(**client_kwargs)
+        return self._async_client
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         import openai
 
@@ -192,6 +226,19 @@ class OpenAIModel:
 
         try:
             response = client.responses.create(**kwargs)
+        except openai.APIError as exc:
+            raise ProviderError(str(exc), provider="openai", model=self.model_id) from exc
+
+        return self._finalize(response, request)
+
+    async def acomplete(self, request: ModelRequest) -> ModelResponse:
+        import openai
+
+        client = self._get_async_client()
+        kwargs = self._build_kwargs(request)
+
+        try:
+            response = await client.responses.create(**kwargs)
         except openai.APIError as exc:
             raise ProviderError(str(exc), provider="openai", model=self.model_id) from exc
 
@@ -225,6 +272,88 @@ class OpenAIModel:
         try:
             with client.responses.stream(**kwargs) as stream:
                 for raw_event in stream:
+                    event_type = getattr(raw_event, "type", None)
+                    if event_type == "response.output_text.delta":
+                        yield RawStreamEvent(kind="text_delta", text=raw_event.delta)
+                    elif event_type == "response.reasoning_summary_text.delta":
+                        yield RawStreamEvent(kind="thinking_delta", text=raw_event.delta)
+                    elif event_type == "response.output_item.added":
+                        item = raw_event.item
+                        item_by_index[raw_event.output_index] = item
+                        if getattr(item, "type", None) == "function_call":
+                            yield RawStreamEvent(
+                                kind="tool_call_started",
+                                tool_call_id=item.call_id,
+                                tool_name=item.name,
+                            )
+                    elif event_type == "response.function_call_arguments.delta":
+                        item = item_by_index.get(raw_event.output_index)
+                        yield RawStreamEvent(
+                            kind="tool_args_delta",
+                            text=raw_event.delta,
+                            tool_call_id=getattr(item, "call_id", None),
+                            tool_name=getattr(item, "name", None),
+                        )
+                    elif event_type == "response.output_item.done":
+                        item = raw_event.item
+                        if getattr(item, "type", None) == "function_call":
+                            yield RawStreamEvent(
+                                kind="tool_call_finished",
+                                tool_call_id=item.call_id,
+                                tool_name=item.name,
+                            )
+                    elif event_type in (
+                        "response.completed",
+                        "response.incomplete",
+                        "response.failed",
+                    ):
+                        # response.incomplete/response.failed both carry a
+                        # `.response` field of the exact same shape as
+                        # response.completed's (verified against the
+                        # installed SDK's ResponseIncompleteEvent /
+                        # ResponseFailedEvent types) -- a response that
+                        # legitimately hit max_output_tokens, or failed
+                        # server-side, ends the stream via one of these
+                        # instead of response.completed, and must be mapped
+                        # the same way complete() maps the equivalent
+                        # non-streamed response (via _stop_reason's
+                        # status=="incomplete" handling, or _finalize's
+                        # status=="failed" check below) rather than falling
+                        # through to the "stream ended early" ProviderError.
+                        final_response = raw_event.response
+                    # Every other event type (response.created,
+                    # .in_progress, content_part.*, audio.*, web_search.*,
+                    # ...) carries nothing new here.
+        except openai.APIError as exc:
+            raise ProviderError(str(exc), provider="openai", model=self.model_id) from exc
+
+        if final_response is None:
+            raise ProviderError(
+                "OpenAI's response stream ended without a response.completed "
+                "event -- the stream was closed or interrupted before finishing",
+                provider="openai",
+                model=self.model_id,
+            )
+
+        response = self._finalize(final_response, request)
+        yield RawStreamEvent(kind="response_done", response=response)
+
+    async def astream(self, request: ModelRequest) -> AsyncIterator[RawStreamEvent]:
+        """Async twin of :meth:`stream`; see its docstring for behavior."""
+        import openai
+
+        client = self._get_async_client()
+        kwargs = self._build_kwargs(request)
+
+        final_response: Any = None
+        # output_index -> the output item seen at response.output_item.added,
+        # so later function_call_arguments.delta/output_item.done events
+        # (which don't repeat the call_id/name) can be correlated back.
+        item_by_index: dict[int, Any] = {}
+
+        try:
+            async with client.responses.stream(**kwargs) as stream:
+                async for raw_event in stream:
                     event_type = getattr(raw_event, "type", None)
                     if event_type == "response.output_text.delta":
                         yield RawStreamEvent(kind="text_delta", text=raw_event.delta)

@@ -7,7 +7,7 @@ Wire shapes were verified against the installed ``openai`` SDK
 from __future__ import annotations
 
 import json
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from types import SimpleNamespace
 from typing import Any
 
@@ -149,6 +149,73 @@ def _model(
     base_url: str = "http://localhost:11434/v1",
 ) -> OpenAICompatibleModel:
     return OpenAICompatibleModel(model_id, base_url=base_url, client=_StubClient(responses))
+
+
+class _AsyncFakeSDKStream:
+    """Async twin of ``_FakeSDKStream``: what ``client.chat.completions.
+    create(stream=True)`` returns from ``AsyncOpenAI`` -- an async context
+    manager (``__aenter__`` returns self; ``__aexit__`` releases the
+    underlying HTTP response) as well as an async iterable over chunks.
+    """
+
+    def __init__(self, chunks: list[Any]) -> None:
+        self._chunks = chunks
+        self.closed = False
+
+    async def __aenter__(self) -> _AsyncFakeSDKStream:
+        return self
+
+    async def __aexit__(self, *exc_info: Any) -> None:
+        self.closed = True
+
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        for chunk in self._chunks:
+            yield chunk
+
+
+class _AsyncStubCompletions:
+    """Async twin of ``_StubCompletions``: duck-typed stand-in for
+    ``openai.AsyncOpenAI().chat.completions`` (``create`` is a coroutine)."""
+
+    def __init__(self, responses) -> None:
+        self._responses = responses
+        self.calls: list[dict[str, Any]] = []
+        self.last_stream: _AsyncFakeSDKStream | None = None
+
+    async def create(self, **kwargs: Any):
+        self.calls.append(kwargs)
+        if callable(self._responses):
+            result = self._responses(kwargs)
+        else:
+            result = self._responses.pop(0)
+        # Same dual-purpose convention as `_StubCompletions.create`: a
+        # streaming test scripts a bare list of chunks, wrapped into an
+        # async fake stream; a non-streaming test scripts a single
+        # `_response(...)` object, returned as-is.
+        if isinstance(result, list):
+            self.last_stream = _AsyncFakeSDKStream(result)
+            return self.last_stream
+        return result
+
+
+class _AsyncStubChat:
+    def __init__(self, responses) -> None:
+        self.completions = _AsyncStubCompletions(responses)
+
+
+class _AsyncStubClient:
+    def __init__(self, responses) -> None:
+        self.chat = _AsyncStubChat(responses)
+
+
+def _amodel(
+    responses,
+    model_id: str = "llama3-test",
+    base_url: str = "http://localhost:11434/v1",
+) -> OpenAICompatibleModel:
+    model = OpenAICompatibleModel(model_id, base_url=base_url)
+    model._async_client = _AsyncStubClient(responses)  # type: ignore[attr-defined]
+    return model
 
 
 # --- stream() stub helpers ----------------------------------------------------
@@ -1334,3 +1401,233 @@ def test_auto_mode_native_success_never_demotes():
 def test_auto_mode_accepted_by_factory():
     model = openai_compatible("http://x/v1", "m", schema_mode="auto")
     assert isinstance(model, OpenAICompatibleModel)
+
+
+# --- async twins (acomplete / astream) ---------------------------------------
+
+
+def test_acomplete_maps_response_like_complete():
+    import asyncio
+
+    # complete() path
+    complete_model = _model([_response([_choice(_message(content="hello there"))])])
+    complete_resp = complete_model.complete(
+        ModelRequest(model="llama3-test", messages=[Message.user("hi")])
+    )
+
+    # acomplete() path, same wire response
+    async_model = _amodel([_response([_choice(_message(content="hello there"))])])
+
+    async def drive():
+        return await async_model.acomplete(
+            ModelRequest(model="llama3-test", messages=[Message.user("hi")])
+        )
+
+    async_resp = asyncio.run(drive())
+
+    assert async_resp.message.text == complete_resp.message.text
+    assert async_resp.stop_reason == complete_resp.stop_reason
+    assert async_resp.usage == complete_resp.usage
+
+
+def test_astream_events_match_stream():
+    import asyncio
+
+    # stream() path
+    sync_chunks = [
+        _chunk(_delta(content="hello")),
+        _chunk(_delta(content=" there")),
+        _chunk(_delta(), finish_reason="stop"),
+        _usage_only_chunk(_usage(prompt_tokens=10, completion_tokens=20)),
+    ]
+    sync_model = _model([sync_chunks])
+    sync_events = list(
+        sync_model.stream(ModelRequest(model="llama3-test", messages=[Message.user("hi")]))
+    )
+
+    # astream() path, same scripted chunk sequence
+    async_chunks = [
+        _chunk(_delta(content="hello")),
+        _chunk(_delta(content=" there")),
+        _chunk(_delta(), finish_reason="stop"),
+        _usage_only_chunk(_usage(prompt_tokens=10, completion_tokens=20)),
+    ]
+    async_model = _amodel([async_chunks])
+
+    async def drive():
+        result = []
+        async for event in async_model.astream(
+            ModelRequest(model="llama3-test", messages=[Message.user("hi")])
+        ):
+            result.append(event)
+        return result
+
+    async_events = asyncio.run(drive())
+
+    assert [e.kind for e in async_events] == [e.kind for e in sync_events]
+    async_resp = async_events[-1].response
+    sync_resp = sync_events[-1].response
+    assert async_resp is not None
+    assert sync_resp is not None
+    assert async_resp.message.text == sync_resp.message.text
+    assert async_resp.usage == sync_resp.usage
+
+
+def test_async_client_constructed_with_same_kwargs(monkeypatch):
+    import openai
+
+    captured: dict = {}
+
+    class FakeAsyncOpenAI:
+        def __init__(self, **kwargs):
+            captured.update(kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeAsyncOpenAI)
+    model = OpenAICompatibleModel(
+        "llama3.2", base_url="http://localhost:11434/v1", timeout=90
+    )
+    model._get_async_client()
+    assert captured["timeout"] == 90
+    assert captured["base_url"] == "http://localhost:11434/v1"
+
+    captured_no_timeout: dict = {}
+
+    class FakeAsyncOpenAINoTimeout:
+        def __init__(self, **kwargs):
+            captured_no_timeout.update(kwargs)
+
+    monkeypatch.setattr(openai, "AsyncOpenAI", FakeAsyncOpenAINoTimeout)
+    model_no_timeout = OpenAICompatibleModel("llama3.2", base_url="http://localhost:11434/v1")
+    model_no_timeout._get_async_client()
+    assert "timeout" not in captured_no_timeout
+
+
+class _AsyncAutoModeCompletions:
+    """Async twin of ``_AutoModeCompletions``: same scripted behavior (prose
+    that ignores ``response_format``, distinct real usage per call), but
+    ``create`` is a coroutine -- mirrors ``AsyncOpenAI().chat.completions``.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        call_number = len(self.calls)
+        msg = SimpleNamespace(
+            content='Sure! {"answer": "ok"} hope that helps',
+            refusal=None,
+            tool_calls=None,
+        )
+        usage = SimpleNamespace(
+            prompt_tokens=7 * call_number,
+            completion_tokens=13 * call_number,
+            prompt_tokens_details=None,
+            completion_tokens_details=None,
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=msg, finish_reason="stop")], usage=usage
+        )
+
+
+def test_acomplete_auto_mode_demotes_and_sums_usage():
+    """Async twin of ``test_auto_mode_demotes_to_prompt_and_sticks``: same
+    call-count/response_format/usage-sum assertions, driven via
+    ``asyncio.run(model.acomplete(request))`` over an async fake client.
+    """
+    import asyncio
+
+    completions = _AsyncAutoModeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=None, schema_mode="auto"
+    )
+    model._async_client = client  # type: ignore[attr-defined]
+
+    first = asyncio.run(model.acomplete(_structured_request()))
+    assert first.parsed == {"answer": "ok"}
+    # call 1 was native (sent response_format), call 2 was the prompt-mode retry
+    assert len(completions.calls) == 2
+    assert "response_format" in completions.calls[0]
+    assert "response_format" not in completions.calls[1]
+    # The first (native) call was real, billed spend -- its usage must reach
+    # the returned response summed with the retry's, not be discarded.
+    assert first.usage.input_tokens == 7 * 1 + 7 * 2
+    assert first.usage.output_tokens == 13 * 1 + 13 * 2
+
+    second = asyncio.run(model.acomplete(_structured_request()))
+    assert second.parsed == {"answer": "ok"}
+    # demotion is sticky: no native attempt this time
+    assert len(completions.calls) == 3
+    assert "response_format" not in completions.calls[2]
+    # Once demoted, only one wire call happens -- no wasted usage to sum.
+    assert second.usage.input_tokens == 7 * 3
+    assert second.usage.output_tokens == 13 * 3
+
+
+# --- injected sync client vs. the async engine's acomplete/astream discovery -
+
+
+def test_injected_sync_client_used_by_async_engine():
+    """A ``client=`` injected at construction is a SYNC client -- the async
+    engine's ``getattr(model, "acomplete", None)`` discovery (models/base.py)
+    must not route to ``acomplete``/``astream`` (which would silently build
+    an unrelated ``AsyncOpenAI`` from env/api_key instead, see
+    ``OpenAICompatibleModel.__init__``). It must fall back to running the
+    injected client's sync ``complete()`` off-thread, exactly as it would
+    for a model with no async methods at all. (``acomplete`` itself used to
+    carry an internal ``if self._client is not None:`` to_thread guard for
+    this same reason -- removed as part of this fix, since discovery now
+    never routes an injected-client model to ``acomplete`` in the first
+    place.)
+    """
+    from composeai.agentfn import agent
+
+    model = _model([_response([_choice(_message(content="Hello there."))])])
+    assert model.acomplete is None
+    assert model.astream is None
+
+    @agent(model=model, max_turns=2, name="compatible_injected_client_agent")
+    def greeter(name: str) -> str:
+        """You are a friendly greeter."""
+        return f"Greet {name}"
+
+    run = greeter.run("Ann")
+
+    assert run.output == "Hello there."
+    assert run.status == "completed"
+    assert len(model._client.chat.completions.calls) == 1  # type: ignore[attr-defined]
+
+
+def test_agent_stream_uses_injected_sync_streaming_client():
+    """Engine-level streaming check: ``@agent(...).stream()`` (the sync
+    facade) with an injected sync streaming fake client must drive the
+    fake's ``stream()``. ``astream`` is shadowed to ``None`` by ``__init__``
+    (client= injected), so the engine's discovery (models/base.py's Model
+    docstring) falls back to iterating the sync ``stream()`` via to_thread
+    hops -- proof the injected client, not some freshly built AsyncOpenAI,
+    served the run.
+    """
+    from composeai.agentfn import agent
+
+    chunks = [
+        _chunk(_delta(content="Hello")),
+        _chunk(_delta(content=" there."), finish_reason="stop"),
+        _usage_only_chunk(_usage()),
+    ]
+    model = _model([chunks])
+    assert model.astream is None
+
+    @agent(model=model, max_turns=2, name="compatible_injected_client_stream_agent")
+    def greeter(name: str) -> str:
+        """You are a friendly greeter."""
+        return f"Greet {name}"
+
+    run_stream = greeter.stream("Ann")
+    events = list(run_stream)
+
+    assert run_stream.run.output == "Hello there."
+    assert run_stream.run.status == "completed"
+    assert any(e.kind == "text_delta" for e in events)
+    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    assert call["stream"] is True

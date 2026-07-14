@@ -34,7 +34,7 @@ import json
 import os
 import re
 import threading
-from collections.abc import Callable, Iterator, Sequence
+from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
@@ -115,6 +115,16 @@ class FakeModel:
         """
         response = self.complete(request)
         yield from _synthesize_stream_events(response)
+
+    async def acomplete(self, request: ModelRequest) -> ModelResponse:
+        """Async twin: same script, same order (in-memory, nothing blocks)."""
+        return self.complete(request)
+
+    async def astream(self, request: ModelRequest) -> AsyncIterator[RawStreamEvent]:
+        """Async twin of stream(): consume one script item, synthesize deltas."""
+        response = self.complete(request)
+        for event in _synthesize_stream_events(response):
+            yield event
 
     def _to_response(self, item: Any, request: ModelRequest) -> ModelResponse:
         if isinstance(item, ModelResponse):
@@ -320,7 +330,7 @@ class RecordingModel:
     def __init__(self, inner: Model, entries: list[dict[str, Any]]) -> None:
         self._inner = inner
         self._entries = entries
-        # Only expose `.stream` when the inner model does -- `_invoke_model`
+        # Only expose `.stream` when the inner model does -- `_ainvoke_model`
         # (composeai.agentfn) detects streaming support with
         # `getattr(model, "stream", None)`, so this instance must not appear
         # to support it when the model it wraps doesn't.
@@ -582,7 +592,7 @@ class CachingModel:
     ``COMPOSE_DIR`` change between runs/tests). A hit decodes the stored
     response but returns it with ``usage=Usage()`` (zeroed) -- a cache hit
     must never re-report the tokens it originally cost, since no new call
-    was made. ``composeai.agentfn._call_llm`` reads :attr:`last_was_hit`
+    was made. ``composeai.agentfn._acall_llm`` reads :attr:`last_was_hit`
     (a duck-typed ``getattr(model, "last_was_hit", False)`` check, right
     after invoking the model) to tag the llm span's
     ``attributes["cached"] = True`` on a hit.

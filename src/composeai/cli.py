@@ -756,7 +756,7 @@ def _export_entry(row: sqlite3.Row) -> dict[str, Any]:
 
     ``full_hash`` is always ``None`` here -- the persisted span input only
     ever stored ``{"system", "messages"}`` (see
-    ``composeai.agentfn._call_llm``), never the tools/output_schema/
+    ``composeai.agentfn._acall_llm``), never the tools/output_schema/
     max_tokens/temperature a live request also hashes -- so an exported
     cassette can only ever match on ``message_hash`` at replay time (see
     :class:`~composeai.testing.ReplayModel`'s fallback).

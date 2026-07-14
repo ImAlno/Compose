@@ -1013,10 +1013,25 @@ def reset_default() -> None:
     and reinstalls the sink from scratch. Used by the test suite's
     session-autouse fixture so every test gets an isolated store rooted at
     a temp dir instead of ever touching the repo's ``./.compose``.
+
+    Also closes the old store's :class:`~composeai._storeasync.StoreWorker`
+    (if the async engine ever routed work through it), not just the store
+    itself -- otherwise its dedicated "composeai-store" writer thread is
+    orphaned (never joined) until interpreter exit, one per reset, since a
+    closed ``RunStore`` with a still-registered worker is never looked up
+    again under its old ``id()``. Guarded for the common case where no
+    worker was ever created for this store. Deferred import: same
+    module-scope import-cycle reason :meth:`RunContext.ajournal_record`
+    documents (``composeai._storeasync`` imports :class:`RunStore` from
+    this module at module scope).
     """
     global _default_store, _sink_installed
     if _default_store is not None:
-        _default_store.close()
+        old_store = _default_store
+        old_store.close()
+        from composeai._storeasync import close_worker_if_registered
+
+        close_worker_if_registered(old_store)
     _default_store = None
     _sink_installed = False
     tracing.set_span_sink(None)
@@ -1073,22 +1088,29 @@ def use_run_id(run_id: str | None) -> Iterator[None]:
 # journal key reserved while active. This is what makes journal keys
 # deterministic for *every* stage kind (bare callables, @agent functions,
 # Pipeline/Aggregate, not just @task) under compose.map/aggregate/parallel
-# tool dispatch: instead of racing every worker thread's calls to
-# `next_key()` against each other (whoever's thread happens to run first
-# wins that slot -- see the durability audit that added this), the
-# dispatching combinator reserves one deterministic scope segment *per item/
-# branch/call*, serially, in a fixed (input/declaration) order, on the
-# dispatching thread, *before* handing work to the thread pool. Each worker
-# then pushes its own already-reserved segment for the duration of its call
-# (via `push_scope`) -- so whatever journal keys that worker's own body
-# reserves are automatically prefixed by a scope that was assigned
-# deterministically, regardless of which thread actually gets there first.
+# tool dispatch: instead of racing every concurrently-scheduled item/
+# branch's calls to `next_key()` against each other (whichever one happens
+# to run first wins that slot -- see the durability audit that added this),
+# the dispatching combinator reserves one deterministic scope segment *per
+# item/branch/call*, serially, in a fixed (input/declaration) order, on its
+# own engine coroutine, *before* any item/branch is actually dispatched.
+# Each item/branch's own coroutine then pushes its already-reserved segment
+# for the duration of its call (via `push_scope`) -- so whatever journal
+# keys that call's own body reserves are automatically prefixed by a scope
+# that was assigned deterministically, regardless of which item/branch
+# actually finishes first.
 #
-# Propagates into worker threads via `tracing.propagate`'s
-# `contextvars.copy_context()` the same way `_current_span`/`_current_bus`
-# do; `push_scope` itself is called *inside* the worker (after the copied
-# context is already running on that thread), so setting it there can never
-# leak back to the dispatching thread or to sibling workers.
+# Propagates the way `asyncio.Task` already does: each item/branch runs as
+# its own coroutine (a native `asyncio.Task` for an async-native stage, or
+# handed off to `_dispatch._run_sync_on_own_thread`'s own dedicated thread
+# for a plain sync callable -- see that module), and `push_scope` is called
+# *inside* that coroutine, so setting it there can never leak back to the
+# dispatching coroutine or to sibling items/branches. A sync callable's
+# dedicated thread sees the same ambient scope via that bridge's own
+# `contextvars.copy_context()` snapshot, taken at the moment the coroutine
+# reaches it -- no separate `tracing.propagate()` step needed here (that
+# helper is for genuine standalone worker threads, e.g. `.stream()`'s
+# background thread, not this coroutine-native dispatch).
 _scope_stack: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "_scope_stack", default=()
 )
@@ -1129,6 +1151,7 @@ class JournalScope(Protocol):
     def qualify(self, segment: str) -> str: ...
     def journal_lookup(self, key: str) -> tuple[bool, Any]: ...
     def journal_record(self, key: str, value: Any) -> Any: ...
+    async def ajournal_record(self, key: str, value: Any) -> Any: ...
 
 
 @dataclass
@@ -1202,6 +1225,49 @@ class RunContext:
         except SerializationError as exc:
             raise SerializationError(f"step {key!r}: {exc}") from exc
         winner_json = self.store.journal_put(self.run_id, key, value_json)
+        self.preloaded[key] = winner_json
+        return from_jsonable(json.loads(winner_json))
+
+    async def ajournal_record(self, key: str, value: Any) -> Any:
+        """Async twin of :meth:`journal_record` (v0.4.0 Plan A, Task 8).
+
+        The one blocking call ``journal_record`` makes -- ``self.store
+        .journal_put(...)`` -- routes through
+        ``composeai._storeasync.worker_for(self.store).call("journal_put", ...)``
+        (the store's dedicated writer thread) instead of calling
+        ``self.store`` directly, so a journaled ``@agent`` step reached from
+        inside :mod:`composeai.combinators`'s async engine (``map``/
+        ``aggregate``/``pipe`` fan-outs) never blocks the composeai runtime
+        loop with SQLite I/O -- same reasoning as
+        :func:`~composeai.agentfn._asnapshot_agent_state`.
+
+        First-write-wins is preserved exactly: :meth:`RunStore.journal_put`'s
+        ``INSERT OR IGNORE`` (falling back to a re-``SELECT`` of the row
+        that won, on conflict) is still the one atomic operation that
+        decides a race's winner -- this only changes WHICH THREAD executes
+        that same SQL (the store's writer thread instead of whichever
+        thread called ``ajournal_record``), never how the race itself is
+        resolved. The return value is the winner's decoded value either
+        way (never necessarily this caller's own ``value``), and
+        ``self.preloaded`` is updated with the winner's JSON exactly like
+        the sync path, so a subsequent ``journal_lookup`` (sync or async,
+        on any thread sharing this ``RunContext``) sees it immediately.
+
+        Deferred import: :mod:`composeai._storeasync` imports
+        :class:`RunStore` from this module at module scope, so importing it
+        back here at module scope would cycle -- this local import is the
+        same workaround :mod:`composeai.agentfn` didn't need only because
+        it is never imported *by* ``_storeasync``.
+        """
+        from composeai._storeasync import worker_for
+
+        try:
+            value_json = json.dumps(to_jsonable(value))
+        except SerializationError as exc:
+            raise SerializationError(f"step {key!r}: {exc}") from exc
+        winner_json = await worker_for(self.store).call(
+            "journal_put", self.run_id, key, value_json
+        )
         self.preloaded[key] = winner_json
         return from_jsonable(json.loads(winner_json))
 
@@ -1281,6 +1347,19 @@ class _AbandonGuardedRunContext:
         self._check()
         return self._ctx.journal_record(key, value)
 
+    async def ajournal_record(self, key: str, value: Any) -> Any:
+        # Mostly unreachable: this guard is only ever installed inside an
+        # abandoned @task(timeout=...)'s own daemon THREAD copy of the
+        # ambient context (see _run_with_timeout), not the composeai runtime
+        # loop's own async engine -- but a nested async agent call launched
+        # from that abandoned worker's thread CAN reach this await, so
+        # ``self._check()`` below is the real defense, not the surrounding
+        # structure. Implemented anyway for structural parity with every
+        # other method on this class (all of which guard-check before
+        # delegating).
+        self._check()
+        return await self._ctx.ajournal_record(key, value)
+
 
 def abandon_guard(ctx: JournalScope | None, abandoned: threading.Event) -> JournalScope | None:
     """Wrap ``ctx`` in a guard that revokes journal access once ``abandoned`` is set.
@@ -1343,6 +1422,35 @@ def persist_pending_interrupt(store: RunStore, run_id: str, interrupt: Any) -> N
         created_at=time.time(),
     )
     store.update_run(run_id, status="paused")
+
+
+async def apersist_pending_interrupt(store: RunStore, run_id: str, interrupt: Any) -> None:
+    """Async twin of :func:`persist_pending_interrupt` (v0.4.0 Plan A, Task 9).
+
+    Both underlying store calls (``pending_interrupt_put`` then
+    ``update_run``) route through
+    ``composeai._storeasync.worker_for(store).call(...)`` instead of calling
+    ``store`` directly, one after the other in the same order the sync
+    version uses -- so persisting a flow's pause from inside
+    ``composeai.flow._aexecute_flow`` (running on the composeai runtime
+    loop) never blocks that loop with SQLite I/O. Same reasoning as
+    :meth:`RunContext.ajournal_record`; deferred import for the same
+    import-cycle reason documented there (:mod:`composeai._storeasync`
+    imports :class:`RunStore` from this module at module scope).
+    """
+    from composeai._storeasync import worker_for
+
+    payload_json = json.dumps(to_jsonable(interrupt.payload))
+    await worker_for(store).call(
+        "pending_interrupt_put",
+        run_id=run_id,
+        interrupt_id=interrupt.id,
+        kind=interrupt.kind,
+        question=interrupt.question,
+        payload_json=payload_json,
+        created_at=time.time(),
+    )
+    await worker_for(store).call("update_run", run_id, status="paused")
 
 
 # --- resume() answers: shared by composeai.flow.resume and --------------
@@ -1496,7 +1604,7 @@ def run_standalone_agent(
     ``composeai.agentfn.resume_standalone_agent`` can reinstate the same cap
     on resume -- previously a resume ran with no budget enforcement at all.
 
-    Pre-generates ``trace_id`` (mirroring ``composeai.flow._execute_flow``)
+    Pre-generates ``trace_id`` (mirroring ``composeai.flow.Flow.run``)
     and wraps ``thunk()`` in :func:`~composeai.tracing.use_trace` with it --
     this is what lets a pause be turned into a paused ``Run`` *with* its
     trace still attached (see :func:`settle_agent_run`), and what lets a

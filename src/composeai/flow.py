@@ -36,10 +36,12 @@ import time
 from collections.abc import Callable
 from typing import Any, overload
 
-from . import agentfn, runs, tracing
+from . import _runtime, agentfn, runs, tracing
+from ._dispatch import run_stage
 from ._encoding import from_jsonable, to_jsonable
 from ._ids import new_ulid
 from ._schema import register_annotation_types
+from ._storeasync import worker_for
 from .errors import ConfigError, ResumeMismatchError, TaskTimeoutError
 from .messages import Usage
 from .runs import (
@@ -49,10 +51,10 @@ from .runs import (
     RunContext,
     RunStream,
     _run_with_timeout,
+    apersist_pending_interrupt,
     apply_resume_answers,
     budget_scope,
     current_run_context,
-    persist_pending_interrupt,
     use_run_context,
 )
 from .runs import open_default as _open_default_store
@@ -325,8 +327,10 @@ class Flow:
             args_json=args_json,
             budget_json=runs.encode_budget(budget),
         )
-        return _execute_flow(
-            self, run_id=run_id, trace_id=trace_id, args=args, kwargs=kwargs, budget=budget
+        return _runtime.run_sync(
+            _aexecute_flow(
+                self, run_id=run_id, trace_id=trace_id, args=args, kwargs=kwargs, budget=budget
+            )
         )
 
     def stream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> RunStream:
@@ -368,7 +372,7 @@ def flow(
     return decorator
 
 
-def _execute_flow(
+async def _aexecute_flow(
     flow_obj: Flow,
     *,
     run_id: str,
@@ -377,21 +381,68 @@ def _execute_flow(
     kwargs: dict[str, Any],
     budget: Budget | None,
 ) -> Run:
+    """Async core of the flow engine (v0.4.0 Plan A, Task 9) -- mirrors the
+    former ``_execute_flow`` exactly; ``Flow.run()``/``resume()`` are its
+    only two callers, both sync facades dispatching via
+    ``_runtime.run_sync(_aexecute_flow(...))`` (``create_run`` itself stays
+    caller-side/sync in both, exactly as before -- this function never
+    creates the row, only ever updates one that already exists).
+
+    Every direct store call this function makes itself (as opposed to a
+    span's own persistence on exit, via ``tracing``'s module-global sink --
+    that stays synchronous on this coroutine's own thread, unchanged from
+    every other async engine core in this codebase; see
+    ``composeai.agentfn``'s identical precedent) routes through
+    ``worker_for(store).call(...)`` -- the store's dedicated writer thread
+    (:mod:`composeai._storeasync`) -- so a durable flow run driven through
+    the async engine (nested inside a ``pipe``/``aggregate``/``map``, or a
+    top-level ``.run()``/``resume()`` dispatched via ``_runtime.run_sync``)
+    never blocks the composeai runtime loop with SQLite I/O: the initial
+    journal preload (``journal_all``) and budget baseline
+    (``prior_llm_usage``), and every ``update_run``/pause-persistence write
+    below.
+
+    The flow BODY itself stays a sync user function in this plan (v0.4.0
+    Plan A) -- it runs via ``_dispatch.run_stage(flow_obj._fn, ...)``, which
+    dispatches a plain sync callable onto its OWN dedicated daemon thread
+    (see ``_dispatch._run_sync_on_own_thread``): every ``@task``/``@agent``/
+    ``now()``/``random()``/``approve()`` call made from inside the body
+    reaches the sync facades on that thread -- legal re-entry into the
+    runtime loop from a non-runtime thread (see ``_runtime.run_sync``'s own
+    re-entry guard, which only refuses re-entry from the runtime loop's OWN
+    thread, never from an arbitrary worker thread like this one); documented
+    extra latency, never a deadlock, same as every other sync-facade-from-a-
+    worker-thread call already exercised elsewhere in this codebase (e.g.
+    ``test_nested_sync_agent_call_from_tool_body_no_deadlock``).
+    ``composeai.hitl._Pause`` raised from the body is a ``BaseException``;
+    ``_run_sync_on_own_thread``'s worker resolves the awaited future with
+    ANY ``BaseException`` the callable raised (its own ``except
+    BaseException`` clause, not ``except Exception``), so it propagates
+    through the ``await run_stage(...)`` below completely unchanged and
+    reaches this function's own ``except BaseException`` immediately after
+    -- exactly as it did when the sync ``_execute_flow`` called
+    ``flow_obj._fn`` directly on its own (the caller's) thread with no
+    bridge in between at all.
+    """
     store = _open_default_store()
-    preloaded = store.journal_all(run_id)
+    preloaded = await worker_for(store).call("journal_all", run_id)
     ctx = RunContext(run_id=run_id, store=store, preloaded=preloaded)
 
     # Budget enforcement is cumulative across attempts: seed with spend
     # already persisted by earlier attempts of this run (zero for a fresh
     # run -- no spans exist yet; skipped entirely when there's no budget).
-    baseline = store.prior_llm_usage(run_id) if budget is not None else None
+    baseline = (
+        await worker_for(store).call("prior_llm_usage", run_id) if budget is not None else None
+    )
 
     with use_run_context(ctx), tracing.use_trace(trace_id):
         root_span: tracing.Span | None = None
         try:
             with tracing.span("flow", flow_obj.name) as root_span:
                 with budget_scope(budget, root_span, baseline=baseline):
-                    output = flow_obj._fn(*args, **kwargs)
+                    output = await run_stage(
+                        flow_obj._fn, args, kwargs, timeout=None, name=flow_obj.name, kind="@flow"
+                    )
                 trace = tracing.current_trace()
                 assert trace is not None
                 usage = trace.rollup_usage(root_span)
@@ -410,7 +461,7 @@ def _execute_flow(
             # propagating up from a nested @agent's tool call) raise
             # `composeai.hitl._Pause`, duck-typed-detected here (this module
             # cannot import `composeai.hitl`, which imports `composeai.runs` for
-            # the ambient-run-context helpers `_execute_flow` itself uses --
+            # the ambient-run-context helpers `_aexecute_flow` itself uses --
             # importing it back here would cycle). The flow *returns* a paused
             # `Run` instead of raising; the process may exit right after.
             if getattr(exc, "_compose_pause", False):
@@ -418,7 +469,7 @@ def _execute_flow(
                 # `composeai.hitl.Interrupt`, so pyright can't check the
                 # attribute access statically either).
                 interrupt = getattr(exc, "interrupt")  # noqa: B009
-                persist_pending_interrupt(store, run_id, interrupt)
+                await apersist_pending_interrupt(store, run_id, interrupt)
                 if root_span is not None:
                     tracing.emit_run_finished(root_span, status="paused")
                 trace = tracing.current_trace()
@@ -433,7 +484,8 @@ def _execute_flow(
                     pending=interrupt,
                 )
             now = time.time()
-            store.update_run(
+            await worker_for(store).call(
+                "update_run",
                 run_id,
                 status="failed",
                 updated_at=now,
@@ -444,7 +496,8 @@ def _execute_flow(
             raise
 
         now = time.time()
-        store.update_run(
+        await worker_for(store).call(
+            "update_run",
             run_id,
             status="completed",
             updated_at=now,
@@ -479,7 +532,7 @@ def _run_flow_journaled(
     A pause (``composeai.hitl._Pause``) raised from inside the inner flow's
     body is deliberately not caught here -- same as a nested ``@task``
     call, it simply propagates to the outermost flow's own pause handling
-    (see ``_execute_flow``'s ``except`` clause); nothing is journaled for
+    (see ``_aexecute_flow``'s ``except`` clause); nothing is journaled for
     this step (a miss again next time), and whatever the inner flow itself
     journaled up to the pause point is unaffected (it shares the same
     journal, just under its own scoped keys).
@@ -617,13 +670,15 @@ def resume(
     apply_resume_answers(store, run_id, answers)
     args, kwargs = _decode_call(row["args_json"])
     effective_budget = budget if budget is not None else runs.decode_budget(row.get("budget_json"))
-    return _execute_flow(
-        flow_obj,
-        run_id=run_id,
-        trace_id=row["trace_id"],
-        args=args,
-        kwargs=kwargs,
-        budget=effective_budget,
+    return _runtime.run_sync(
+        _aexecute_flow(
+            flow_obj,
+            run_id=run_id,
+            trace_id=row["trace_id"],
+            args=args,
+            kwargs=kwargs,
+            budget=effective_budget,
+        )
     )
 
 

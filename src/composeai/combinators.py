@@ -20,22 +20,23 @@ default to ``Any``).
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import time
 import types
 import typing
 from collections.abc import Callable, Sequence
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from typing import Any
 
-from . import agentfn, runs, tracing
+from . import _runtime, agentfn, runs, tracing
+from ._dispatch import gather_settled, run_stage
 from ._encoding import register_serializable
 from ._ids import new_ulid
 from ._schema import resolve_annotations
 from .agentfn import AgentFunction
 from .errors import CompositionTypeError, ConfigError
-from .runs import Budget, Run, RunStream, _run_with_timeout, budget_scope
+from .runs import Budget, Run, RunStream, budget_scope
 from .tools import Tool
 
 Stage = Any
@@ -151,10 +152,19 @@ def _types_compatible(out_t: Any, in_t: Any) -> bool:
 # --- shared stage-invocation + top-level run assembly --------------------------
 
 
-def _invoke_stage(stage: Stage, x: Any, *, streaming: bool, task_name: str | None = None) -> Any:
+async def _ainvoke_stage(
+    stage: Stage,
+    x: Any,
+    *,
+    streaming: bool,
+    task_name: str | None = None,
+    timeout: float | None = None,
+    timeout_name: str | None = None,
+    timeout_kind: str = "@task",
+) -> Any:
     """Run one stage on input ``x``, opening whatever span kind fits it.
 
-    ``AgentFunction`` stages run via ``agentfn._run_agent`` directly (not
+    ``AgentFunction`` stages run via ``agentfn._arun_agent`` directly (not
     the public, always-non-streaming ``.run()`` sugar) so a ``streaming``
     pipeline/aggregate can thread ``streaming=True`` down to them and get
     real token deltas on the ambient bus, not just span events. Nested
@@ -162,20 +172,78 @@ def _invoke_stage(stage: Stage, x: Any, *, streaming: bool, task_name: str | Non
     recurse with the same ``streaming`` flag. A plain callable gets a
     ``task`` span with its input/output captured; ``task_name`` overrides
     the default name (used by :func:`map` for per-item span names).
-    """
-    if isinstance(stage, AgentFunction):
-        return agentfn._run_agent(stage, (x,), {}, streaming=streaming).output
-    if isinstance(stage, Pipeline):
-        with tracing.span("pipe", stage._name):
-            return stage._run_stages(x, streaming=streaming)
-    if isinstance(stage, Aggregate):
-        with tracing.span("aggregate", stage._name):
-            return stage._run_branches(x, streaming=streaming)
 
-    name = task_name if task_name is not None else _stage_name(stage)
-    with tracing.span("task", name) as task_span:
+    This also owns a ``timeout``/``timeout_kind`` the old sync engine never
+    took: ``map()``/``Aggregate._run_branches`` used to wrap the WHOLE
+    dispatch -- sync stage or not -- in the same ``runs._run_with_timeout``
+    daemon race, since everything ran synchronously in a worker thread
+    regardless of stage kind.
+
+    Threading the timeout down into *this* function -- rather than the
+    caller wrapping this function's own result in a second, outer timeout
+    -- is what preserves each stage kind's correct cancellation semantics
+    via :func:`~composeai._dispatch.run_stage`: for a plain callable,
+    ``stage`` itself (not a wrapper) is what's handed to ``run_stage``, so
+    its own ``inspect.iscoroutinefunction`` check still sees the real user
+    function -- a sync ``def`` still gets the abandoned-thread daemon race
+    (:func:`~composeai.runs._run_with_timeout`, unchanged wording -- what
+    the existing ``test_map_timeout_per_item_raises``-style tests exercise
+    and must keep passing), an ``async def`` (the new, map()-internal-only
+    capability) gets cooperative ``asyncio.wait_for`` cancellation. An
+    ``AgentFunction``/``Pipeline``/``Aggregate`` stage has no sync body to
+    preserve a thread-race for -- it's already async-native -- so it's
+    wrapped in a zero-arg coroutine function and always takes
+    ``run_stage``'s cooperative-cancel branch instead. (Had this function
+    instead wrapped *its own* dispatch in one outer async closure regardless
+    of stage kind, every stage -- including a plain sync callable -- would
+    look like a coroutine function to ``run_stage``, silently losing the
+    abandoned-thread semantics for the very case the existing tests cover.)
+
+    ``task_name`` behaves exactly as in the sync version (span-naming
+    override for the plain-callable branch only -- ``map()`` uses this for
+    per-item span names like ``f"{fn_name}[{i}]"``; ``Pipeline``/
+    ``Aggregate``/``AgentFunction`` branches always use their own inherent
+    name). ``timeout_name`` is a SEPARATE identifier used only in the
+    ``TaskTimeoutError`` message (defaults to whatever ``task_name``/
+    ``_stage_name(stage)`` resolves to when not given): ``map()`` passes
+    the same value for both (its old ``dispatch()`` used one ``name`` for
+    both purposes); ``Aggregate._arun_branches`` passes only
+    ``timeout_name`` (the branch's declared key, e.g. ``"hung"``) and never
+    ``task_name`` -- matching the sync version, where a plain-callable
+    branch's span name came from ``_stage_name(stage)`` while its timeout
+    message named the branch by its dict key, two independently-meaningful
+    identifiers that happened to coincide only in ``map()``.
+    """
+    stage_name = task_name if task_name is not None else _stage_name(stage)
+    tname = timeout_name if timeout_name is not None else stage_name
+
+    if isinstance(stage, AgentFunction):
+
+        async def _call() -> Any:
+            run = await agentfn._arun_agent(stage, (x,), {}, streaming=streaming)
+            return run.output
+
+        return await run_stage(_call, (), {}, timeout=timeout, name=tname, kind=timeout_kind)
+
+    if isinstance(stage, Pipeline):
+
+        async def _call() -> Any:
+            with tracing.span("pipe", stage._name):
+                return await stage._arun_stages(x, streaming=streaming)
+
+        return await run_stage(_call, (), {}, timeout=timeout, name=tname, kind=timeout_kind)
+
+    if isinstance(stage, Aggregate):
+
+        async def _call() -> Any:
+            with tracing.span("aggregate", stage._name):
+                return await stage._arun_branches(x, streaming=streaming)
+
+        return await run_stage(_call, (), {}, timeout=timeout, name=tname, kind=timeout_kind)
+
+    with tracing.span("task", stage_name) as task_span:
         task_span.set_input(x)
-        result = stage(x)
+        result = await run_stage(stage, (x,), {}, timeout=timeout, name=tname, kind=timeout_kind)
         task_span.set_output(result)
         return result
 
@@ -326,10 +394,23 @@ class Pipeline:
         )
 
     def _run_stages(self, x: Any, *, streaming: bool) -> Any:
-        """Run every stage in sequence, assuming an enclosing 'pipe' span is already open."""
+        """Sync facade over the async core :meth:`_arun_stages` (v0.4.0 Plan
+        A, Task 8) -- assumes an enclosing 'pipe' span is already open (same
+        contract as before). One ``_runtime.run_sync`` hop per call: every
+        caller (``.run()``, ``.stream()``'s background thread, and
+        ``combinators._ainvoke_stage``'s Pipeline-as-nested-stage branch,
+        which calls :meth:`_arun_stages` directly instead of this facade --
+        see its own docstring for why) reaches the engine through here or
+        directly through the async core, never both.
+        """
+        return _runtime.run_sync(self._arun_stages(x, streaming=streaming))
+
+    async def _arun_stages(self, x: Any, *, streaming: bool) -> Any:
+        """Async core: run every stage in sequence, assuming an enclosing
+        'pipe' span is already open."""
         current = x
         for stage in self._stages:
-            current = _invoke_stage(stage, current, streaming=streaming)
+            current = await _ainvoke_stage(stage, current, streaming=streaming)
         return current
 
 
@@ -399,14 +480,30 @@ class Aggregate:
         )
 
     def _run_branches(self, x: Any, *, streaming: bool) -> dict[str, Any]:
-        """Run every branch in parallel, assuming an enclosing 'aggregate' span is already open.
+        """Sync facade over the async core :meth:`_arun_branches` (v0.4.0
+        Plan A, Task 8) -- see its docstring for the full contract, byte-
+        identical here. Assumes an enclosing 'aggregate' span is already
+        open, same as before. One ``_runtime.run_sync`` hop per call
+        (``.run()``, ``.stream()``'s background thread) --
+        ``combinators._ainvoke_stage``'s Aggregate-as-nested-stage branch
+        calls :meth:`_arun_branches` directly instead, never both.
+        """
+        return _runtime.run_sync(self._arun_branches(x, streaming=streaming))
+
+    async def _arun_branches(self, x: Any, *, streaming: bool) -> dict[str, Any]:
+        """Async core: run every branch concurrently, assuming an enclosing
+        'aggregate' span is already open.
 
         Every branch settles (success or exception) before this returns;
         on any failure the first branch's exception *in declaration order*
-        is raised, regardless of which branch actually finished first.
+        is raised, regardless of which branch actually finished first --
+        :func:`~composeai._dispatch.gather_settled` returns settled pairs in
+        the SAME order as the coroutines it was given (``asyncio.gather``'s
+        own ordering guarantee), and this iterates ``self._branches`` (a
+        plain ``dict``, insertion-ordered) to preserve that.
 
         This applies equally when a branch pauses (``composeai.hitl._Pause``
-        is a ``BaseException``, caught by ``_run_one`` like anything else):
+        is a ``BaseException``, caught by ``_arun_one`` like anything else):
         if two or more branches call ``approve()``/``ask_human()`` (or hit an
         unanswered ``@tool(requires_approval=True)`` call) with no journaled
         answer, only the first (in declaration order) actually raises and
@@ -417,15 +514,22 @@ class Aggregate:
 
         Inside an active ``@flow`` body, each branch runs under its own
         deterministic journal scope (``"aggregate#n/{branch_name}"``,
-        reserved serially -- in declaration order -- on *this* thread before
-        any branch is dispatched) -- see ``composeai.runs``'s scope-stack
-        module docs. Without this, any ``@task``/``@agent``/nested-``@flow``
-        call inside a branch would journal under a key assigned by whichever
-        thread happened to reach it first, not by declaration order --
+        reserved serially -- in declaration order -- on *this* (engine)
+        coroutine, before any branch is dispatched) -- see
+        ``composeai.runs``'s scope-stack module docs. Without this, any
+        ``@task``/``@agent``/nested-``@flow`` call inside a branch would
+        journal under a key assigned by whichever concurrently-scheduled
+        task happened to reach it first, not by declaration order --
         nondeterministic across a crash/resume, potentially attaching a
         completed branch's cached step to the wrong branch. This applies to
         *every* stage kind (bare callables, ``@agent`` functions, nested
-        ``Pipeline``/``Aggregate``), not just ``@task``.
+        ``Pipeline``/``Aggregate``), not just ``@task``. Each branch's
+        ``runs.push_scope`` call moves INSIDE its own coroutine (wrapping
+        that branch's stage invocation), rather than around the fan-out as
+        a whole: contextvars are task-local, so a push made inside a
+        coroutine only affects that coroutine's own task-local context copy
+        (taken by ``asyncio.gather`` at the moment each task is scheduled) --
+        the same isolation the sync version's per-thread context copy gave.
         """
         ctx = runs.current_run_context()
         if ctx is not None:
@@ -436,32 +540,35 @@ class Aggregate:
         else:
             branch_scopes = {name: None for name in self._branches}
 
-        def _run_one(name: str, stage: Stage) -> tuple[Any, BaseException | None]:
-            def call() -> Any:
-                return _invoke_stage(stage, x, streaming=streaming)
-
-            def run() -> Any:
-                if self._timeout_per_branch is None:
-                    return call()
-                return _run_with_timeout(
-                    call, (), {}, self._timeout_per_branch, name, kind="aggregate branch"
+        async def _adispatch(name: str, stage: Stage) -> Any:
+            async def _call() -> Any:
+                return await _ainvoke_stage(
+                    stage,
+                    x,
+                    streaming=streaming,
+                    timeout=self._timeout_per_branch,
+                    timeout_name=name,
+                    timeout_kind="aggregate branch",
                 )
 
+            scope = branch_scopes[name]
+            if scope is None:
+                return await _call()
+            with runs.push_scope(scope):
+                return await _call()
+
+        async def _arun_one(name: str, stage: Stage) -> tuple[Any, BaseException | None]:
             try:
-                scope = branch_scopes[name]
-                if scope is None:
-                    return run(), None
-                with runs.push_scope(scope):
-                    return run(), None
+                return await _adispatch(name, stage), None
             except BaseException as exc:  # settled below, re-raised as-is once every branch is done
                 return None, exc
 
-        with ThreadPoolExecutor(max_workers=len(self._branches)) as pool:
-            futures = {
-                name: pool.submit(tracing.propagate(_run_one), name, stage)
-                for name, stage in self._branches.items()
-            }
-            outcomes = {name: future.result() for name, future in futures.items()}
+        settled = await gather_settled(
+            [_arun_one(name, stage) for name, stage in self._branches.items()]
+        )
+        outcomes = dict(
+            zip(self._branches.keys(), (outcome for outcome, _exc in settled), strict=True)
+        )
 
         for _output, exc in outcomes.values():
             if exc is not None:
@@ -552,7 +659,7 @@ def map(
       collect mode.
 
     Same "first one wins" rule applies to pauses in ``on_error="raise"``
-    mode (see :meth:`Aggregate._run_branches`'s docstring for the
+    mode (see :meth:`Aggregate._arun_branches`'s docstring for the
     human-in-the-loop implication): if several items independently call
     ``approve()``/``ask_human()`` unanswered, only the first (by index)
     raises and pauses this attempt -- the rest simply re-pause on a later
@@ -561,25 +668,71 @@ def map(
     Inside an active ``@flow`` body, each item runs under its own
     deterministic journal scope (``"map#n[i]"``, ``n`` this ``map()``
     call's own step number and ``i`` the item's *input* index -- both
-    reserved serially, before any item is dispatched, on this thread --
-    see ``composeai.runs``'s scope-stack module docs). Every completed
-    item is journaled individually as it finishes, so a failed ``map()``
-    (whether it raises or, with ``on_error="collect"``, records a failed
-    ``MapResult``) never discards its siblings' completed work across a
-    ``resume()`` -- only the unfinished tail actually re-runs. Without
+    reserved serially, before any item is dispatched, on this (engine)
+    coroutine -- see ``composeai.runs``'s scope-stack module docs). Every
+    completed item is journaled individually as it finishes, so a failed
+    ``map()`` (whether it raises or, with ``on_error="collect"``, records a
+    failed ``MapResult``) never discards its siblings' completed work across
+    a ``resume()`` -- only the unfinished tail actually re-runs. Without
     per-item scoping, any ``@task``/``@agent``/nested-``@flow``/nested-
     ``pipe``/nested-``aggregate`` call inside ``fn`` would journal under a
-    key assigned by whichever worker thread happened to reach it first --
-    parallel *completion* order, not input order -- so a crash mid-map
-    followed by a differently-scheduled resume could attach a completed
-    item's cached output to a different item, silently. This applies to
-    *every* stage kind (bare callables, ``@agent`` functions,
+    key assigned by whichever concurrently-scheduled item happened to reach
+    it first -- parallel *completion* order, not input order -- so a crash
+    mid-map followed by a differently-scheduled resume could attach a
+    completed item's cached output to a different item, silently. This
+    applies to *every* stage kind (bare callables, ``@agent`` functions,
     ``Pipeline``/``Aggregate``), not just ``@task`` -- there is no
     special-casing by stage type anymore.
     """
     if on_error not in ("raise", "collect"):
         raise ConfigError(f"map(): on_error must be 'raise' or 'collect', got {on_error!r}")
+    if max_workers is not None and max_workers < 1:
+        raise ValueError("max_workers must be greater than 0")
 
+    return _runtime.run_sync(
+        _amap(
+            fn,
+            items,
+            max_workers=max_workers,
+            timeout_per_item=timeout_per_item,
+            on_error=on_error,
+        )
+    )
+
+
+async def _amap(
+    fn: Stage,
+    items: Sequence[Any],
+    *,
+    max_workers: int | None,
+    timeout_per_item: float | None,
+    on_error: str,
+) -> list[Any]:
+    """Async core of :func:`map` (v0.4.0 Plan A, Task 8) -- see its
+    docstring for the full contract, byte-identical here. ``on_error``
+    validation stays in :func:`map` itself so it raises immediately,
+    without even touching the composeai runtime.
+
+    ``max_workers`` (``None`` means "as many as there are items", same
+    default as before) bounds concurrency via an ``asyncio.Semaphore``
+    rather than an OS thread pool's size -- there is no thread to bound any
+    more for a stage that runs natively as a coroutine (an ``AgentFunction``/
+    ``Pipeline``/``Aggregate``/``async def`` callable); a plain sync
+    callable still runs off-loop, on its own dedicated daemon thread (see
+    :func:`~composeai._dispatch.run_stage`'s ``_run_sync_on_own_thread``
+    bridge -- deliberately NOT ``asyncio.to_thread``, whose shared, bounded
+    default executor would starve under nested fan-out), so the semaphore
+    is what actually limits how many are in flight at once, same as the old
+    pool size did.
+
+    Every item's coroutine (``_arun_one``) catches ``BaseException`` itself
+    and always returns its own ``(output, exc)`` pair rather than letting
+    anything propagate through ``gather_settled`` -- mirroring
+    ``composeai.agentfn._aprocess_tool_use``'s identical pattern for its own
+    parallel batch: ``gather_settled``'s own exception slot is never
+    populated in practice, exactly like the sync version's
+    ``future.result()`` never raising from ``_run_one``'s own body.
+    """
     items = list(items)
     fn_name = _stage_name(fn)
 
@@ -590,40 +743,39 @@ def map(
     else:
         item_scopes = [None] * len(items)
 
-    def dispatch(i: int, item: Any) -> Any:
+    workers = max_workers if max_workers is not None else (len(items) or 1)
+    semaphore = asyncio.Semaphore(workers)
+
+    async def _adispatch(i: int, item: Any) -> Any:
         scope = item_scopes[i]
         name = f"{fn_name}[{i}]"
 
-        def call() -> Any:
-            return _invoke_stage(fn, item, streaming=False, task_name=name)
+        async def _call() -> Any:
+            return await _ainvoke_stage(
+                fn,
+                item,
+                streaming=False,
+                task_name=name,
+                timeout=timeout_per_item,
+                timeout_kind="@task",
+            )
 
-        def run() -> Any:
-            if timeout_per_item is None:
-                return call()
-            # Same daemon-thread race @task(timeout=) uses -- see
-            # runs._run_with_timeout for why not a ThreadPoolExecutor, and
-            # for the journal abandon-guard the worker gets.
-            return _run_with_timeout(call, (), {}, timeout_per_item, name)
-
-        if scope is None:
-            return run()
-        with runs.push_scope(scope):
-            return run()
+        async with semaphore:
+            if scope is None:
+                return await _call()
+            with runs.push_scope(scope):
+                return await _call()
 
     with tracing.span("aggregate", f"map({fn_name})"):
 
-        def _run_one(i: int, item: Any) -> tuple[Any, BaseException | None]:
+        async def _arun_one(i: int, item: Any) -> tuple[Any, BaseException | None]:
             try:
-                return dispatch(i, item), None
+                return await _adispatch(i, item), None
             except BaseException as exc:  # settled below, re-raised as-is once every item is done
                 return None, exc
 
-        workers = max_workers if max_workers is not None else (len(items) or 1)
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [
-                pool.submit(tracing.propagate(_run_one), i, item) for i, item in enumerate(items)
-            ]
-            outcomes = [future.result() for future in futures]
+        settled = await gather_settled([_arun_one(i, item) for i, item in enumerate(items)])
+        outcomes = [outcome for outcome, _exc in settled]
 
         if on_error == "collect":
             results: list[Any] = []

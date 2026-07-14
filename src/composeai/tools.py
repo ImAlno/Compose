@@ -255,7 +255,7 @@ def _build_param_model(fn: Callable[..., Any], tool_name: str) -> type[BaseModel
     # that too, not just pydantic's default `extra="ignore"` (which would
     # silently drop any keys not in the schema instead of rejecting the
     # call). A rejection here is still just a normal exception -- the agent
-    # loop's existing `except Exception` handling in `_execute_one_tool`
+    # loop's existing `except Exception` handling in `_aexecute_one_tool`
     # already turns it into an `is_error` tool result, same as any other
     # validation failure.
     return create_model(  # type: ignore[call-overload, no-any-return]
