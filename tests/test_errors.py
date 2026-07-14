@@ -87,3 +87,11 @@ def test_errors_carry_no_extra_frames_beyond_raise_site():
             frame_count += 1
             tb = tb.tb_next
         assert frame_count == 1
+
+
+def test_mcp_tool_error_is_compose_error():
+    from composeai.errors import ComposeError, MCPToolError
+
+    assert issubclass(MCPToolError, ComposeError)
+    err = MCPToolError("server exploded")
+    assert str(err) == "server exploded"

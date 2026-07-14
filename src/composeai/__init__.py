@@ -10,12 +10,13 @@ from .agentfn import agent, prompt
 from .combinators import MapResult, aggregate, map, pipe
 from .flow import flow, now, random, resume, task
 from .hitl import Interrupt, approve, ask_human
+from .mcp import mcp_tools
 from .models.compatible import openai_compatible
 from .models.prices import ModelPrice, register_price
 from .runs import Budget, Run
 from .tools import tool
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 __all__ = [
     "Budget",
@@ -29,6 +30,7 @@ __all__ = [
     "ask_human",
     "flow",
     "map",
+    "mcp_tools",
     "now",
     "openai_compatible",
     "pipe",

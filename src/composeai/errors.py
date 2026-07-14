@@ -94,3 +94,14 @@ class TaskTimeoutError(ComposeError):
     daemon thread after this is raised; its eventual result or exception
     is discarded. Treat a timed-out task as failed and move on.
     """
+
+
+class MCPToolError(ComposeError):
+    """An MCP tool call failed: the server reported ``isError``, the
+    transport failed mid-run, the per-call timeout expired, or the server
+    connection was already closed.
+
+    Inside an agent run this surfaces exactly like any tool-body
+    exception: an ``is_error`` tool result the model can react to -- never
+    a run abort (see ``composeai.agentfn._execute_one_tool``).
+    """

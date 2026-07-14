@@ -85,6 +85,8 @@ def fetch_url(url: str) -> str:
 
 When the model requests several tool calls in one turn, they run in parallel with no blanket bound on the batch as a whole — `@tool(timeout=...)` is the only per-call guard, so an individual tool with no timeout set can run indefinitely alongside its siblings.
 
+Tools can also come from MCP servers — see [mcp](mcp.md).
+
 ## Resilience knobs
 
 All of these are keyword-only arguments to `@compose.agent(...)`:

@@ -111,3 +111,22 @@ def test_live_openai_compatible_prompt_mode():
 
         result = live_asker("What color is the sky on a clear day?")
         assert isinstance(result, LiveAnswer)
+
+
+def test_live_mcp_server_lists_and_echoes():
+    """Extra gate: COMPOSE_LIVE_MCP_COMMAND, e.g.
+    'npx -y @modelcontextprotocol/server-everything' -- any server whose
+    first listed tool takes no required args or a single string arg."""
+    import shlex
+
+    command_line = os.environ.get("COMPOSE_LIVE_MCP_COMMAND")
+    if not command_line:
+        pytest.skip("set COMPOSE_LIVE_MCP_COMMAND to run the MCP live smoke")
+
+    from composeai import mcp_tools
+
+    parts = shlex.split(command_line)
+    tools = mcp_tools(command=parts[0], args=parts[1:], connect_timeout=60)
+    assert tools, "server listed no tools"
+    names = [t.name for t in tools]
+    assert all(isinstance(n, str) and n for n in names)

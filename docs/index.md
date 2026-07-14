@@ -74,6 +74,7 @@ No accounts, no exporters, no instrumentation to wire up — the trace (and its 
 | [observability](observability.md) | The local tracing model, every `compose` CLI command, `--import`, `COMPOSE_TRACE_CONTENT` |
 | [budgets](budgets.md) | `Budget(usd=, tokens=)`, what counts, cumulative spend across `resume()`, `BudgetExceededError` |
 | [testing](testing.md) | `FakeModel`, cassettes, `@agent(cache=True)`, `reset_registries()` |
+| [mcp](mcp.md) | Connect MCP servers' tools to your agents |
 
 ## See also
 

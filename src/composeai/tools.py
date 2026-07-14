@@ -42,24 +42,44 @@ class Tool:
 
     def __init__(
         self,
-        fn: Callable[..., Any],
-        spec: ToolSpec,
-        param_model: type[BaseModel],
+        fn: Callable[..., Any] | None = None,
+        spec: ToolSpec | None = None,
+        param_model: type[BaseModel] | None = None,
         *,
         timeout: float | None = None,
+        executor: Callable[[dict[str, Any]], str] | None = None,
     ) -> None:
+        if spec is None:
+            raise ConfigError("Tool requires a spec")
+        if (fn is None) == (executor is None):
+            raise ConfigError(
+                "Tool requires exactly one execution path: fn+param_model "
+                "(local @tool) or executor= (remote, e.g. MCP)"
+            )
+        if fn is not None and param_model is None:
+            raise ConfigError("Tool with fn= also requires param_model=")
         self.fn = fn
         self.spec = spec
         self._param_model = param_model
+        self._executor = executor
         self.__name__ = spec.name
-        self.__doc__ = fn.__doc__
+        self.__doc__ = fn.__doc__ if fn is not None else spec.description
         # Composition-time type checking (composeai.combinators.pipe/aggregate)
         # for a @tool used directly as a stage -- derived from `fn`'s own
         # signature, not `Tool.__call__`'s untyped `(*args, **kwargs)` one.
-        self.input_type, self.output_type = _tool_types(fn)
+        # Executor-backed tools have no Python signature: Any -> str.
+        if fn is not None:
+            self.input_type, self.output_type = _tool_types(fn)
+        else:
+            self.input_type, self.output_type = Any, str
         self.timeout = timeout
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        if self.fn is None:
+            raise ConfigError(
+                f"tool {self.spec.name!r} is not a local function (it executes on a "
+                "remote server); use it via @agent(tools=[...]) instead of calling it"
+            )
         return self.fn(*args, **kwargs)
 
     @property
@@ -79,6 +99,9 @@ class Tool:
         unchanged -- the agent loop decides how to turn them into a tool
         result.
         """
+        if self._executor is not None:
+            return self._executor(arguments)
+        assert self.fn is not None and self._param_model is not None
         validated = self._param_model.model_validate(arguments)
         kwargs = {name: getattr(validated, name) for name in self._param_model.model_fields}
         result = self.fn(**kwargs)

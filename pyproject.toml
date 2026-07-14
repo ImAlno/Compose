@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "composeai"
-version = "0.2.1"
+version = "0.3.0"
 description = "Radically simple, functional framework for multi-agent AI workflows — typed agent functions, pipe composition, always-on local tracing, durable flows."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -17,8 +17,9 @@ compose = "composeai.cli:main"
 [project.optional-dependencies]
 anthropic = ["anthropic>=0.40"]
 openai = ["openai>=1.60"]
-all = ["composeai[anthropic,openai]"]
-dev = ["pytest>=8", "ruff>=0.5", "pyright>=1.1.380", "anthropic>=0.40", "openai>=1.60", "build"]
+mcp = ["mcp>=1.27,<2"]
+all = ["composeai[anthropic,openai,mcp]"]
+dev = ["pytest>=8", "ruff>=0.5", "pyright>=1.1.380", "anthropic>=0.40", "openai>=1.60", "mcp>=1.27,<2", "build"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/composeai"]

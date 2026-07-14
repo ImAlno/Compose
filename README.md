@@ -8,6 +8,7 @@ A radically simple, functional framework for multi-agent AI workflows.
 - **Flows are durable.** A `@flow` journals every step; if it crashes — or pauses on a **named interrupt** (`approve("publish")`) waiting for a human — `resume(run_id)` continues it in the same process or a brand-new one, days later, replaying finished steps without re-paying for them.
 - **Every run can carry a spend cap.** `Budget(usd=..., tokens=...)` is enforced after every LLM call in a run's subtree, and stays cumulative across `resume()` — a run can't dodge its budget by crashing and getting resumed.
 - **Streaming and tracing are the same event bus.** `.stream()` yields `text_delta`/`thinking_delta`/`tool_call_started`/`tool_args_delta` interleaved with the very `span_started`/`span_finished`/`run_finished` events the trace is built from — on agents, pipelines, and flows alike, so a live UI and the trace can never disagree.
+- **MCP servers plug straight into `tools=`.** `compose.mcp_tools(command=..., ...)` connects to a Model Context Protocol server (stdio or streamable HTTP) and turns its tools into ordinary composeai `Tool` objects — indistinguishable from `@compose.tool` ones, including the same `requires_approval=` pause/resume.
 
 Runtime dependencies: **pydantic + the standard library**. Provider SDKs are optional extras. Python ≥ 3.10.
 
@@ -78,6 +79,7 @@ No accounts, no exporters, no instrumentation to wire up — the trace (and its 
 | [docs/observability.md](docs/observability.md) | The local tracing model, every `compose` CLI command, `--import`, `COMPOSE_TRACE_CONTENT` |
 | [docs/budgets.md](docs/budgets.md) | `Budget(usd=, tokens=)`, what counts, cumulative spend across `resume()`, `BudgetExceededError` |
 | [docs/testing.md](docs/testing.md) | `FakeModel`, cassettes, `@agent(cache=True)`, `reset_registries()` |
+| [docs/mcp.md](docs/mcp.md) | Connect MCP servers' tools to your agents |
 
 ## Rules of the road
 
@@ -102,13 +104,6 @@ The contracts composeai holds you to — and the ones it holds itself to:
 | **Observability** | External/SaaS platforms, opt-in callbacks | Always-on local SQLite tracing + a CLI, zero setup |
 | **Durability & HITL** | Separate checkpointer/orchestrator machinery | Journaled `@flow` + named interrupts, one `resume()` |
 | **Dependencies** | Heavy transitive footprint | pydantic + stdlib; provider SDKs as optional extras |
-
-## Releasing (maintainers)
-
-Two equivalent paths:
-
-- **Local**: put a project-scoped PyPI token in `.env` (git-ignored; see the placeholder), commit your work, then `scripts/release.sh X.Y.Z` — it bumps the version, runs the full gate, builds, and uploads. Commit the bump and tag `vX.Y.Z` afterwards.
-- **GitHub**: publish a GitHub Release and `.github/workflows/release.yml` tests, builds, and publishes via PyPI trusted publishing (no stored token). One-time setup: add this repo as a trusted publisher on pypi.org (workflow `release.yml`, environment `pypi`).
 
 ## Roadmap
 

@@ -506,3 +506,51 @@ def test_tool_timeout_default_none():
         return q
 
     assert plain_lookup.timeout is None
+
+
+def _make_executor_tool(executor):
+    from composeai.models.base import ToolSpec
+    from composeai.tools import Tool
+
+    spec = ToolSpec(
+        name="remote_echo",
+        description="Echo from a remote server.",
+        input_schema={"type": "object", "properties": {"text": {"type": "string"}}},
+        requires_approval=False,
+        strict=False,
+    )
+    return Tool(spec=spec, executor=executor)
+
+
+def test_executor_tool_executes_via_executor():
+    calls = []
+
+    def fake_executor(arguments):
+        calls.append(arguments)
+        return "echoed: " + str(arguments.get("text"))
+
+    tool_obj = _make_executor_tool(fake_executor)
+    assert tool_obj.execute({"text": "hi"}) == "echoed: hi"
+    assert calls == [{"text": "hi"}]
+    assert tool_obj.name == "remote_echo"
+    assert tool_obj.timeout is None
+
+
+def test_executor_tool_not_directly_callable():
+    from composeai.errors import ConfigError
+
+    tool_obj = _make_executor_tool(lambda a: "x")
+    with pytest.raises(ConfigError):
+        tool_obj("hi")
+
+
+def test_tool_requires_exactly_one_execution_path():
+    from composeai.errors import ConfigError
+    from composeai.models.base import ToolSpec
+    from composeai.tools import Tool
+
+    spec = ToolSpec(
+        name="broken", description="d", input_schema={}, requires_approval=False, strict=False
+    )
+    with pytest.raises(ConfigError):
+        Tool(spec=spec)  # neither fn/param_model nor executor

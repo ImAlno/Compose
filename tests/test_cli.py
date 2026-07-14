@@ -991,11 +991,11 @@ def test_console_script_smoke(tmp_path):
 
 
 def test_cli_imports_cleanly_with_no_provider_sdks_installed():
-    """`composeai.cli` must import fine with anthropic/openai unimportable.
+    """`composeai.cli` must import fine with anthropic/openai/mcp unimportable.
 
     Runs in a fresh subprocess (so no other test's already-imported modules
     leak into ``sys.modules``) with a ``sys.meta_path`` finder that raises
-    for any ``anthropic``/``openai`` import -- proving `composeai.cli`
+    for any ``anthropic``/``openai``/``mcp`` import -- proving `composeai.cli`
     never touches those packages on its import path.
     """
     code = (
@@ -1003,13 +1003,14 @@ def test_cli_imports_cleanly_with_no_provider_sdks_installed():
         "class _Blocker:\n"
         "    def find_spec(self, name, path, target=None):\n"
         "        root = name.split('.')[0]\n"
-        "        if root in ('anthropic', 'openai'):\n"
+        "        if root in ('anthropic', 'openai', 'mcp'):\n"
         "            raise ModuleNotFoundError(f'blocked: {name}')\n"
         "        return None\n"
         "sys.meta_path.insert(0, _Blocker())\n"
         "import composeai.cli\n"
         "assert 'anthropic' not in sys.modules\n"
         "assert 'openai' not in sys.modules\n"
+        "assert 'mcp' not in sys.modules\n"
         "print('IMPORT_OK')\n"
     )
     result = subprocess.run(
