@@ -29,11 +29,11 @@ would have returned, real or ``FakeModel``, and never imports
 
 from __future__ import annotations
 
+import contextvars
 import hashlib
 import json
 import os
 import re
-import threading
 from collections.abc import AsyncIterator, Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
@@ -597,20 +597,34 @@ class CachingModel:
     after invoking the model) to tag the llm span's
     ``attributes["cached"] = True`` on a hit.
 
-    Applies to :meth:`complete` only -- when the inner model also supports
-    ``stream()``, this exposes it *unwrapped* (straight passthrough, same
-    trick :class:`RecordingModel` uses to conditionally expose ``.stream``):
-    a cache would need to store and replay deltas too, which isn't
-    implemented, so streaming calls always run for real and are never
-    cached, by design.
+    Applies to :meth:`complete`/:meth:`acomplete` only -- when the inner
+    model also supports ``stream()``/``astream()``, this exposes them
+    *unwrapped* (straight passthrough, same trick :class:`RecordingModel`
+    uses to conditionally expose ``.stream``): a cache would need to store
+    and replay deltas too, which isn't implemented, so streaming calls
+    always run for real and are never cached, by design. ``acomplete`` and
+    ``astream`` are each only exposed when the inner model has the matching
+    method -- set to ``None`` in :meth:`__init__` otherwise, which defeats
+    the engine's ``getattr(model, "acomplete", None)`` discovery
+    (``composeai.models.base``) so it falls back to running this model's
+    sync ``complete``/``stream`` off-thread, exactly mirroring the
+    provider-adapter shadow-off pattern (e.g. ``AnthropicModel.__init__``
+    when constructed with a sync-only injected client).
 
-    Safe for concurrent :meth:`complete` calls on the *same* instance from
-    multiple threads -- :attr:`last_was_hit` is thread-local (backed by
-    ``threading.local``), so each thread observes only the outcome of its
-    own most recent call, never another thread's hit/miss racing in
-    between the call and the read. This matters because a single agent's
-    model slot (and thus its ``CachingModel``) is shared across a
-    ``pipe.map``/``aggregate`` fan-out's worker threads.
+    Safe for concurrent :meth:`complete`/:meth:`acomplete` calls on the
+    *same* instance from multiple threads AND/OR multiple asyncio tasks on
+    one thread -- :attr:`last_was_hit` is backed by a
+    ``contextvars.ContextVar`` (one per ``CachingModel`` instance), so each
+    thread *and* each task observes only the outcome of its own most recent
+    call, never another thread's or task's hit/miss racing in between the
+    call and the read. A plain ``threading.local`` would isolate by OS
+    thread only -- insufficient once ``acomplete`` lets multiple coroutines
+    share one instance on a single event-loop thread, which is exactly the
+    bug class ``ContextVar`` (task- and thread-isolated) closes. This
+    matters because a single agent's model slot (and thus its
+    ``CachingModel``) is shared across a ``pipe.map``/``aggregate``
+    fan-out's worker threads, or across concurrent ``asyncio.gather``'d
+    coroutines under the async engine.
 
     Writes the full, unredacted response to disk regardless of
     ``COMPOSE_TRACE_CONTENT`` -- that flag only governs what a *trace span*
@@ -625,31 +639,84 @@ class CachingModel:
     def __init__(self, inner: Model, cache_dir: str | Path | None = None) -> None:
         self._inner = inner
         self._cache_dir = Path(cache_dir) if cache_dir is not None else _default_cache_dir()
-        self._hit_flag = threading.local()
+        # One ContextVar per instance (not a module-level singleton) --
+        # `last_was_hit` must be reachable from every CachingModel without
+        # instances stepping on each other's flag.
+        self._hit_flag: contextvars.ContextVar[bool] = contextvars.ContextVar(
+            f"CachingModel._hit_flag[{id(self)}]", default=False
+        )
         inner_stream = getattr(inner, "stream", None)
         if inner_stream is not None:
             self.stream = inner_stream
+        if getattr(inner, "acomplete", None) is None:
+            # Discovery-defeat: the inner model has no async complete, so
+            # this instance must not appear to either -- the engine falls
+            # back to running this model's sync `complete()` off-thread.
+            self.acomplete = None  # type: ignore[assignment]
+        if getattr(inner, "astream", None) is None:
+            self.astream = None  # type: ignore[assignment]
 
     @property
     def last_was_hit(self) -> bool:
-        """Whether THIS THREAD's most recent :meth:`complete` was served from cache.
+        """Whether THIS THREAD/TASK's most recent complete/acomplete call was a cache hit.
 
-        Thread-local: parallel map/aggregate branches sharing one
-        ``CachingModel`` instance each observe their own flag (a plain
-        instance attribute let one thread's hit/miss overwrite another's
-        between the call and the read).
+        Backed by a ``contextvars.ContextVar``: parallel map/aggregate
+        threads, or concurrent asyncio tasks, sharing one ``CachingModel``
+        instance each observe their own flag (a plain instance attribute --
+        or a ``threading.local``, once coroutines share one thread -- let
+        one caller's hit/miss overwrite another's between the call and the
+        read).
         """
-        return getattr(self._hit_flag, "value", False)
+        return self._hit_flag.get()
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         key = compute_full_hash(request)
         path = self._cache_dir / f"{key}.json"
         if path.exists():
-            self._hit_flag.value = True
+            self._hit_flag.set(True)
             cached = from_jsonable(json.loads(path.read_text()))
             return replace(cached, usage=Usage())
-        self._hit_flag.value = False
+        self._hit_flag.set(False)
         response = self._inner.complete(request)
+        self._write_cache_file(key, response)
+        return response
+
+    async def acomplete(self, request: ModelRequest) -> ModelResponse:
+        """Async twin of :meth:`complete`: same cache, same hit/miss semantics.
+
+        Shadowed off (set to ``None`` in :meth:`__init__`) when the inner
+        model has no ``acomplete`` -- see the class docstring.
+        """
+        key = compute_full_hash(request)
+        path = self._cache_dir / f"{key}.json"
+        if path.exists():
+            self._hit_flag.set(True)
+            cached = from_jsonable(json.loads(path.read_text()))
+            return replace(cached, usage=Usage())
+        self._hit_flag.set(False)
+        # `acomplete` isn't part of the `Model` Protocol (duck-discovered,
+        # like the engine itself does -- see `agentfn._ainvoke_model`), so
+        # it's reached via `getattr` rather than direct attribute access;
+        # `__init__` already guarantees it's present whenever this method
+        # itself is (shadowed off to `None` otherwise).
+        acomplete_fn = getattr(self._inner, "acomplete")  # noqa: B009
+        response = await acomplete_fn(request)
+        self._write_cache_file(key, response)
+        return response
+
+    async def astream(self, request: ModelRequest) -> AsyncIterator[RawStreamEvent]:
+        """Passthrough to the inner model's ``astream`` -- never cached.
+
+        Same reasoning as the (sync) ``stream`` passthrough: a cache would
+        need to store and replay deltas, which isn't implemented here.
+        Shadowed off (set to ``None`` in :meth:`__init__`) when the inner
+        model has no ``astream``.
+        """
+        astream_fn = getattr(self._inner, "astream")  # noqa: B009
+        async for event in astream_fn(request):
+            yield event
+
+    def _write_cache_file(self, key: str, response: ModelResponse) -> None:
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         # Atomic write: a plain `write_text` on `path` directly would leave
         # a truncated/corrupt file behind (permanently breaking that cache
@@ -658,10 +725,10 @@ class CachingModel:
         # to a private tmp path first and `os.replace`-ing it into place
         # means every observer only ever sees either the old state (no
         # file) or the fully-written new one -- never a partial file.
+        path = self._cache_dir / f"{key}.json"
         tmp_path = self._cache_dir / f"{key}.{new_ulid()}.tmp"
         tmp_path.write_text(json.dumps(to_jsonable(response)))
         os.replace(tmp_path, path)
-        return response
 
 
 def reset_registries() -> None:

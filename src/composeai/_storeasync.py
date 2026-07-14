@@ -28,6 +28,28 @@ whichever kind it is -- is resolved either with the result or with the
 exception, never left untouched. Combined with rejecting new jobs once
 ``close()`` has run, no caller can be left blocked on a future that nothing
 will ever resolve.
+
+A third submission style, ``cast()``, shares the same queue and worker
+thread as ``call``/``call_blocking`` but carries no reply at all: it's
+fire-and-forget, for callers that must never block on -- or learn the
+outcome of -- the store write (see ``runs._default_span_sink``, which casts
+every finished span's persistence instead of blocking whichever thread
+emitted it). Because it's the same FIFO queue, a ``cast()`` job enqueued
+before a later ``call()``/``call_blocking()`` job is still guaranteed to run
+first; ordering against journal writes is preserved even though the span
+write itself is now asynchronous. The trade-off: a hard process crash can
+lose the last few spans that were cast but not yet drained by the worker --
+observability-only, since journal durability goes through
+``call``/``call_blocking``, which do block until the write actually lands.
+``cast()`` never raises, even after ``close()`` -- it silently drops,
+matching ``set_span_sink``'s "the sink must never crash user code" contract.
+A ``cast()`` job's *store method* raising is a different matter from
+``cast()`` itself raising, though: the first such failure per process still
+surfaces exactly one ``RuntimeWarning`` (emitted from this worker thread,
+in ``StoreWorker._resolve``), with every failure after that silent -- see
+``_warn_once_on_cast_failure``. This restores, off the worker thread
+instead of the emitting thread, the same "one warning, then silence"
+contract ``composeai.tracing.set_span_sink`` documents.
 """
 
 from __future__ import annotations
@@ -37,6 +59,7 @@ import atexit
 import concurrent.futures
 import queue
 import threading
+import warnings
 from typing import Any
 
 from .runs import RunStore
@@ -47,6 +70,50 @@ _STOP = object()
 # resolve plus the loop it belongs to, so the worker thread can hop back via
 # call_soon_threadsafe -- or a plain concurrent.futures.Future for
 # `call_blocking()`.
+
+# "Already warned about a cast() persistence failure" latch -- module-level
+# (process-wide), mirroring composeai.tracing's `_span_sink_warned` latch
+# (see `tracing.set_span_sink`'s docstring). A `cast()` job never has a
+# reply for its caller to inspect (see `StoreWorker.cast`), so a real
+# persistence failure (disk full, a locked db, ...) would otherwise be
+# permanently silent -- exactly the "tracing silently goes dark forever"
+# failure mode `RunStore._init_schema`'s comment warns against. Guarded by
+# `_cast_warned_lock` since the worker thread (which flips it) and a test's
+# main thread (which may reset it via `reset_cast_warned_state`) can touch
+# it from different threads; the worker thread itself only ever accesses
+# this serially (one dedicated thread per store), so the lock is cheap and
+# uncontended in the hot path.
+_cast_warned = False
+_cast_warned_lock = threading.Lock()
+
+
+def reset_cast_warned_state() -> None:
+    """Test-only: clear the "already warned about a cast() failure" latch."""
+    global _cast_warned
+    with _cast_warned_lock:
+        _cast_warned = False
+
+
+def _warn_once_on_cast_failure(exc: BaseException) -> None:
+    """Emit one ``RuntimeWarning`` for the first ``cast()`` job that raises, per process.
+
+    Called from the worker thread, inside :meth:`StoreWorker._resolve` --
+    NOT from :func:`composeai.tracing._notify_span_sink` (which can only
+    ever observe a *synchronous* failure calling the sink itself; a
+    ``cast()``-based sink like ``runs._default_span_sink`` always returns
+    before the write actually runs, so the real failure surfaces here
+    instead, on whichever thread is draining the queue).
+    """
+    global _cast_warned
+    with _cast_warned_lock:
+        if _cast_warned:
+            return
+        _cast_warned = True
+    warnings.warn(
+        f"composeai: persisting a span failed ({exc!r}); further failures will be silent",
+        RuntimeWarning,
+        stacklevel=2,
+    )
 
 
 def _set_result(future: asyncio.Future[Any], result: Any) -> None:
@@ -91,6 +158,18 @@ class StoreWorker:
 
     @staticmethod
     def _resolve(reply: Any, *, result: Any = None, exc: BaseException | None = None) -> None:
+        if reply is None:
+            # A `cast()` job: fire-and-forget, no one is waiting on this --
+            # a successful result is simply discarded. An exception is NOT
+            # simply swallowed forever, though: the first one per process
+            # still surfaces exactly one `RuntimeWarning` (restoring the
+            # contract `tracing.set_span_sink`'s docstring and
+            # `RunStore._init_schema`'s comment both document), with every
+            # failure after that staying silent -- see
+            # `_warn_once_on_cast_failure`.
+            if exc is not None:
+                _warn_once_on_cast_failure(exc)
+            return
         if isinstance(reply, tuple):
             future, loop = reply
             callback = _set_exception if exc is not None else _set_result
@@ -138,6 +217,32 @@ class StoreWorker:
         cf_future: concurrent.futures.Future[Any] = concurrent.futures.Future()
         self._enqueue(method_name, args, kwargs, cf_future)
         return cf_future.result()
+
+    def cast(self, method_name: str, /, *args: Any, **kwargs: Any) -> None:
+        """Enqueue ``store.<method_name>(*args, **kwargs)`` with no reply.
+
+        Same FIFO queue and worker thread as :meth:`call`/:meth:`call_blocking`,
+        so ordering against those is preserved -- a ``cast()`` job enqueued
+        before a later ``call()``/``call_blocking()`` job is guaranteed to run
+        first. Unlike those two, the caller never learns the outcome (result
+        or exception) and never blocks on the write actually landing: this is
+        the mechanism for off-loop work whose emitting side must never be
+        slowed down or crashed by it (span persistence -- see
+        ``runs._default_span_sink``). A failing job is not entirely silent,
+        though: the first one per process still emits one ``RuntimeWarning``
+        from the worker thread (see :func:`_warn_once_on_cast_failure`); this
+        call itself never raises either way.
+
+        Deliberately mirrors :meth:`_enqueue` rather than calling it: after
+        :meth:`close`, this returns silently instead of raising
+        ``RuntimeError`` -- ``cast()`` callers (the span sink) must never see
+        an exception here, matching :func:`composeai.tracing.set_span_sink`'s
+        "the sink must never crash user code" contract.
+        """
+        with self._close_lock:
+            if self._closed:
+                return
+            self._queue.put((method_name, args, kwargs, None))
 
     def close(self) -> None:
         """Drain the queue, stop the thread, join (<=2s). Idempotent."""

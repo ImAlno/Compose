@@ -25,7 +25,7 @@ import inspect
 import time
 import types
 import typing
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -34,9 +34,10 @@ from ._dispatch import gather_settled, run_stage
 from ._encoding import register_serializable
 from ._ids import new_ulid
 from ._schema import resolve_annotations
+from ._storeasync import worker_for
 from .agentfn import AgentFunction
 from .errors import CompositionTypeError, ConfigError
-from .runs import Budget, Run, RunStream, budget_scope
+from .runs import AsyncRunStream, Budget, Run, RunStream, budget_scope
 from .tools import Tool
 
 Stage = Any
@@ -362,6 +363,111 @@ def _run_top(
     return result
 
 
+async def _arun_top(
+    kind: tracing.SpanKind,
+    name: str,
+    budget: Budget | None,
+    run_body: Callable[[], Coroutine[Any, Any, Any]],
+) -> Run:
+    """Async twin of :func:`_run_top` (v0.4.0 Plan B, Task 5) -- see its
+    docstring for the full contract (durable row, budget scope, terminal
+    ``run_finished``, and the paused-bare-pipe/aggregate ``ConfigError``
+    refusal), byte-identical here except for what has to change to run on
+    the CALLER's own event loop instead of a background thread:
+
+    - Row creation (``create_run``) and the paused-row purge
+      (``delete_run``) both go through ``await
+      composeai._storeasync.worker_for(store).call(...)`` instead of calling
+      ``store`` directly -- a direct, blocking SQLite write/delete here
+      would freeze the caller's loop instead of merely parking an idle
+      thread the way the sync version's direct calls do (mirrors
+      :func:`~composeai.runs.arun_standalone_agent`'s identical reasoning
+      for row creation).
+    - Settling goes through :func:`~composeai.runs.asettle_agent_run`
+      instead of :func:`~composeai.runs.settle_agent_run` -- same status
+      transitions and pause handling, just awaited rather than called, and
+      its own store writes are likewise non-blocking.
+    - The inner thunk is ``async def`` and ``await run_body()`` instead of
+      calling it directly, since ``run_body`` here is a zero-arg coroutine
+      *factory* (``Pipeline.arun``/``Aggregate.arun`` pass
+      ``self._arun_stages``/``self._arun_branches``), not a plain callable.
+
+    ``runs.use_run_id``/``tracing.use_trace`` stay plain, synchronous
+    context managers -- the contextvars they push stay correctly scoped
+    across every ``await`` inside this same coroutine, so there is nothing
+    async-specific needed there (same reasoning as
+    :func:`~composeai.runs.arun_standalone_agent`).
+    """
+    store = runs.open_default()
+    run_id = new_ulid()
+    trace_id = new_ulid()
+    now = time.time()
+    await worker_for(store).call(
+        "create_run",
+        run_id=run_id,
+        kind=kind,
+        name=name,
+        status="running",
+        created_at=now,
+        updated_at=now,
+        trace_id=trace_id,
+        fingerprint=None,
+        args_json=None,
+    )
+
+    async def _thunk() -> Run:
+        root_span: tracing.Span | None = None
+        try:
+            with tracing.span(kind, name) as root_span:
+                with budget_scope(budget, root_span):
+                    output = await run_body()
+                trace = tracing.current_trace()
+                assert trace is not None  # we're inside an active span, so a trace exists
+                usage = trace.rollup_usage(root_span)
+                run = Run(
+                    id=new_ulid(),
+                    status="completed",
+                    output=output,
+                    usage=usage,
+                    trace=trace,
+                    messages=[],
+                    pending=None,
+                )
+        except BaseException as exc:
+            if root_span is not None:
+                if getattr(exc, "_compose_pause", False):
+                    tracing.emit_run_finished(root_span, status="paused")
+                else:
+                    tracing.emit_run_finished(
+                        root_span, status="failed", error_type=type(exc).__name__
+                    )
+            raise
+
+        tracing.emit_run_finished(root_span, status="completed")
+        return run
+
+    with runs.use_run_id(run_id), tracing.use_trace(trace_id):
+        result = await runs.asettle_agent_run(store, run_id, _thunk)
+
+    if result.status == "paused":
+        # Same v1 refusal as `_run_top` -- see its docstring for the full
+        # rationale. `delete_run` routes through the store worker here
+        # (see this function's own docstring) rather than calling it
+        # directly.
+        await worker_for(store).call("delete_run", run_id)
+        raise ConfigError(
+            f"{kind} {name!r} paused on an approval/ask_human interrupt, but a "
+            f"bare {kind}()/aggregate() isn't resumable -- durable pauses need a "
+            "@flow as the root. Wrap this call in a @flow function (so it has a "
+            "name resume() can look up and a fingerprint it can check) and call "
+            "that instead, e.g.:\n\n"
+            "    @flow\n"
+            "    def run_it(x):\n"
+            f"        return {name}(x)\n"
+        )
+    return result
+
+
 # --- Pipeline -------------------------------------------------------------------
 
 
@@ -386,10 +492,29 @@ class Pipeline:
     def run(self, x: Any, budget: Budget | None = None) -> Run:
         return _run_top("pipe", self._name, budget, lambda: self._run_stages(x, streaming=False))
 
+    async def arun(self, x: Any, budget: Budget | None = None) -> Run:
+        """Async twin of :meth:`run` (v0.4.0 Plan B, Task 5) -- runs entirely
+        on the CALLER's own running event loop via :func:`_arun_top`, never
+        the composeai runtime loop."""
+        return await _arun_top(
+            "pipe", self._name, budget, lambda: self._arun_stages(x, streaming=False)
+        )
+
     def stream(self, x: Any, budget: Budget | None = None) -> RunStream:
         return agentfn._stream_run(
             lambda: _run_top(
                 "pipe", self._name, budget, lambda: self._run_stages(x, streaming=True)
+            )
+        )
+
+    def astream(self, x: Any, budget: Budget | None = None) -> AsyncRunStream:
+        """Async twin of :meth:`stream` (v0.4.0 Plan B, Task 5) -- mirrors
+        ``AgentFunction.astream``'s shape (:func:`~composeai.agentfn._astream_run`):
+        a fresh, private bus, subscribed before the task is created, run as
+        an ``asyncio.Task`` on the caller's own loop."""
+        return agentfn._astream_run(
+            lambda: _arun_top(
+                "pipe", self._name, budget, lambda: self._arun_stages(x, streaming=True)
             )
         )
 
@@ -472,10 +597,29 @@ class Aggregate:
             "aggregate", self._name, budget, lambda: self._run_branches(x, streaming=False)
         )
 
+    async def arun(self, x: Any, budget: Budget | None = None) -> Run:
+        """Async twin of :meth:`run` (v0.4.0 Plan B, Task 5) -- runs entirely
+        on the CALLER's own running event loop via :func:`_arun_top`, never
+        the composeai runtime loop."""
+        return await _arun_top(
+            "aggregate", self._name, budget, lambda: self._arun_branches(x, streaming=False)
+        )
+
     def stream(self, x: Any, budget: Budget | None = None) -> RunStream:
         return agentfn._stream_run(
             lambda: _run_top(
                 "aggregate", self._name, budget, lambda: self._run_branches(x, streaming=True)
+            )
+        )
+
+    def astream(self, x: Any, budget: Budget | None = None) -> AsyncRunStream:
+        """Async twin of :meth:`stream` (v0.4.0 Plan B, Task 5) -- mirrors
+        ``AgentFunction.astream``'s shape (:func:`~composeai.agentfn._astream_run`):
+        a fresh, private bus, subscribed before the task is created, run as
+        an ``asyncio.Task`` on the caller's own loop."""
+        return agentfn._astream_run(
+            lambda: _arun_top(
+                "aggregate", self._name, budget, lambda: self._arun_branches(x, streaming=True)
             )
         )
 
@@ -697,6 +841,38 @@ def map(
             timeout_per_item=timeout_per_item,
             on_error=on_error,
         )
+    )
+
+
+async def amap(
+    fn: Stage,
+    items: Sequence[Any],
+    *,
+    max_workers: int | None = None,
+    timeout_per_item: float | None = None,
+    on_error: str = "raise",
+) -> list[Any]:
+    """Async twin of :func:`map` (v0.4.0 Plan B, Task 5) -- same contract,
+    see its docstring in full. Runs entirely on the CALLER's own running
+    event loop (never the composeai runtime loop): ``await``s the async core
+    :func:`_amap` directly instead of routing through
+    :func:`~composeai._runtime.run_sync`, which is the ONLY difference from
+    :func:`map`'s own body -- both validate ``on_error``/``max_workers``
+    identically, and up front, so a bad argument raises immediately without
+    touching the composeai runtime (or, here, without even needing a running
+    loop to have started any work yet).
+    """
+    if on_error not in ("raise", "collect"):
+        raise ConfigError(f"amap(): on_error must be 'raise' or 'collect', got {on_error!r}")
+    if max_workers is not None and max_workers < 1:
+        raise ValueError("max_workers must be greater than 0")
+
+    return await _amap(
+        fn,
+        items,
+        max_workers=max_workers,
+        timeout_per_item=timeout_per_item,
+        on_error=on_error,
     )
 
 

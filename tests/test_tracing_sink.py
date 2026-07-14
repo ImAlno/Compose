@@ -106,6 +106,37 @@ def test_use_trace_restores_previous_trace_after_block():
         assert restored.trace_id == outer.trace_id
 
 
+def test_span_sink_persists_via_worker_and_is_drained_by_close():
+    """Spans now persist through the store worker (off the emitting thread).
+
+    Uses the REAL default sink installed by ``composeai.runs`` (not this
+    file's custom ``received.append`` sinks the other tests install) --
+    ``runs.reset_default()`` first so it installs fresh regardless of
+    whatever ran before this test in the same session. After running a
+    traced call and closing the worker (drain), the span row must be
+    present -- same net effect as the old synchronous sink, just off the
+    emitting thread.
+    """
+    import sqlite3
+
+    from composeai import runs
+    from composeai._storeasync import worker_for
+
+    runs.reset_default()
+    try:
+        store = runs.open_default()  # installs runs._default_span_sink
+        with span("task", "sink-worker-t1") as s:
+            pass
+        worker_for(store).close()  # drain: blocks until the cast persist lands
+        conn = sqlite3.connect(store._path)
+        row = conn.execute(
+            "SELECT span_id FROM spans WHERE span_id = ?", (s.span_id,)
+        ).fetchone()
+        assert row is not None
+    finally:
+        runs.reset_default()
+
+
 def test_module_does_not_import_runs():
     # tracing.py must stay ignorant of composeai.runs -- the sink is
     # injected, not imported. A regression here would reintroduce the

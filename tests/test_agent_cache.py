@@ -15,6 +15,8 @@ would otherwise collide against the session-wide default store (see
 
 from __future__ import annotations
 
+from typing import Any
+
 import pytest
 
 from composeai import agent, runs
@@ -246,3 +248,98 @@ def test_caching_model_last_was_hit_is_thread_local(tmp_path):
 
     assert results["hit_thread"] is True  # unaffected by the concurrent miss
     assert results["miss_thread"] is False  # unaffected by the concurrent hit
+
+
+def test_caching_model_flag_is_task_isolated(tmp_path):
+    """Two coroutines sharing one CachingModel on ONE thread each see only
+    their own hit/miss flag (ContextVar semantics -- a `threading.local`
+    would share a single slot across tasks cooperatively scheduled on the
+    same OS thread, the exact bug class ContextVar closes for asyncio)."""
+    import asyncio
+
+    from composeai.messages import Message
+    from composeai.models.base import ModelRequest
+    from composeai.testing import CachingModel
+
+    class _DelayedModel:
+        """Wraps a FakeModel; the MISS request's acomplete genuinely
+        suspends (a real `await asyncio.sleep`) so the HIT task gets a
+        chance to run -- and finish -- while the MISS task's own
+        acomplete() call is still in flight, well after it set its own
+        (should-be-isolated) flag to False."""
+
+        def __init__(self, fake: FakeModel, delay_for: ModelRequest) -> None:
+            self._fake = fake
+            self._delay_for = delay_for
+
+        def complete(self, request: ModelRequest) -> Any:
+            return self._fake.complete(request)
+
+        async def acomplete(self, request: ModelRequest) -> Any:
+            if request is self._delay_for:
+                await asyncio.sleep(0.05)
+            return await self._fake.acomplete(request)
+
+    fake = FakeModel(["pre-warmed response", "miss response"])
+    hit_request = ModelRequest(model="m", messages=[Message.user("pre-warm me")])
+    miss_request = ModelRequest(model="m", messages=[Message.user("never cached")])
+    inner = _DelayedModel(fake, delay_for=miss_request)
+    caching_model = CachingModel(inner, cache_dir=tmp_path / "cache")
+
+    # Pre-warm: a real (miss) call so `hit_request` is on disk before the
+    # two tasks below race each other.
+    caching_model.complete(hit_request)
+    assert caching_model.last_was_hit is False  # sanity: that call was a genuine miss
+
+    results: dict[str, bool] = {}
+
+    async def probe(name: str, request: ModelRequest) -> None:
+        await caching_model.acomplete(request)
+        results[name] = caching_model.last_was_hit
+
+    async def run_both() -> None:
+        # MISS is listed first so it starts, sets its flag to False, then
+        # suspends at `await asyncio.sleep(...)` inside `_DelayedModel`,
+        # letting HIT run to completion (set True, read True, no
+        # suspension of its own) before MISS resumes and does its own read.
+        await asyncio.gather(
+            probe("miss_task", miss_request),
+            probe("hit_task", hit_request),
+        )
+
+    asyncio.run(run_both())
+
+    assert results["hit_task"] is True  # unaffected by the concurrent miss
+    assert results["miss_task"] is False  # unaffected by the concurrent hit
+
+
+def test_caching_model_acomplete_caches_like_complete(tmp_path):
+    """acomplete on a cache MISS stores; a second acomplete HITS with the
+    zero-usage cached response and last_was_hit True (same contract as
+    sync complete)."""
+    import asyncio
+
+    from composeai.messages import Message
+    from composeai.models.base import ModelRequest
+    from composeai.testing import CachingModel
+
+    fake = FakeModel(["only one scripted response"])  # inner model has acomplete (Plan A T3)
+    caching_model = CachingModel(fake, cache_dir=tmp_path / "cache")
+    request = ModelRequest(model="m", messages=[Message.user("hi")])
+
+    async def run() -> tuple[Any, bool, Any, bool]:
+        first = await caching_model.acomplete(request)
+        first_hit = caching_model.last_was_hit
+        second = await caching_model.acomplete(request)
+        second_hit = caching_model.last_was_hit
+        return first, first_hit, second, second_hit
+
+    first, first_hit, second, second_hit = asyncio.run(run())
+
+    assert first.message.text == "only one scripted response"
+    assert first_hit is False
+    assert second.message.text == "only one scripted response"
+    assert second_hit is True
+    assert second.usage.input_tokens == 0
+    assert second.usage.output_tokens == 0
+    assert len(fake.requests) == 1  # the script was only ever consumed once

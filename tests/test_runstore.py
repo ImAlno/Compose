@@ -444,35 +444,90 @@ def test_reset_default_drops_cached_store(tmp_path, monkeypatch, _reset_default_
 def test_open_default_installs_span_sink_and_persists_spans(
     tmp_path, monkeypatch, _reset_default_around
 ):
+    from composeai._storeasync import worker_for
+
     monkeypatch.setenv("COMPOSE_DIR", str(tmp_path / "sinktest"))
     runs.reset_default()
     store = runs.open_default()
     with tracing.span("task", "standalone"):
         pass
+    # The default sink now casts `persist_span` onto the store's worker
+    # thread (off the emitting thread -- see `runs._default_span_sink` /
+    # `StoreWorker.cast`), so the row lands asynchronously; draining the
+    # worker (close() blocks until its queue is empty) makes the write
+    # observable before this reads it back directly.
+    worker_for(store).close()
     conn = sqlite3.connect(store._path)
     row = conn.execute("SELECT span_id FROM spans WHERE name = ?", ("standalone",)).fetchone()
     conn.close()
     assert row is not None
 
 
-def test_sink_failure_warns_once_and_run_continues(tmp_path, monkeypatch, _reset_default_around):
+def test_sink_failure_warns_once_from_worker_thread_and_run_continues(
+    tmp_path, monkeypatch, _reset_default_around
+):
+    """Regression, restored for async span persistence (v0.4.0 Plan B Task 1):
+    `persist_span` failures used to be caught synchronously in
+    ``tracing._notify_span_sink`` (which warned once per process) because
+    the old sink called ``store.persist_span`` directly on the emitting
+    thread. The sink now casts the write onto the store's worker thread
+    (``StoreWorker.cast``, no reply) -- a genuine `persist_span` failure
+    happens asynchronously, well after ``_default_span_sink`` already
+    returned, so ``_notify_span_sink``'s try/except can no longer observe
+    it (``cast()`` is fire-and-forget by design: no reply channel exists to
+    carry an exception back). A fire-and-forget cast that just swallowed
+    the exception outright would silently break the documented contract
+    (``tracing.set_span_sink``'s docstring, ``RunStore._init_schema``'s
+    comment) that the *first* persistence failure per process is never
+    silent -- so ``StoreWorker._resolve`` now emits that one
+    ``RuntimeWarning`` itself, from the worker thread, the first time a
+    cast job's store method raises (see
+    ``_storeasync._warn_once_on_cast_failure``), with every failure after
+    that staying silent. Never crashes (or even warns synchronously in) the
+    run either way.
+    """
+    from composeai import _storeasync
+    from composeai._storeasync import worker_for
+
     monkeypatch.setenv("COMPOSE_DIR", str(tmp_path / "failtest"))
-    runs.reset_default()
-    runs.open_default()
+    runs.reset_default()  # also clears the "already warned" latch below
+    store = runs.open_default()
 
     def boom(self, span, run_id):
         raise RuntimeError("disk full")
 
     monkeypatch.setattr(RunStore, "persist_span", boom)
 
-    with pytest.warns(RuntimeWarning):
+    # `warnings.catch_warnings`'s bookkeeping (the filter list, `showwarning`)
+    # is process-global, not thread-local, so a warning raised on the
+    # worker thread is captured here too -- AS LONG AS it actually runs
+    # before this `with` block exits. `worker_for(store).close()` blocks
+    # until the queue (including the failing cast job) is fully drained,
+    # so it's called *inside* the block to force that ordering.
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
         with tracing.span("task", "t1"):
             pass
-    # second failure: no warning, but still doesn't crash
-    with warnings.catch_warnings():
-        warnings.simplefilter("error")
+        worker_for(store).close()
+
+    assert len(caught) == 1
+    assert issubclass(caught[0].category, RuntimeWarning)
+    assert "persisting a span failed" in str(caught[0].message)
+    assert _storeasync._cast_warned is True
+
+    # Second failure (a fresh worker -- the previous one is now closed):
+    # the latch is process-wide, not per-worker, so this stays silent.
+    with warnings.catch_warnings(record=True) as caught_again:
+        warnings.simplefilter("always")
         with tracing.span("task", "t2"):
             pass
+        worker_for(store).close()
+    assert len(caught_again) == 0
+
+    # Minor: the worker loop itself survived both failing casts -- a
+    # subsequent call_blocking still completes normally rather than hanging
+    # or raising, proving the dedicated writer thread never died mid-job.
+    assert worker_for(store).call_blocking("get_run", "does-not-exist") is None
 
 
 def test_standalone_agent_run_id_matches_store_row():

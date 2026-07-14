@@ -1,9 +1,13 @@
+import asyncio
 import threading
 import time
 
 import pytest
 
 from composeai.events import Event, EventBus, current_bus, emit, use_bus
+from composeai.messages import Usage
+from composeai.runs import AsyncRunStream, Run
+from composeai.tracing import Trace
 
 # --- Event dataclass ---
 
@@ -189,3 +193,128 @@ def test_ambient_emit_delivers_within_use_bus():
     sub.close()
     received = list(sub)
     assert [e.text for e in received] == ["ambient"]
+
+
+# --- AsyncSubscription / EventBus.asubscribe (asyncio-native) ---
+
+
+def test_async_subscribe_consumes_cross_thread_publish_in_order():
+    """A publisher on a plain ``threading.Thread`` feeds an `AsyncSubscription`
+    subscribed from inside a running event loop; ``async for`` collects the
+    published events, in order, cross-thread."""
+    bus = EventBus()
+
+    async def scenario() -> list[Event]:
+        sub = bus.asubscribe()
+
+        def publish() -> None:
+            for i in range(3):
+                bus.emit(Event(kind="text_delta", text=str(i)))
+            sub.close()
+
+        thread = threading.Thread(target=publish)
+        thread.start()
+        events = [event async for event in sub]
+        thread.join()
+        return events
+
+    events = asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert [e.text for e in events] == ["0", "1", "2"]
+
+
+def test_async_subscribe_close_ends_iteration_promptly():
+    async def scenario() -> list[Event]:
+        sub = bus.asubscribe()
+        bus.emit(Event(kind="text_delta", text="hello"))
+        sub.close()
+        return [event async for event in sub]
+
+    bus = EventBus()
+    events = asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert [e.text for e in events] == ["hello"]
+
+
+def test_async_subscribe_second_iteration_returns_immediately():
+    """Regression, async twin of
+    ``test_iterating_a_closed_subscription_a_second_time_returns_immediately``:
+    once drained, a second ``async for`` must return immediately rather than
+    hang forever waiting on a sentinel the bus will never deliver again --
+    bounded with ``wait_for`` so a regression fails fast instead of hanging
+    the whole suite."""
+
+    async def scenario() -> tuple[list[Event], list[Event]]:
+        bus = EventBus()
+        sub = bus.asubscribe()
+        bus.emit(Event(kind="text_delta", text="hello"))
+        sub.close()
+
+        first = [event async for event in sub]
+        second = [event async for event in sub]
+        return first, second
+
+    first, second = asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert [e.text for e in first] == ["hello"]
+    assert second == []
+
+
+def test_asubscribe_outside_a_running_loop_raises_runtime_error():
+    bus = EventBus()
+    with pytest.raises(RuntimeError):
+        bus.asubscribe()
+
+
+# --- AsyncRunStream (unit-level; engine-level tests live in test_streaming.py) ---
+
+
+def test_async_run_stream_yields_events_then_run_returns_task_result():
+    bus = EventBus()
+    result = Run(
+        id="r1",
+        status="completed",
+        output="done",
+        usage=Usage(),
+        trace=Trace(trace_id="t1"),
+        messages=[],
+    )
+
+    async def scenario() -> tuple[list[Event], Run]:
+        sub = bus.asubscribe()
+
+        async def worker() -> Run:
+            bus.emit(Event(kind="text_delta", text="hi"))
+            sub.close()
+            return result
+
+        task = asyncio.create_task(worker())
+        stream = AsyncRunStream(task, sub)
+        events = [event async for event in stream]
+        run = await stream.run()
+        return events, run
+
+    events, run = asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert [e.text for e in events] == ["hi"]
+    assert run is result
+
+
+def test_async_run_stream_run_reraises_task_exception_verbatim():
+    bus = EventBus()
+
+    class _Boom(Exception):
+        pass
+
+    async def scenario() -> list[Event]:
+        sub = bus.asubscribe()
+
+        async def worker() -> Run:
+            sub.close()
+            raise _Boom("kaboom")
+
+        task = asyncio.create_task(worker())
+        stream = AsyncRunStream(task, sub)
+        events = [event async for event in stream]
+        with pytest.raises(_Boom):
+            await stream.run()
+        return events
+
+    events = asyncio.run(asyncio.wait_for(scenario(), timeout=5))
+    assert events == []

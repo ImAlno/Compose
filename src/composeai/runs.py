@@ -19,6 +19,7 @@ combinators without either module depending on the other.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import json
 import os
@@ -26,7 +27,7 @@ import sqlite3
 import threading
 import time
 import warnings
-from collections.abc import Callable, Iterator
+from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,7 +37,7 @@ from . import tracing
 from ._encoding import from_jsonable, to_jsonable
 from ._ids import new_ulid
 from .errors import BudgetExceededError, ConfigError, SerializationError, TaskTimeoutError
-from .events import Event, Subscription
+from .events import AsyncSubscription, Event, Subscription
 from .messages import Message, Usage
 from .tracing import Span, Trace, current_trace
 
@@ -125,6 +126,50 @@ class RunStream:
             raise self._exception
         assert self._run is not None  # the thread always sets one or the other
         return self._run
+
+
+class AsyncRunStream:
+    """Asyncio-native twin of :class:`RunStream` (v0.4.0 Plan B).
+
+    Constructed by the async engine's streaming entry point -- never
+    directly by users. The agent loop runs as an ``asyncio.Task`` against a
+    fresh, private :class:`~composeai.events.EventBus`; this object is a
+    read-only view onto that bus (``async for``) plus a handle onto the
+    task (:meth:`run`).
+
+    ``async for`` blocks until an event arrives or the subscription closes.
+    The producing task closes its :class:`~composeai.events.AsyncSubscription`
+    in a ``finally``, exactly where the sync worker closes its own
+    :class:`~composeai.events.Subscription` -- so breaking out of iteration
+    early (or calling :meth:`close`) only unsubscribes; the task itself is
+    never disturbed by it, and always runs to completion. Because
+    ``asyncio.Task`` memoizes its own result, :meth:`run` after iterating
+    (or iterating twice) always sees the same, stable outcome -- awaiting
+    it re-raises the task's original exception verbatim if it failed.
+    """
+
+    def __init__(self, task: asyncio.Task[Run], subscription: AsyncSubscription) -> None:
+        self._task = task
+        self._subscription = subscription
+
+    async def __aiter__(self) -> AsyncIterator[Event]:
+        async for event in self._subscription:
+            yield event
+
+    def close(self) -> None:
+        """Unsubscribe from the underlying bus, ending iteration.
+
+        Safe to call more than once, and does not affect the task (still
+        awaitable via :meth:`run` regardless).
+        """
+        self._subscription.close()
+
+    async def run(self) -> Run:
+        """Await the task and return its :class:`Run`.
+
+        Re-raises the task's original exception verbatim if it failed.
+        """
+        return await self._task
 
 
 # --- Budget --------------------------------------------------------------
@@ -376,9 +421,10 @@ class RunStore:
         # version's tables don't have. Reproduced concretely before this
         # guard existed: an older-shape `spans` table missing `cost_usd`/
         # `replayed` raised a raw `sqlite3.OperationalError` from deep
-        # inside `persist_span`, which the span-sink's one-time-warning
-        # error handling then converted into "tracing silently goes dark
-        # forever after one RuntimeWarning" -- no migration, no clear
+        # inside `persist_span`, which the store worker's one-time-warning
+        # error handling (`_storeasync._warn_once_on_cast_failure`) then
+        # converted into "tracing silently goes dark forever after one
+        # RuntimeWarning" -- no migration, no clear
         # error, just quietly missing data from then on. Checked *before*
         # the `CREATE TABLE IF NOT EXISTS` below runs, so a mismatched
         # store is never mutated on the way to raising. A brand-new
@@ -1024,14 +1070,27 @@ def reset_default() -> None:
     module-scope import-cycle reason :meth:`RunContext.ajournal_record`
     documents (``composeai._storeasync`` imports :class:`RunStore` from
     this module at module scope).
+
+    Also clears :func:`~composeai._storeasync.reset_cast_warned_state`'s
+    "already warned about a failed cast()" latch, same reasoning as
+    resetting :func:`~composeai.tracing.reset_span_sink_state` below --
+    both are process-wide "first failure only" latches guarding the two
+    layers a span persistence failure can be caught at (a synchronous sink
+    exception in ``tracing._notify_span_sink``, or the store worker
+    thread's asynchronous ``cast()`` failure in ``StoreWorker._resolve``),
+    and each test in the suite should get its own "first failure" chance
+    rather than inheriting whichever test happened to fail first.
     """
     global _default_store, _sink_installed
+    from composeai._storeasync import reset_cast_warned_state
+
     if _default_store is not None:
         old_store = _default_store
         old_store.close()
         from composeai._storeasync import close_worker_if_registered
 
         close_worker_if_registered(old_store)
+    reset_cast_warned_state()
     _default_store = None
     _sink_installed = False
     tracing.set_span_sink(None)
@@ -1047,9 +1106,31 @@ def _ensure_default_sink_installed() -> None:
 
 
 def _default_span_sink(span: Span) -> None:
+    """Persist ``span`` off the emitting thread, via the store's writer thread.
+
+    Routes ``persist_span`` through
+    ``composeai._storeasync.worker_for(store).cast(...)`` rather than calling
+    it directly -- the same FIFO queue the store's journal writes go
+    through, so span rows still land in the same order relative to those
+    (a `cast()` enqueued here before a later journal `call()`/
+    `call_blocking()` is guaranteed to run first), but the write itself no
+    longer blocks whichever thread emitted the span: the runtime loop, a
+    user's own asyncio loop (Plan B), or a plain synchronous call. Trade-off
+    documented on :meth:`~composeai._storeasync.StoreWorker.cast`: a hard
+    process crash can lose the last few spans that were cast but not yet
+    drained -- observability-only, since journal durability is unaffected
+    (those writes use `call`/`call_blocking`, which block until landed).
+
+    Deferred import: same import-cycle reason documented on
+    :meth:`RunContext.ajournal_record` (``composeai._storeasync`` imports
+    :class:`RunStore` from this module at module scope, so this module can
+    never import it back at module scope).
+    """
+    from composeai._storeasync import worker_for
+
     run_id = current_run_id()
     store = open_default()
-    store.persist_span(span, run_id)
+    worker_for(store).cast("persist_span", span, run_id)
 
 
 # --- ambient run_id (span-sink tagging) + RunContext (flow journaling) ----
@@ -1409,11 +1490,30 @@ def persist_pending_interrupt(store: RunStore, run_id: str, interrupt: Any) -> N
     :class:`~composeai.hitl.Interrupt` -- this module cannot import
     ``composeai.hitl``, which imports *this* module for :func:`interrupt_lookup`
     and :func:`current_run_context`/:func:`current_run_id` above (importing it
-    back here would cycle). Shared by ``composeai.flow``'s flow-pause handling
-    and this module's own :func:`settle_agent_run`.
+    back here would cycle). Used by this module's own :func:`settle_agent_run`
+    for a standalone (non-flow) run's pause path; a flow's own pause goes
+    through the async twin below, :func:`apersist_pending_interrupt`, from
+    inside ``composeai.flow``'s already-async execution instead.
+
+    Both store calls route through
+    ``composeai._storeasync.worker_for(store).call_blocking(...)`` rather
+    than calling ``store`` directly (v0.4.0 Plan B Task 1) -- the same FIFO
+    queue and worker thread that ``runs._default_span_sink`` casts this
+    run's span persistence onto, so by the time this (blocking) call
+    returns, every span cast before it is guaranteed to have already run
+    (persisted, or failed-and-warned -- see
+    ``_storeasync._warn_once_on_cast_failure``), never left queued behind a
+    ``.run()`` call that's already returned control to the caller. Deferred
+    import: same import-cycle reason documented on
+    :meth:`RunContext.ajournal_record` (``composeai._storeasync`` imports
+    :class:`RunStore` from this module at module scope).
     """
+    from composeai._storeasync import worker_for
+
     payload_json = json.dumps(to_jsonable(interrupt.payload))
-    store.pending_interrupt_put(
+    worker = worker_for(store)
+    worker.call_blocking(
+        "pending_interrupt_put",
         run_id=run_id,
         interrupt_id=interrupt.id,
         kind=interrupt.kind,
@@ -1421,7 +1521,7 @@ def persist_pending_interrupt(store: RunStore, run_id: str, interrupt: Any) -> N
         payload_json=payload_json,
         created_at=time.time(),
     )
-    store.update_run(run_id, status="paused")
+    worker.call_blocking("update_run", run_id, status="paused")
 
 
 async def apersist_pending_interrupt(store: RunStore, run_id: str, interrupt: Any) -> None:
@@ -1531,6 +1631,43 @@ def apply_resume_answers(store: RunStore, run_id: str, answers: dict[str, Any] |
             raise SerializationError(f"answer {raw_key!r}: {exc}") from exc
         store.journal_put(run_id, f"__interrupt__:{full_id}", value_json)
         store.pending_interrupt_delete(run_id, full_id)
+
+
+async def aapply_resume_answers(
+    store: RunStore, run_id: str, answers: dict[str, Any] | None
+) -> None:
+    """Async twin of :func:`apply_resume_answers` (v0.4.0 Plan B, Task 7).
+
+    Identical first-write-wins/:func:`resolve_answer_key` logic -- read
+    :func:`apply_resume_answers`'s docstring first, unchanged here. Every
+    store call it makes (``pending_interrupts_all``, then one
+    ``journal_put``/``pending_interrupt_delete`` pair per answer, same
+    order as the sync version) routes through ``await
+    worker_for(store).call(...)`` instead of calling ``store`` directly, so
+    a durable resume driven through ``composeai.flow.aresume``/
+    ``composeai.agentfn.aresume_standalone_agent`` (both running on the
+    CALLER's own event loop, never a dedicated worker thread) never blocks
+    that loop with SQLite I/O. Deferred import: same import-cycle reason
+    documented on :meth:`RunContext.ajournal_record`
+    (``composeai._storeasync`` imports :class:`RunStore` from this module
+    at module scope).
+    """
+    if not answers:
+        return
+    from composeai._storeasync import worker_for
+
+    pending_rows = await worker_for(store).call("pending_interrupts_all", run_id)
+    pending_ids = {row["interrupt_id"] for row in pending_rows}
+    for raw_key, value in answers.items():
+        full_id = resolve_answer_key(pending_ids, raw_key)
+        try:
+            value_json = json.dumps(to_jsonable(value))
+        except SerializationError as exc:
+            raise SerializationError(f"answer {raw_key!r}: {exc}") from exc
+        await worker_for(store).call(
+            "journal_put", run_id, f"__interrupt__:{full_id}", value_json
+        )
+        await worker_for(store).call("pending_interrupt_delete", run_id, full_id)
 
 
 _run_context: contextvars.ContextVar[JournalScope | None] = contextvars.ContextVar(
@@ -1644,7 +1781,29 @@ def settle_agent_run(store: RunStore, run_id: str, thunk: Callable[[], Run]) -> 
     -- this module cannot import ``composeai.hitl``, which imports this
     module) rather than catching a specific exception type; a real failure
     marks the row ``"failed"`` and re-raises unchanged.
+
+    Every finalization path -- completed, failed, and (via
+    :func:`persist_pending_interrupt`) paused -- routes its ``update_run``
+    through ``composeai._storeasync.worker_for(store).call_blocking(...)``
+    rather than calling ``store`` directly (v0.4.0 Plan B Task 1 fix: this
+    used to bypass the store's worker/queue entirely, so a standalone
+    agent/pipe/aggregate run's ``.run()`` could return -- row marked
+    ``"completed"``/``"failed"``/``"paused"`` and all -- while some of that
+    same run's spans were still sitting in the worker's queue, cast but not
+    yet actually persisted).
+    ``call_blocking`` shares the same FIFO queue as the ``cast()`` jobs
+    ``runs._default_span_sink`` enqueues for every span this run emitted,
+    so its blocking wait doubles as a barrier: by the time this call
+    returns (and thus by the time ``.run()`` returns to the caller), every
+    span this run cast is guaranteed to have already been persisted or
+    failed-and-warned (see ``_storeasync._warn_once_on_cast_failure``),
+    never left queued behind a run that's already visibly done. A flow's
+    own run already got this for free -- ``composeai.flow`` awaits its
+    worker calls directly -- this closes the same gap for a run that never
+    goes through a flow at all.
     """
+    from composeai._storeasync import worker_for
+
     try:
         run = thunk()
     except BaseException as exc:
@@ -1665,13 +1824,15 @@ def settle_agent_run(store: RunStore, run_id: str, thunk: Callable[[], Run]) -> 
                 messages=[],
                 pending=interrupt,
             )
-        store.update_run(
+        worker_for(store).call_blocking(
+            "update_run",
             run_id,
             status="failed",
             error_json=json.dumps({"type": type(exc).__name__, "message": str(exc)}),
         )
         raise
-    store.update_run(
+    worker_for(store).call_blocking(
+        "update_run",
         run_id,
         status="completed",
         trace_id=run.trace.trace_id,
@@ -1681,6 +1842,117 @@ def settle_agent_run(store: RunStore, run_id: str, thunk: Callable[[], Run]) -> 
     # `compose runs` / `compose trace <id>` will find in the store.
     run.id = run_id
     return run
+
+
+async def asettle_agent_run(
+    store: RunStore, run_id: str, thunk: Callable[[], Coroutine[Any, Any, Run]]
+) -> Run:
+    """Async twin of :func:`settle_agent_run` (v0.4.0 Plan B, Task 4).
+
+    Same status transitions/pause handling as the sync version -- read its
+    docstring first -- but every store write goes through ``await
+    composeai._storeasync.worker_for(store).call(...)`` rather than
+    ``call_blocking(...)``: this runs on the CALLER's own asyncio loop (via
+    ``AgentFunction.arun``/``.astream``), never a dedicated worker thread,
+    so a *blocking* call here would freeze that loop instead of merely
+    parking an idle thread the way ``call_blocking`` does on the sync path.
+
+    ``thunk`` is a zero-arg coroutine *factory*
+    (``Callable[[], Coroutine[Any, Any, Run]]``), not a coroutine itself --
+    calling it produces the coroutine this function awaits, exactly once
+    (mirrors the sync version calling its own zero-arg ``thunk``).
+
+    The pause path reuses :func:`apersist_pending_interrupt` (the existing
+    async twin of :func:`persist_pending_interrupt`, v0.4.0 Plan A) rather
+    than duplicating its two awaited store calls here.
+    """
+    from composeai._storeasync import worker_for
+
+    try:
+        run = await thunk()
+    except BaseException as exc:
+        if getattr(exc, "_compose_pause", False):
+            # `exc.interrupt` (duck-typed -- see the module docstring's note
+            # on why this module can't import `composeai.hitl.Interrupt` to
+            # type-check the attribute access statically).
+            interrupt = getattr(exc, "interrupt")  # noqa: B009
+            await apersist_pending_interrupt(store, run_id, interrupt)
+            trace = tracing.current_trace()
+            assert trace is not None
+            return Run(
+                id=run_id,
+                status="paused",
+                output=None,
+                usage=Usage(),
+                trace=trace,
+                messages=[],
+                pending=interrupt,
+            )
+        await worker_for(store).call(
+            "update_run",
+            run_id,
+            status="failed",
+            error_json=json.dumps({"type": type(exc).__name__, "message": str(exc)}),
+        )
+        raise
+    await worker_for(store).call(
+        "update_run",
+        run_id,
+        status="completed",
+        trace_id=run.trace.trace_id,
+        output_json=_best_effort_output_json(run.output),
+    )
+    # The durable row's id IS the run's identity: `run.id` must match what
+    # `compose runs` / `compose trace <id>` will find in the store.
+    run.id = run_id
+    return run
+
+
+async def arun_standalone_agent(
+    name: str,
+    args_json: str | None,
+    thunk: Callable[[], Coroutine[Any, Any, Run]],
+    *,
+    budget: Budget | None = None,
+) -> Run:
+    """Async twin of :func:`run_standalone_agent` (v0.4.0 Plan B, Task 4).
+
+    Same shape as the sync version -- read its docstring first -- pre-
+    generating ``run_id``/``trace_id``, creating the durable row, wrapping
+    ``thunk`` in :func:`use_run_id`/:func:`~composeai.tracing.use_trace`
+    (both plain synchronous context managers: the contextvars they push
+    stay correctly scoped across every ``await`` inside this same
+    coroutine/task, so there is nothing async-specific needed there), then
+    handing off to :func:`asettle_agent_run`.
+
+    The one real difference from the sync version: row creation itself
+    goes through ``await composeai._storeasync.worker_for(store)
+    .call("create_run", ...)`` instead of calling ``store.create_run``
+    directly -- this runs on the caller's own asyncio loop (never a
+    dedicated worker thread), so a direct, blocking SQLite write here would
+    freeze that loop instead of merely parking an idle thread.
+    """
+    from composeai._storeasync import worker_for
+
+    store = open_default()
+    run_id = new_ulid()
+    trace_id = new_ulid()
+    now = time.time()
+    await worker_for(store).call(
+        "create_run",
+        run_id=run_id,
+        kind="agent",
+        name=name,
+        status="running",
+        created_at=now,
+        updated_at=now,
+        trace_id=trace_id,
+        fingerprint=None,
+        args_json=args_json,
+        budget_json=encode_budget(budget),
+    )
+    with use_run_id(run_id), tracing.use_trace(trace_id):
+        return await asettle_agent_run(store, run_id, thunk)
 
 
 def _best_effort_output_json(value: Any) -> str | None:

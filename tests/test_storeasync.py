@@ -98,3 +98,30 @@ def test_close_drains_already_enqueued_jobs():
         t.join(timeout=10)
     worker.close()
     assert results == [None] * 5
+
+
+def test_cast_executes_fifo_with_calls():
+    store = open_default()
+    worker = StoreWorker(store)
+    try:
+        run_id = "cast-fifo-t1"
+        worker.cast(
+            "create_run",
+            run_id=run_id, kind="flow", name="c", status="running",
+            created_at=time.time(), updated_at=time.time(),
+            trace_id="t", fingerprint=None, args_json=None,
+        )
+        # A blocking call enqueued AFTER the cast must observe its effect --
+        # both share the same FIFO queue, so the cast is guaranteed to run
+        # first even though it carries no reply.
+        row = worker.call_blocking("get_run", run_id)
+        assert row is not None and row["status"] == "running"
+    finally:
+        worker.close()
+
+
+def test_cast_after_close_is_silent():
+    store = open_default()
+    worker = StoreWorker(store)
+    worker.close()
+    worker.cast("get_run", "whatever")  # must not raise

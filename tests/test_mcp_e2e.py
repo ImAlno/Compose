@@ -266,6 +266,44 @@ def test_mcp_requires_approval_pauses_and_resumes():
     assert resumed.output == "approved and done"
 
 
+def test_mcp_tool_inside_arun():
+    """Async twin of ``test_mcp_tool_inside_agent_run`` (v0.4.0 Plan B, Task
+    8): the same fixture-server tool, called via ``await agent.arun(...)``
+    under ``asyncio.run`` -- the MCP bridge's blocking call happens on its
+    own dedicated worker thread (see ``composeai.mcp``'s own bridge thread,
+    and ``_dispatch.run_stage``'s sync-tool-on-its-own-thread dispatch),
+    never the asyncio loop driving this test, so this must complete
+    normally with no extra bridging."""
+    import asyncio
+
+    from composeai import agent, prompt
+    from composeai.testing import FakeModel
+
+    tools = _fixture_tools(include=["echo"])
+    model = FakeModel(
+        [
+            {"tool_calls": [{"name": "echo", "arguments": {"text": "ping"}}]},
+            "final answer",
+        ]
+    )
+
+    @agent(model=model, tools=tools, name="mcp_agent_e2e_arun")
+    def mcp_user(q: str) -> str:
+        """Use tools."""
+        return prompt(q)
+
+    async def drive():
+        return await mcp_user.arun("go")
+
+    run = asyncio.run(drive())
+    assert run.status == "completed"
+    assert run.output == "final answer"
+    result_part = model.requests[1].messages[-1].parts[0]
+    assert isinstance(result_part, ToolResultPart)
+    assert result_part.is_error is False
+    assert "echo: ping" in result_part.content
+
+
 def test_close_all_then_call_raises_and_is_idempotent():
     import composeai.mcp as compose_mcp
     from composeai.errors import MCPToolError

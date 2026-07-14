@@ -76,6 +76,52 @@ def test_contextvars_flow_into_runtime():
     assert run_sync(read_var()) == "caller-value"
 
 
+def test_keyboard_interrupt_cancels_engine_task():
+    """Simulate the caller thread's blocking wait being interrupted: the
+    engine-side task must get cancelled, not keep running.
+
+    Drives the cancel SEAM directly (`_runtime._cancel_task_threadsafe`) --
+    the same helper `run_sync`'s KeyboardInterrupt except-branch calls --
+    rather than real signal delivery, mirroring exactly what `_spawn`/
+    `run_sync` do internally (schedule task creation via
+    `call_soon_threadsafe`, hold the task handle in a one-slot list, cancel
+    threadsafe from another thread).
+    """
+    import threading
+    import time as _time
+
+    from composeai import _runtime
+
+    started = threading.Event()
+    state: dict = {}
+
+    async def engine():
+        started.set()
+        try:
+            await asyncio.sleep(30)
+            state["finished"] = True
+        except asyncio.CancelledError:
+            state["cancelled"] = True
+            raise
+
+    loop = _runtime.get_loop()
+    task_holder: list = []
+
+    def _spawn() -> None:
+        task_holder.append(loop.create_task(engine()))
+
+    loop.call_soon_threadsafe(_spawn)
+    assert started.wait(timeout=2)
+
+    _runtime._cancel_task_threadsafe(loop, task_holder)
+
+    deadline = _time.monotonic() + 2
+    while state.get("cancelled") is not True and _time.monotonic() < deadline:
+        _time.sleep(0.01)
+
+    assert state == {"cancelled": True}
+
+
 def test_run_sync_after_shutdown_raises_not_hangs():
     from composeai import _runtime
 

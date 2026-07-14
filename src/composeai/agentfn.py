@@ -16,11 +16,12 @@ deltas from adapters that support :meth:`~composeai.models.base.Model.stream`.
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
 import threading
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -44,7 +45,7 @@ from .hitl import Interrupt, _Pause
 from .messages import Message, StopReason, ToolCallPart, ToolResultPart, Usage
 from .models import registry
 from .models.base import Model, ModelRequest, ModelResponse, ToolSpec
-from .runs import Budget, Run, RunStream, budget_scope, check_budgets
+from .runs import AsyncRunStream, Budget, Run, RunStream, budget_scope, check_budgets
 from .tools import Tool
 
 # --- agent registry (Phase 8: resume() routing) ------------------------------
@@ -64,8 +65,19 @@ class AgentFunction:
     enforced across every LLM call in the run (see
     :func:`~composeai.runs.check_budgets`). ``.stream(...)`` runs the same
     loop on a background thread and returns a :class:`~composeai.runs.RunStream`
-    for live consumption. ``.name``, ``.input_type``, and ``.output_type``
-    support introspection (e.g. by ``composeai.combinators.pipe()``).
+    for live consumption. ``.arun(...)``/``.astream(...)`` (v0.4.0 Plan B)
+    are their asyncio-native twins: the agent LOOP itself runs entirely on
+    the CALLER's own running event loop (never the composeai runtime loop)
+    and is safe to ``await``/gather concurrently from it -- but that's the
+    loop, not everything it touches. A sync ``@tool`` call, a nested
+    sync-bodied ``@flow`` call, or a sync-only model adapter the loop
+    invokes along the way still dispatches onto its own dedicated stage
+    worker thread (see ``_dispatch.run_stage``), and the durable row write
+    goes through the store's own dedicated writer thread
+    (:mod:`composeai._storeasync`) -- neither is the composeai runtime
+    thread, but neither is "no background thread at all" either.
+    ``.name``, ``.input_type``, and ``.output_type`` support introspection
+    (e.g. by ``composeai.combinators.pipe()``).
     """
 
     def __init__(
@@ -132,8 +144,14 @@ class AgentFunction:
     def run(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run:
         return _run_agent(self, args, kwargs, budget=budget)
 
+    async def arun(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run:
+        return await _arun_agent_on_callers_loop(self, args, kwargs, budget=budget)
+
     def stream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> RunStream:
         return _stream_agent(self, args, kwargs, budget=budget)
+
+    def astream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> AsyncRunStream:
+        return _astream_agent(self, args, kwargs, budget=budget)
 
 
 def prompt(text_or_messages: str | Sequence[Message]) -> Any:
@@ -288,10 +306,15 @@ def _build_output_schema(output_type: Any) -> tuple[dict[str, Any] | None, bool]
     return result_schema, wrapped
 
 
-def _build_conversation(
-    agent_fn: AgentFunction, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
-) -> list[Message]:
-    body_result = agent_fn._fn(*call_args, **call_kwargs)
+def _validate_body_result(agent_fn: AgentFunction, body_result: Any) -> list[Message]:
+    """Shared str/``list[Message]`` validation for an ``@agent`` body's return value.
+
+    Factored out (v0.4.0 Plan B, Task 6) so :func:`_abuild_conversation` --
+    the one conversation builder every engine entry point now uses, sync or
+    async (see its own docstring) -- enforces this contract in exactly one
+    place, without duplicating the check (and its error message) anywhere
+    else.
+    """
     if isinstance(body_result, str):
         return [Message.user(body_result)]
     if isinstance(body_result, list) and all(isinstance(item, Message) for item in body_result):
@@ -301,6 +324,35 @@ def _build_conversation(
         "or a list[Message] (the full conversation) from its body, got "
         f"{type(body_result)!r}"
     )
+
+
+async def _abuild_conversation(
+    agent_fn: AgentFunction, call_args: tuple[Any, ...], call_kwargs: dict[str, Any]
+) -> list[Message]:
+    """Build the conversation an ``@agent`` body produces (v0.4.0 Plan B, Task 6).
+
+    Calls the agent body, then validates its return value via
+    :func:`_validate_body_result`; if the body is itself an ``async def``
+    function, calling it returns a coroutine rather than the final
+    str/``list[Message]`` -- detected here via ``inspect.iscoroutine`` (the
+    already-called return *value*, not ``iscoroutinefunction``, which tests
+    the function object itself) -- and that coroutine is awaited before
+    validation. A sync body's plain str/``list[Message]`` return passes
+    straight through unchanged, so this builder handles both body kinds
+    uniformly.
+
+    :func:`_arun_agent_uncached` (the one async engine core, shared by
+    every entry point -- standalone, journaled-in-flow, resumed, streamed)
+    calls this builder exclusively -- so a SYNC-facade call
+    (``agent_fn(...)``/``.run(...)``, which drives this same async engine
+    via ``_runtime.run_sync``, see ``_run_agent_uncached``'s docstring)
+    reaches an async-bodied agent correctly too: the engine underneath is
+    async regardless of which facade the caller used.
+    """
+    body_result = agent_fn._fn(*call_args, **call_kwargs)
+    if inspect.iscoroutine(body_result):
+        body_result = await body_result
+    return _validate_body_result(agent_fn, body_result)
 
 
 def _extract_output(agent_fn: AgentFunction, response: ModelResponse) -> Any:
@@ -433,17 +485,22 @@ async def _ainvoke_model(
 
         def _complete_sync() -> ModelResponse:
             response = slot.model.complete(request)
-            # `CachingModel.last_was_hit` (composeai.testing) is
-            # thread-local by design (correct for the sync engine, where
-            # the same thread calls `complete()` and later reads the
-            # flag). Routed through `to_thread`, that read would instead
-            # happen on the runtime loop thread in `_acall_llm` right
-            # after this returns -- a *different* thread than the one that
-            # actually ran `complete()` -- and would always see the
-            # thread-local default of `False`. Tag the span here instead,
-            # on the very thread the call ran on, while the flag is still
-            # visible; `_acall_llm`'s own (now-redundant for this path,
-            # still correct for a real `acomplete`) check is left as-is.
+            # `CachingModel.last_was_hit` (composeai.testing) is backed by a
+            # `contextvars.ContextVar`, not a plain thread-local -- but that
+            # still doesn't make the flag visible back on the caller's own
+            # context here: `_run_sync_on_own_thread` propagates contextvars
+            # onto this dedicated thread by running `fn` inside a *copy* of
+            # the caller's context (`contextvars.copy_context()`), and a
+            # `.set()` made inside that copy while `fn` runs never writes
+            # back to the original context the awaiting coroutine resumes
+            # in. So if this read instead happened in `_acall_llm`, on the
+            # runtime loop thread, right after this returns, it would still
+            # observe the ContextVar's untouched default (`False`), not the
+            # value `complete()` just set on this thread's copied context.
+            # Tag the span here instead, on the very thread (and context
+            # copy) the call ran on, while the flag is still visible;
+            # `_acall_llm`'s own (now-redundant for this path, still correct
+            # for a real `acomplete`) check is left as-is.
             if getattr(slot.model, "last_was_hit", False):
                 llm_span.attributes["cached"] = True
             return response
@@ -669,7 +726,12 @@ async def _aexecute_one_tool(agent_fn: AgentFunction, call: ToolCallPart) -> Too
 
     Execution itself is one call to ``_dispatch.run_stage``, which
     internally makes the ``timeout is None`` distinction explicitly (see its
-    module docstring) rather than branching on it here.
+    module docstring) rather than branching on it here. A separate branch
+    picks WHICH bound method to hand ``run_stage`` (v0.4.0 Plan B, Task 6):
+    ``tool_obj.aexecute`` for an async-bodied tool (``run_stage`` detects
+    it's a coroutine function and awaits it natively, so ``timeout=``
+    cancels it cooperatively rather than abandoning a daemon thread) or the
+    existing ``tool_obj.execute`` otherwise.
     """
     tool_obj = agent_fn._tools_by_name.get(call.name)
     try:
@@ -678,8 +740,9 @@ async def _aexecute_one_tool(agent_fn: AgentFunction, call: ToolCallPart) -> Too
                 raise UnknownToolError(
                     f"the model called tool {call.name!r} but this agent has no such tool"
                 )
+            run_fn = tool_obj.aexecute if tool_obj.is_async else tool_obj.execute
             content = await run_stage(
-                tool_obj.execute,
+                run_fn,
                 (call.arguments,),
                 {},
                 timeout=tool_obj.timeout,
@@ -1050,6 +1113,53 @@ async def _arun_agent(
     )
 
 
+async def _arun_agent_on_callers_loop(
+    agent_fn: AgentFunction,
+    call_args: tuple[Any, ...],
+    call_kwargs: dict[str, Any],
+    *,
+    streaming: bool = False,
+    budget: Budget | None = None,
+) -> Run:
+    """The async engine behind ``AgentFunction.arun``/``.astream`` (v0.4.0 Plan B, Task 4).
+
+    Same three-way routing as :func:`_run_agent`/:func:`_arun_agent`
+    (journaled flow step -> standalone durable row -> plain uncached loop),
+    but the middle branch differs on purpose: :func:`_arun_agent` above
+    calls the fully-SYNC ``runs.run_standalone_agent`` in that branch,
+    which is safe there ONLY because that branch is documented dead code
+    for `_arun_agent` -- its one caller (``composeai.combinators``) never
+    invokes it from outside an already-open span. This function, in
+    contrast, is reached directly from a user's own asyncio loop as a
+    genuine trace root (a bare, non-nested ``await agent_fn.arun(...)`` --
+    see ``tests/test_async_surface.py``), so it calls
+    :func:`~composeai.runs.arun_standalone_agent` (this same task's other
+    new entry point) instead. That never touches
+    :func:`~composeai._runtime.run_sync` or the composeai runtime loop at
+    all -- everything below runs to completion on whichever loop the
+    caller is already running, ``await``ed all the way down through
+    :func:`_arun_agent_uncached`.
+    """
+    ctx = runs.current_run_context()
+    if ctx is not None:
+        return await _arun_agent_journaled(
+            agent_fn, call_args, call_kwargs, ctx, streaming=streaming, budget=budget
+        )
+    if tracing.current_span() is None:
+        args_json = _encode_agent_call(call_args, call_kwargs)
+        return await runs.arun_standalone_agent(
+            agent_fn.name,
+            args_json,
+            lambda: _arun_agent_uncached(
+                agent_fn, call_args, call_kwargs, streaming=streaming, budget=budget, scope_key=""
+            ),
+            budget=budget,
+        )
+    return await _arun_agent_uncached(
+        agent_fn, call_args, call_kwargs, streaming=streaming, budget=budget, scope_key=""
+    )
+
+
 def _run_agent_journaled(
     agent_fn: AgentFunction,
     call_args: tuple[Any, ...],
@@ -1286,6 +1396,84 @@ def resume_standalone_agent(
         )
 
 
+async def aresume_standalone_agent(
+    run_id: str,
+    row: dict[str, Any],
+    answers: dict[str, Any] | None = None,
+    budget: Budget | None = None,
+) -> Run:
+    """Async twin of :func:`resume_standalone_agent` (v0.4.0 Plan B, Task 7)
+    -- called by ``composeai.flow.aresume()`` when the run row's ``kind`` is
+    ``"agent"``. Same contract and the same check order as the sync
+    version -- read its docstring first, unchanged here (completed-row
+    short-circuit, then unregistered-agent check, both BEFORE any answer is
+    journaled).
+
+    Runs natively on the CALLER's own running event loop (never
+    ``_runtime.run_sync``/the composeai runtime loop): every store read/
+    write this function makes itself -- the budget-override ``update_run``,
+    the budget-baseline ``prior_llm_usage`` -- routes through ``await
+    worker_for(store).call(...)`` instead of calling ``store`` directly,
+    same reasoning as ``composeai.flow.aresume``/``composeai.runs
+    .arun_standalone_agent``. ``answers`` are journaled through
+    :func:`~composeai.runs.aapply_resume_answers` (the async twin of
+    :func:`~composeai.runs.apply_resume_answers`) instead of the sync
+    version, and the loop itself runs through :func:`_arun_agent_uncached`
+    (awaited directly, never through the sync facade
+    :func:`_run_agent_uncached`), settled by
+    :func:`~composeai.runs.asettle_agent_run` instead of
+    :func:`~composeai.runs.settle_agent_run`.
+    """
+    if row["status"] == "completed":
+        output = from_jsonable(json.loads(row["output_json"])) if row["output_json"] else None
+        trace = tracing.Trace(trace_id=row["trace_id"] or "")
+        return Run(
+            id=run_id,
+            status="completed",
+            output=output,
+            usage=Usage(),
+            trace=trace,
+            messages=[],
+            pending=None,
+        )
+
+    agent_fn = _AGENT_REGISTRY.get(row["name"])
+    if agent_fn is None:
+        raise ConfigError(
+            f"agent {row['name']!r} is not registered in this process -- import the "
+            "module that defines it (so its @agent decoration runs) before calling resume()"
+        )
+
+    store = runs.open_default()
+    if budget is not None:
+        await worker_for(store).call(
+            "update_run", run_id, budget_json=runs.encode_budget(budget), updated_at=time.time()
+        )
+    await runs.aapply_resume_answers(store, run_id, answers)
+    call_args, call_kwargs = (
+        _decode_agent_call(row["args_json"]) if row["args_json"] else ((), {})
+    )
+    if budget is None:
+        budget = runs.decode_budget(row.get("budget_json"))
+    budget_baseline = (
+        await worker_for(store).call("prior_llm_usage", run_id) if budget is not None else None
+    )
+    trace_id = row["trace_id"] or new_ulid()
+    with runs.use_run_id(run_id), tracing.use_trace(trace_id):
+        return await runs.asettle_agent_run(
+            store,
+            run_id,
+            lambda: _arun_agent_uncached(
+                agent_fn,
+                call_args,
+                call_kwargs,
+                budget=budget,
+                budget_baseline=budget_baseline,
+                scope_key="",
+            ),
+        )
+
+
 def _run_agent_uncached(
     agent_fn: AgentFunction,
     call_args: tuple[Any, ...],
@@ -1359,7 +1547,7 @@ async def _arun_agent_uncached(
     durable run at all (e.g. nested directly in a bare pipe/aggregate), in
     which case snapshotting/restoring are both no-ops. If a saved snapshot
     exists, its conversation is restored (never re-deriving the prompt via
-    ``_build_conversation``) and, if it was paused mid-tool-batch (its last
+    ``_abuild_conversation``) and, if it was paused mid-tool-batch (its last
     message is the assistant's own tool-call message), that batch is
     re-processed first -- seeded with whatever results already completed --
     before the loop continues into its next turn.
@@ -1415,7 +1603,7 @@ async def _arun_agent_uncached(
                     conversation.append(tool_message)
                     await _asnapshot_agent_state(run_id, scope_key, conversation, turn, {})
             else:
-                conversation = _build_conversation(agent_fn, call_args, call_kwargs)
+                conversation = await _abuild_conversation(agent_fn, call_args, call_kwargs)
                 turn = 0
 
             repairs_used = 0
@@ -1603,4 +1791,68 @@ def _stream_agent(
 ) -> RunStream:
     return _stream_run(
         lambda: _run_agent(agent_fn, call_args, call_kwargs, streaming=True, budget=budget)
+    )
+
+
+def _astream_run(run_thunk: Callable[[], Coroutine[Any, Any, Run]]) -> AsyncRunStream:
+    """Async twin of :func:`_stream_run` (v0.4.0 Plan B, Task 4).
+
+    ``run_thunk`` is a zero-arg coroutine *factory* (same contract as
+    ``runs.asettle_agent_run``'s ``thunk``) -- calling it produces the
+    coroutine the wrapper below awaits, exactly once. Runs the engine as an
+    ``asyncio.Task`` on the CALLER's own already-running loop -- the engine
+    ITSELF is not dispatched to a background thread the way
+    :func:`_stream_run` dispatches it, though a sync ``@tool``/nested
+    sync-bodied ``@flow`` call it makes along the way still runs on its own
+    dedicated stage worker thread regardless (same caveat as
+    :class:`AgentFunction`'s own docstring) -- against a fresh, private
+    :class:`~composeai.events.EventBus`.
+
+    Subscribes (``bus.asubscribe()``) *before* creating the task -- the
+    same subscribe-before-emit ordering :func:`_stream_run` gets for free
+    by subscribing before starting its worker thread. Creating the task
+    first here could let the engine start emitting (the first
+    ``span_started``/``text_delta``/...) before anything is listening,
+    silently dropping those events.
+
+    The wrapper coroutine enters :func:`~composeai.events.use_bus` (a
+    plain, synchronous context manager -- the contextvar it pushes stays
+    correctly scoped across every ``await`` inside this same coroutine/
+    task) and closes the :class:`~composeai.events.AsyncSubscription` in a
+    ``finally`` -- mirroring exactly where :func:`_stream_run`'s worker
+    closes its own :class:`~composeai.events.Subscription`, so breaking out
+    of ``async for`` early (or calling ``.close()``) only unsubscribes; the
+    task itself always runs to completion regardless. Unlike
+    :class:`~composeai.runs.RunStream`'s manual ``_set_outcome``, no
+    outcome-stashing is needed here: ``asyncio.Task`` memoizes its own
+    result, so ``await``ing :meth:`~composeai.runs.AsyncRunStream.run`
+    (whether before, during, or after iterating) always sees the same,
+    stable outcome -- re-raising the task's original exception verbatim if
+    it failed.
+    """
+    bus = events.EventBus()
+    subscription = bus.asubscribe()
+
+    async def _wrapper() -> Run:
+        with events.use_bus(bus):
+            try:
+                return await run_thunk()
+            finally:
+                subscription.close()
+
+    task = asyncio.get_running_loop().create_task(_wrapper())
+    return AsyncRunStream(task, subscription)
+
+
+def _astream_agent(
+    agent_fn: AgentFunction,
+    call_args: tuple[Any, ...],
+    call_kwargs: dict[str, Any],
+    *,
+    budget: Budget | None = None,
+) -> AsyncRunStream:
+    return _astream_run(
+        lambda: _arun_agent_on_callers_loop(
+            agent_fn, call_args, call_kwargs, streaming=True, budget=budget
+        )
     )

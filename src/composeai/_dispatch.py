@@ -21,11 +21,17 @@ coroutine function or a plain sync callable:
   thread per in-flight sync stage has no shared bound, so nesting can
   never starve it. Contextvars are propagated manually (``to_thread`` did
   this for us) so contextvars set by the caller are still visible inside
-  ``fn``. Without a timeout that's the whole story. WITH a timeout, a
-  thread can't be safely interrupted, so this delegates to
-  ``runs._run_with_timeout`` -- unchanged daemon-race-and-abandon semantics,
-  just invoked from this dedicated thread instead of directly, preserving
-  the exact "abandoned thread" wording callers already match on.
+  ``fn``. WITH a timeout, a thread can't be safely interrupted, so this
+  delegates to ``runs._run_with_timeout`` -- unchanged daemon-race-and-abandon
+  semantics, just invoked from this dedicated thread instead of directly,
+  preserving the exact "abandoned thread" wording callers already match on.
+  Independent of any timeout, ``_run_sync_on_own_thread`` itself always
+  installs the same journal abandon-guard around ``fn`` (v0.4.0 Plan B,
+  Task 2): if the AWAITING side is cancelled instead (e.g. an enclosing
+  ``wait_for`` timing out a *composite* stage while this nested sync stage
+  is still running on its own thread), the guard's ``abandoned`` event is
+  set the instant that happens, so the zombie thread's later journal writes
+  are rejected rather than landing under the cancelled branch's keys.
 
 ``gather_settled`` runs a batch of coroutines concurrently and guarantees
 every one of them settles (result or exception, never left pending), in
@@ -73,14 +79,33 @@ async def _run_sync_on_own_thread(
     work and no shared bound exists. Contextvars are propagated manually
     (``to_thread`` did it for us); the reply future is resolved under a
     ``try``/``except BaseException`` so the awaiting task can never hang.
+
+    Installs the same journal abandon-guard ``runs._run_with_timeout``
+    installs for a timed-out task (v0.4.0 Plan B, Task 2 -- closing Plan
+    A's remaining gap): if the AWAITING side (this coroutine, on the
+    engine's loop) is cancelled -- e.g. an enclosing ``wait_for`` timing out
+    a *composite* stage while this nested sync stage is still running --
+    ``abandoned`` is set the instant that happens, and the worker thread's
+    own copied context has a guard installed in its place so any further
+    journal touch from inside ``fn`` raises instead of landing a zombie
+    write under the cancelled branch's keys. Only the worker thread's own
+    copied context is ever guarded -- never the caller's -- so a cancelled
+    stage never affects sibling branches or the flow that gave up on it.
     """
     loop = asyncio.get_running_loop()
     future: asyncio.Future = loop.create_future()
     context = contextvars.copy_context()
+    abandoned = threading.Event()
+
+    def _guarded_call() -> Any:
+        ctx = runs.current_run_context()
+        guarded = runs.abandon_guard(ctx, abandoned)
+        with runs.use_journal_scope(guarded):
+            return fn(*args, **kwargs)
 
     def _worker() -> None:
         try:
-            result = context.run(fn, *args, **kwargs)
+            result = context.run(_guarded_call)
         except BaseException as exc:  # resolved below; never swallowed
             try:
                 loop.call_soon_threadsafe(_resolve, future, None, exc)
@@ -93,7 +118,11 @@ async def _run_sync_on_own_thread(
                 pass  # loop already closed -- nothing to do, awaiter is gone
 
     threading.Thread(target=_worker, daemon=True, name="composeai-stage").start()
-    return await future
+    try:
+        return await future
+    except asyncio.CancelledError:
+        abandoned.set()
+        raise
 
 
 async def run_stage(

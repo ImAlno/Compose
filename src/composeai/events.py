@@ -12,11 +12,12 @@ sync.
 
 from __future__ import annotations
 
+import asyncio
 import contextvars
 import queue
 import threading
 import time
-from collections.abc import Iterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -113,11 +114,83 @@ class Subscription:
         self.close()
 
 
+class AsyncSubscription:
+    """Asyncio-native twin of :class:`Subscription`.
+
+    Bound at construction to ``asyncio.get_running_loop()`` -- publishers
+    (on any thread, running any loop or none at all) reach this
+    subscription's queue exclusively through that loop's
+    ``call_soon_threadsafe``, never by touching the queue directly, so
+    :meth:`_deliver` (called by :meth:`EventBus.emit`, exactly like
+    :class:`Subscription`'s) is safe to call from anywhere.
+
+    Mirrors :class:`Subscription`'s contract exactly: ``close()`` is
+    idempotent and threadsafe (only the call that actually unsubscribes
+    delivers the close sentinel), ``async for`` stops at that sentinel, a
+    second iteration after a full drain returns immediately rather than
+    waiting forever (see :meth:`Subscription.__iter__`'s docstring for why
+    -- the reasoning is identical here), and it works as an async context
+    manager (closing on exit).
+    """
+
+    def __init__(self, bus: EventBus) -> None:
+        self._bus = bus
+        self._loop = asyncio.get_running_loop()
+        self._queue: asyncio.Queue[Event | _Closed] = asyncio.Queue()
+        self._drained = False
+
+    def _put_threadsafe(self, item: Event | _Closed) -> None:
+        try:
+            self._loop.call_soon_threadsafe(self._queue.put_nowait, item)
+        except RuntimeError:
+            # The loop is closed -- this subscriber is gone. A publisher
+            # (on any thread, possibly long after this subscriber's loop
+            # shut down) must never crash over a gone subscriber.
+            pass
+
+    def _deliver(self, event: Event) -> None:
+        self._put_threadsafe(event)
+
+    def close(self) -> None:
+        """Unsubscribe from the bus and end iteration.
+
+        Safe to call more than once and from any thread; only the call
+        that actually removes this subscription from the bus delivers the
+        close sentinel.
+        """
+        if self._bus._unsubscribe(self):
+            self._put_threadsafe(_CLOSE_SENTINEL)
+
+    async def __aiter__(self) -> AsyncIterator[Event]:
+        """Yield events until the subscription closes, then stop.
+
+        A *second* iteration (after the close sentinel was already
+        consumed once) returns immediately instead of waiting forever:
+        same reasoning as :meth:`Subscription.__iter__` -- once closed,
+        the bus has already unsubscribed this queue and will never
+        deliver another sentinel.
+        """
+        if self._drained:
+            return
+        while True:
+            item = await self._queue.get()
+            if isinstance(item, _Closed):
+                self._drained = True
+                return
+            yield item
+
+    async def __aenter__(self) -> AsyncSubscription:
+        return self
+
+    async def __aexit__(self, *exc_info: object) -> None:
+        self.close()
+
+
 class EventBus:
     """Thread-safe fan-out from publishers to subscribers."""
 
     def __init__(self) -> None:
-        self._subscribers: list[Subscription] = []
+        self._subscribers: list[Subscription | AsyncSubscription] = []
         self._lock = threading.Lock()
 
     def subscribe(self) -> Subscription:
@@ -126,7 +199,21 @@ class EventBus:
             self._subscribers.append(sub)
         return sub
 
-    def _unsubscribe(self, sub: Subscription) -> bool:
+    def asubscribe(self) -> AsyncSubscription:
+        """Subscribe from within a running asyncio event loop.
+
+        Requires a running loop: propagates whatever
+        ``asyncio.get_running_loop()`` raises (a ``RuntimeError``) when
+        called with none running -- there would be nowhere for the
+        returned :class:`AsyncSubscription` to schedule its queue puts
+        otherwise.
+        """
+        sub = AsyncSubscription(self)
+        with self._lock:
+            self._subscribers.append(sub)
+        return sub
+
+    def _unsubscribe(self, sub: Subscription | AsyncSubscription) -> bool:
         """Remove ``sub`` if present. Returns whether it was present."""
         with self._lock:
             try:

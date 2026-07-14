@@ -326,11 +326,19 @@ def set_span_sink(fn: Callable[[Span], None] | None) -> None:
 
     Called with every finished :class:`Span` from ``span()``'s ``finally``
     block, after the span's terminal ``status``/``ended_at`` are set.
-    Exceptions raised by ``fn`` are caught here -- persistence failures
-    must never crash user code -- with one ``RuntimeWarning`` emitted on
-    the first failure per process and silence after that (see
+    Exceptions raised by ``fn`` itself are caught here -- persistence
+    failures must never crash user code -- with one ``RuntimeWarning``
+    emitted on the first failure per process and silence after that (see
     :func:`reset_span_sink_state` for the test-only way to clear that
-    latch).
+    latch). That only covers a sink that fails *synchronously*, though:
+    ``composeai.runs``'s default sink (installed by
+    :func:`~composeai.runs.open_default`) never raises here at all -- it
+    hands the write off to the store's writer thread
+    (``composeai._storeasync.StoreWorker.cast``) and returns immediately,
+    so a genuine persistence failure surfaces from the store writer thread
+    on the first failed span persist instead (one ``RuntimeWarning``,
+    then silence -- see ``_storeasync._warn_once_on_cast_failure``), not
+    from here.
     """
     global _span_sink
     _span_sink = fn

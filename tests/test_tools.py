@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 
 import pytest
@@ -554,3 +555,117 @@ def test_tool_requires_exactly_one_execution_path():
     )
     with pytest.raises(ConfigError):
         Tool(spec=spec)  # neither fn/param_model nor executor
+
+
+# --- v0.4.0 Plan B, Task 6: async @tool bodies -------------------------------
+
+
+def test_async_tool_aexecute_awaits_and_encodes():
+    @tool
+    async def afetch(q: str) -> dict:
+        """Fetch something asynchronously.
+
+        Args:
+            q: the query.
+        """
+        await asyncio.sleep(0)
+        return {"q": q, "n": 1}
+
+    assert afetch.is_async is True
+    result = asyncio.run(afetch.aexecute({"q": "x"}))
+    assert json.loads(result) == {"q": "x", "n": 1}
+
+
+def test_aexecute_on_sync_tool_raises():
+    @tool
+    def sync_lookup(q: str) -> str:
+        """Look something up.
+
+        Args:
+            q: the query.
+        """
+        return q
+
+    assert sync_lookup.is_async is False
+    with pytest.raises(ConfigError):
+        asyncio.run(sync_lookup.aexecute({"q": "x"}))
+
+
+def test_async_tool_in_agent_run():
+    from composeai import agent, prompt
+    from composeai.messages import ToolResultPart
+    from composeai.testing import FakeModel
+
+    @tool
+    async def alookup(q: str) -> str:
+        """Look something up asynchronously.
+
+        Args:
+            q: the query.
+        """
+        await asyncio.sleep(0)
+        return f"result for {q}"
+
+    model = FakeModel(
+        [
+            {"tool_calls": [{"name": "alookup", "arguments": {"q": "x"}}]},
+            "done",
+        ]
+    )
+
+    @agent(model=model, tools=[alookup], max_turns=5)
+    def researcher(question: str) -> str:
+        """You are a researcher."""
+        return prompt(question)
+
+    run = researcher.run("go")
+    assert run.output == "done"
+
+    tool_result_message = model.requests[1].messages[-1]
+    result_part = tool_result_message.parts[0]
+    assert isinstance(result_part, ToolResultPart)
+    assert result_part.is_error is False
+    assert result_part.content == "result for x"
+
+
+def test_async_tool_timeout_cancels_cooperatively():
+    import time as _time
+
+    from composeai import agent, prompt
+    from composeai.messages import ToolResultPart
+    from composeai.testing import FakeModel
+
+    @tool(timeout=0.3)
+    async def astall(q: str) -> str:
+        """Stall forever, asynchronously.
+
+        Args:
+            q: ignored.
+        """
+        await asyncio.sleep(10)
+        return "never"
+
+    model = FakeModel(
+        [
+            {"tool_calls": [{"name": "astall", "arguments": {"q": "x"}}]},
+            "done",
+        ]
+    )
+
+    @agent(model=model, tools=[astall], max_turns=5)
+    def staller(question: str) -> str:
+        """You are patient."""
+        return prompt(question)
+
+    start = _time.monotonic()
+    run = staller.run("go")
+    elapsed = _time.monotonic() - start
+
+    assert run.output == "done"
+    assert elapsed < 2.0  # must not block for the full 10s sleep
+
+    tool_result_message = model.requests[1].messages[-1]
+    result_part = tool_result_message.parts[0]
+    assert isinstance(result_part, ToolResultPart)
+    assert result_part.is_error is True
+    assert "cancelled cooperatively" in result_part.content

@@ -7,8 +7,8 @@ checks, always-on local tracing, and durable, resumable flows.
 from ._encoding import register_serializable
 from ._schema import register_module_types
 from .agentfn import agent, prompt
-from .combinators import MapResult, aggregate, map, pipe
-from .flow import flow, now, random, resume, task
+from .combinators import MapResult, aggregate, amap, map, pipe
+from .flow import anow, arandom, aresume, flow, now, random, resume, task
 from .hitl import Interrupt, approve, ask_human
 from .mcp import mcp_tools
 from .models.compatible import openai_compatible
@@ -26,7 +26,11 @@ __all__ = [
     "Run",
     "agent",
     "aggregate",
+    "amap",
+    "anow",
     "approve",
+    "arandom",
+    "aresume",
     "ask_human",
     "flow",
     "map",

@@ -90,6 +90,18 @@ class Tool:
     def input_schema(self) -> dict[str, Any]:
         return self.spec.input_schema
 
+    @property
+    def is_async(self) -> bool:
+        """Whether this tool's body is an ``async def`` function.
+
+        ``False`` for an executor-backed (remote, e.g. MCP) tool -- those
+        have no local ``fn`` at all. Consulted by the agent loop
+        (``composeai.agentfn._aexecute_one_tool``) to route execution to
+        :meth:`aexecute` (native await) instead of :meth:`execute` (its own
+        dedicated thread) -- see that function's docstring.
+        """
+        return self.fn is not None and inspect.iscoroutinefunction(self.fn)
+
     def execute(self, arguments: dict[str, Any]) -> str:
         """Validate/coerce ``arguments`` through the signature model and call the fn.
 
@@ -105,6 +117,35 @@ class Tool:
         validated = self._param_model.model_validate(arguments)
         kwargs = {name: getattr(validated, name) for name in self._param_model.model_fields}
         result = self.fn(**kwargs)
+        if isinstance(result, str):
+            return result
+        return json.dumps(to_jsonable(result))
+
+    async def aexecute(self, arguments: dict[str, Any]) -> str:
+        """Async twin of :meth:`execute`, for a ``@tool`` whose body is ``async def``.
+
+        Same validation/encoding contract as :meth:`execute` -- argument
+        validation through ``param_model`` stays a plain sync call (fast,
+        in-memory, nothing to await); only the fn call itself
+        (``result = await self.fn(**kwargs)``) is awaited. Raises
+        :class:`~composeai.errors.ConfigError` if called on a tool whose
+        body isn't a coroutine function (see :attr:`is_async`) -- an
+        executor-backed or plain-sync tool has no coroutine to await here;
+        use :meth:`execute` for those instead. The agent loop
+        (``composeai.agentfn._aexecute_one_tool``) only ever calls this when
+        ``is_async`` is already ``True``, so this guard only fires on
+        direct misuse.
+        """
+        if not self.is_async:
+            raise ConfigError(
+                f"tool {self.spec.name!r}.aexecute() called but this tool's body "
+                "is not an 'async def' function (or it's an executor-backed tool "
+                "with no local fn at all) -- use .execute() instead"
+            )
+        assert self.fn is not None and self._param_model is not None
+        validated = self._param_model.model_validate(arguments)
+        kwargs = {name: getattr(validated, name) for name in self._param_model.model_fields}
+        result = await self.fn(**kwargs)
         if isinstance(result, str):
             return result
         return json.dumps(to_jsonable(result))
@@ -144,6 +185,15 @@ def tool(
     daemon-thread race ``@task(timeout=)`` uses). A timed-out call surfaces
     to the model as an ``is_error`` tool result -- the agent keeps running
     and the model can react -- never as a run abort.
+
+    The decorated function's body may be ``async def`` (v0.4.0 Plan B):
+    the agent loop detects it (:attr:`Tool.is_async`) and awaits it
+    natively via :meth:`Tool.aexecute` instead of running it on its own
+    dedicated thread. ``timeout=`` on an async tool cancels it
+    *cooperatively* (``asyncio.wait_for``, a real ``CancelledError`` thrown
+    into the coroutine) rather than abandoning a daemon thread -- still
+    surfaced to the model as the same ``is_error`` tool result, just with
+    no zombie thread left running in the background afterward.
     """
 
     def decorator(func: Callable[..., Any]) -> Tool:

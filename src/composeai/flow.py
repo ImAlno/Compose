@@ -51,6 +51,7 @@ from .runs import (
     RunContext,
     RunStream,
     _run_with_timeout,
+    aapply_resume_answers,
     apersist_pending_interrupt,
     apply_resume_answers,
     budget_scope,
@@ -79,6 +80,14 @@ class Task:
     :func:`~composeai.runs.push_scope`), so a call dispatched by
     ``compose.map``/``aggregate``/the agent loop's parallel tool execution
     gets a deterministic key regardless of thread-scheduling order.
+
+    The decorated function's body may be ``async def`` (v0.4.0 Plan B):
+    ``task_obj(...)`` still works from a sync caller (a plain sync flow
+    body, or outside any flow) -- it bridges onto the coroutine via
+    :func:`~composeai._runtime.run_sync` under the hood. ``.arun(...)`` is
+    the asyncio-native twin: awaited directly on the caller's own running
+    event loop, for a sync OR an async ``fn`` alike (T7 consumes this from
+    an async ``@flow`` body).
     """
 
     def __init__(
@@ -146,9 +155,103 @@ class Task:
         attempt = 0
         while True:
             try:
+                if inspect.iscoroutinefunction(self._fn):
+                    # v0.4.0 Plan B, Task 6: an `async def` @task body called
+                    # from a sync caller (outside a flow, or from a sync flow
+                    # body's own worker thread -- never the composeai runtime
+                    # loop thread itself, so this re-entry is always legal;
+                    # see `_runtime.run_sync`'s docstring). `run_stage` does
+                    # the actual dispatch -- coroutine-fn branch: native
+                    # await, and (with `timeout=` set) `asyncio.wait_for`
+                    # cancelling the coroutine cooperatively rather than
+                    # abandoning a daemon thread the way the sync branch
+                    # below still does.
+                    return _runtime.run_sync(
+                        run_stage(
+                            self._fn,
+                            args,
+                            kwargs,
+                            timeout=self._timeout,
+                            name=self.name,
+                            kind="@task",
+                        )
+                    )
                 if self._timeout is None:
                     return self._fn(*args, **kwargs)
                 return _run_with_timeout(self._fn, args, kwargs, self._timeout, self.name)
+            except TaskTimeoutError:
+                raise  # never retried: retrying would pile up more abandoned threads
+            except Exception as exc:
+                task_span.attributes.setdefault("retries", []).append(
+                    {"type": type(exc).__name__, "message": str(exc)}
+                )
+                if attempt < self._retries:
+                    attempt += 1
+                    continue
+                raise
+
+    async def arun(self, *args: Any, **kwargs: Any) -> Any:
+        """Async twin of :meth:`__call__` -- runs natively on the CALLER's own
+        running event loop (v0.4.0 Plan B, Task 6; T7 consumes this from an
+        async ``@flow`` body).
+
+        Same journaled-vs-plain routing as the sync facade: journaled (via
+        :meth:`_arun_journaled`, mirroring :meth:`_run_journaled` but
+        recording through :meth:`~composeai.runs.RunContext.ajournal_record`
+        instead of the sync ``journal_record`` -- see that method's
+        docstring for why: it routes the store write through the store's
+        dedicated writer thread rather than blocking whatever loop this
+        coroutine is running on) when there's an ambient
+        :class:`~composeai.runs.JournalScope`, else the plain span-wrapped
+        path (:meth:`_arun_uncached`). Both the sync fn and the async fn
+        case are handled uniformly by :meth:`_aexecute` -- awaited body via
+        ``_dispatch.run_stage`` either way (see its module docstring for the
+        sync-callable-on-its-own-thread vs. coroutine-native-await split).
+        """
+        ctx = current_run_context()
+        if ctx is None:
+            return await self._arun_uncached(args, kwargs)
+        key = ctx.next_key(self.name)
+        return await self._arun_journaled(ctx, key, args, kwargs)
+
+    async def _arun_uncached(self, args: tuple[Any, ...], kwargs: dict[str, Any]) -> Any:
+        with tracing.span("task", self.name) as task_span:
+            task_span.set_input(_call_input_dict(args, kwargs))
+            result = await self._aexecute(args, kwargs, task_span)
+            task_span.set_output(result)
+            return result
+
+    async def _arun_journaled(
+        self, ctx: JournalScope, key: str, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Any:
+        hit, value = ctx.journal_lookup(key)
+        with tracing.span("task", self.name, attributes={"step_key": key}) as task_span:
+            if hit:
+                task_span.replayed = True
+                task_span.set_output(value)
+                return value
+            task_span.set_input(_call_input_dict(args, kwargs))
+            result = await self._aexecute(args, kwargs, task_span)
+            recorded = await ctx.ajournal_record(key, result)
+            task_span.set_output(recorded)
+            return recorded
+
+    async def _aexecute(
+        self, args: tuple[Any, ...], kwargs: dict[str, Any], task_span: tracing.Span
+    ) -> Any:
+        """Async twin of :meth:`_execute` -- retries loop mirrored exactly
+        (``TaskTimeoutError`` never retried, same reasoning), but the body
+        itself always runs through ``_dispatch.run_stage`` (handles a sync
+        OR an async ``self._fn`` uniformly, awaited natively either way --
+        no ``_runtime.run_sync`` bridge needed since this coroutine is
+        already running on the caller's own loop).
+        """
+        attempt = 0
+        while True:
+            try:
+                return await run_stage(
+                    self._fn, args, kwargs, timeout=self._timeout, name=self.name, kind="@task"
+                )
             except TaskTimeoutError:
                 raise  # never retried: retrying would pile up more abandoned threads
             except Exception as exc:
@@ -239,6 +342,48 @@ def random() -> float:
     if hit:
         return value
     return ctx.journal_record(key, _stdlib_random.random())
+
+
+async def anow() -> datetime.datetime:
+    """Async twin of :func:`now` (v0.4.0 Plan B, Task 7).
+
+    Draws from the SAME per-run key counter as :func:`now` -- both reserve
+    keys under the one shared name ``"now"`` (see
+    :meth:`~composeai.runs.RunContext.next_key`), so a sync ``@flow`` body
+    converted to ``async def`` (or vice versa) still replays whatever the
+    other one already journaled: ``now#1``/``now#2``/... means the same
+    thing to both. The one difference from :func:`now`: a miss journals
+    through :meth:`~composeai.runs.RunContext.ajournal_record` instead of
+    the sync ``journal_record`` -- same reasoning as :meth:`Task.arun`, so
+    this never blocks whatever loop the caller (an async ``@flow`` body) is
+    running on. Outside a flow it is exactly ``datetime.now(timezone.utc)``,
+    same as :func:`now`.
+    """
+    ctx = current_run_context()
+    if ctx is None:
+        return datetime.datetime.now(datetime.timezone.utc)
+    key = ctx.next_key("now")
+    hit, value = ctx.journal_lookup(key)
+    if hit:
+        return value
+    return await ctx.ajournal_record(key, datetime.datetime.now(datetime.timezone.utc))
+
+
+async def arandom() -> float:
+    """Async twin of :func:`random` (v0.4.0 Plan B, Task 7) -- same shared
+    ``"random"`` key counter and async-journaling difference documented on
+    :func:`anow` (its docstring's reasoning applies here verbatim, s/now/
+    random/). Outside a flow it is exactly ``random.random()``, same as
+    :func:`random`.
+    """
+    ctx = current_run_context()
+    if ctx is None:
+        return _stdlib_random.random()
+    key = ctx.next_key("random")
+    hit, value = ctx.journal_lookup(key)
+    if hit:
+        return value
+    return await ctx.ajournal_record(key, _stdlib_random.random())
 
 
 # --- @flow --------------------------------------------------------------
@@ -333,6 +478,86 @@ class Flow:
             )
         )
 
+    async def arun(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run:
+        """Async twin of :meth:`run` (v0.4.0 Plan B, Task 7) -- runs natively
+        on the CALLER's own running event loop: no ``_runtime.run_sync``,
+        no composeai runtime loop involved at all.
+
+        A ``@flow`` called from inside another active ``@flow`` body is a
+        *nested* flow call -- v0.4.0 Plan B, Task 8 mirrors :meth:`__call__`'s
+        ctx-check here too: journal it as one step of the ENCLOSING flow
+        (via :func:`_arun_flow_journaled`) instead of minting a brand-new
+        durable run row the way a genuine top-level ``arun()`` does below.
+        Without this, ``await inner.arun(...)`` from inside an async
+        ``@flow`` body would mint a second durable run every attempt,
+        instead of journaling as one step of the outer run the way a nested
+        sync ``inner(...)`` call already does. Returns the journaled step's
+        own ``Run`` directly (not just its ``.output``) -- the same
+        contract ``AgentFunction.arun`` already has for a nested agent call
+        (see ``agentfn._arun_agent_on_callers_loop``'s identical ctx-check,
+        which likewise returns ``_arun_agent_journaled``'s ``Run`` as-is,
+        rather than unwrapping it). ``budget=...`` raises ``ConfigError`` on
+        this nested path instead of silently doing nothing -- same as a
+        nested ``@flow`` step never getting its own budget scope (see
+        :func:`_run_flow_journaled`'s docstring): only a genuine top-level
+        run below accepts one, and the enclosing run's own budget already
+        governs every step inside it.
+
+        Nested-routing asymmetry vs. :meth:`run`: unlike this method (and
+        :meth:`__call__`), :meth:`run` never checks for an ambient ``@flow``
+        context at all -- it *always* mints a brand-new top-level durable
+        run, even when called from inside another active flow's body. So
+        ``inner.run(...)`` called from a flow body does NOT journal as a
+        nested step the way sync sugar (``inner(...)``) or ``await
+        inner.arun(...)`` both do; it starts an entirely separate,
+        independently-resumable run instead. Deliberate, but easy to trip
+        over -- prefer the sugar call or ``arun()`` for a call meant to be
+        part of the enclosing run, and reach for ``.run()`` inside a flow
+        body only when a genuinely separate durable run is what's wanted.
+
+        Otherwise (no ambient ``@flow``), same pre-work as :meth:`run` --
+        ``_encode_call`` (sync, rejects unserializable args up front), then
+        a fresh ``run_id``/``trace_id`` and the durable ``create_run`` row
+        -- except row creation goes through ``await
+        worker_for(store).call("create_run", ...)`` instead of calling
+        ``store`` directly: this runs on the caller's own loop rather than
+        a dedicated worker thread, so a direct, blocking SQLite write here
+        would freeze that loop instead of merely parking an idle thread
+        (same reasoning as ``composeai.runs.arun_standalone_agent``).
+        ``_aexecute_flow`` itself is awaited directly with no bridge in
+        between -- see its docstring for the async-vs-sync flow-body
+        dispatch this enables.
+        """
+        ctx = current_run_context()
+        if ctx is not None:
+            if budget is not None:
+                raise ConfigError(
+                    f"@flow {self.name!r}: budget= is not supported on a nested flow "
+                    "call (the enclosing run's budget governs); set it on the outer run"
+                )
+            return await _arun_flow_journaled(self, ctx, args, kwargs)
+        args_json = _encode_call(args, kwargs)  # rejects unserializable args up front
+        store = _open_default_store()
+        run_id = new_ulid()
+        trace_id = new_ulid()
+        now = time.time()
+        await worker_for(store).call(
+            "create_run",
+            run_id=run_id,
+            kind="flow",
+            name=self.name,
+            status="running",
+            created_at=now,
+            updated_at=now,
+            trace_id=trace_id,
+            fingerprint=self.fingerprint,
+            args_json=args_json,
+            budget_json=runs.encode_budget(budget),
+        )
+        return await _aexecute_flow(
+            self, run_id=run_id, trace_id=trace_id, args=args, kwargs=kwargs, budget=budget
+        )
+
     def stream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> RunStream:
         return agentfn._stream_run(lambda: self.run(*args, budget=budget, **kwargs))
 
@@ -381,12 +606,19 @@ async def _aexecute_flow(
     kwargs: dict[str, Any],
     budget: Budget | None,
 ) -> Run:
-    """Async core of the flow engine (v0.4.0 Plan A, Task 9) -- mirrors the
-    former ``_execute_flow`` exactly; ``Flow.run()``/``resume()`` are its
-    only two callers, both sync facades dispatching via
-    ``_runtime.run_sync(_aexecute_flow(...))`` (``create_run`` itself stays
-    caller-side/sync in both, exactly as before -- this function never
-    creates the row, only ever updates one that already exists).
+    """Async core of the flow engine (v0.4.0 Plan A, Task 9; docstring
+    harmonized in Plan B, Task 9) -- mirrors the former ``_execute_flow``
+    exactly on the sync path. Four callers reach it now: ``Flow.run()``/
+    ``resume()`` (sync facades dispatching via
+    ``_runtime.run_sync(_aexecute_flow(...))``) and ``Flow.arun()``/
+    ``aresume()`` (v0.4.0 Plan B, Task 7 -- awaiting this function directly
+    on the caller's own loop, no ``_runtime.run_sync`` bridge at all -- see
+    each async facade's own docstring). ``create_run`` (row creation) stays
+    caller-side/sync on the ``run()``/``resume()`` path, exactly as before;
+    on the ``arun()``/``aresume()`` path it instead goes through ``await
+    worker_for(store).call("create_run", ...)`` so it never blocks the
+    caller's own loop. Either way, this function itself never creates the
+    row, only ever updates one that already exists.
 
     Every direct store call this function makes itself (as opposed to a
     span's own persistence on exit, via ``tracing``'s module-global sink --
@@ -402,10 +634,11 @@ async def _aexecute_flow(
     (``prior_llm_usage``), and every ``update_run``/pause-persistence write
     below.
 
-    The flow BODY itself stays a sync user function in this plan (v0.4.0
-    Plan A) -- it runs via ``_dispatch.run_stage(flow_obj._fn, ...)``, which
-    dispatches a plain sync callable onto its OWN dedicated daemon thread
-    (see ``_dispatch._run_sync_on_own_thread``): every ``@task``/``@agent``/
+    The flow BODY may be a plain sync function OR an ``async def`` (v0.4.0
+    Plan B, Task 7 -- Plan A only ever ran a sync body). A sync body still
+    runs via ``_dispatch.run_stage(flow_obj._fn, ...)``, which dispatches
+    the plain sync callable onto its OWN dedicated daemon thread (see
+    ``_dispatch._run_sync_on_own_thread``): every ``@task``/``@agent``/
     ``now()``/``random()``/``approve()`` call made from inside the body
     reaches the sync facades on that thread -- legal re-entry into the
     runtime loop from a non-runtime thread (see ``_runtime.run_sync``'s own
@@ -414,13 +647,36 @@ async def _aexecute_flow(
     extra latency, never a deadlock, same as every other sync-facade-from-a-
     worker-thread call already exercised elsewhere in this codebase (e.g.
     ``test_nested_sync_agent_call_from_tool_body_no_deadlock``).
-    ``composeai.hitl._Pause`` raised from the body is a ``BaseException``;
-    ``_run_sync_on_own_thread``'s worker resolves the awaited future with
-    ANY ``BaseException`` the callable raised (its own ``except
-    BaseException`` clause, not ``except Exception``), so it propagates
-    through the ``await run_stage(...)`` below completely unchanged and
-    reaches this function's own ``except BaseException`` immediately after
-    -- exactly as it did when the sync ``_execute_flow`` called
+
+    An ``async def`` body is instead awaited DIRECTLY on this coroutine's
+    own loop -- no thread bridge, no ``run_stage`` involved at all (see the
+    ``inspect.iscoroutinefunction`` branch below). That loop is either the
+    composeai runtime loop (``Flow.run()``/``resume()``, both dispatching
+    via ``_runtime.run_sync(_aexecute_flow(...))``) or the caller's own
+    asyncio loop (``Flow.arun()``/``aresume()``, which await this function
+    directly with no ``run_sync`` in between) -- either way, every
+    ``@task``/``@agent`` call the body makes must go through its
+    ``.arun(...)`` twin, and every clock/random read through
+    ``anow()``/``arandom()`` instead of ``now()``/``random()``: the plain
+    sync facades would route through ``_runtime.run_sync``, which raises
+    immediately (rather than deadlocking) on re-entry from the runtime
+    loop's own thread -- precisely the thread this coroutine may now be
+    running on. Sync ``approve()``/``ask_human()`` remain directly callable
+    from an async body either way: both only ever do a brief in-memory
+    journal read (``runs.interrupt_lookup`` -> ``ctx.journal_lookup``,
+    never a store/disk touch, so never a call to ``run_sync``) -- a
+    negligible, documented sync hop on the loop, not a deadlock risk (the
+    cost the Plan A review quantified as negligible).
+
+    ``composeai.hitl._Pause`` raised from the body is a ``BaseException`` --
+    on the sync-body path, ``_run_sync_on_own_thread``'s worker resolves the
+    awaited future with ANY ``BaseException`` the callable raised (its own
+    ``except BaseException`` clause, not ``except Exception``), so it
+    propagates through the ``await run_stage(...)`` below completely
+    unchanged; on the async-body path it simply propagates out of the
+    directly-awaited coroutine the same way any exception does. Either way
+    it reaches this function's own ``except BaseException`` immediately
+    after -- exactly as it did when the sync ``_execute_flow`` called
     ``flow_obj._fn`` directly on its own (the caller's) thread with no
     bridge in between at all.
     """
@@ -440,9 +696,19 @@ async def _aexecute_flow(
         try:
             with tracing.span("flow", flow_obj.name) as root_span:
                 with budget_scope(budget, root_span, baseline=baseline):
-                    output = await run_stage(
-                        flow_obj._fn, args, kwargs, timeout=None, name=flow_obj.name, kind="@flow"
-                    )
+                    if inspect.iscoroutinefunction(flow_obj._fn):
+                        # v0.4.0 Plan B, Task 7 -- see this function's own
+                        # docstring above for the full async-body contract.
+                        output = await flow_obj._fn(*args, **kwargs)
+                    else:
+                        output = await run_stage(
+                            flow_obj._fn,
+                            args,
+                            kwargs,
+                            timeout=None,
+                            name=flow_obj.name,
+                            kind="@flow",
+                        )
                 trace = tracing.current_trace()
                 assert trace is not None
                 usage = trace.rollup_usage(root_span)
@@ -558,9 +824,110 @@ def _run_flow_journaled(
 
     with tracing.span("flow", flow_obj.name, attributes={"step_key": key}) as flow_span:
         with runs.push_scope(segment):
-            output = flow_obj._fn(*args, **kwargs)
+            if inspect.iscoroutinefunction(flow_obj._fn):
+                # Legal re-entry: this function only ever runs on a sync flow
+                # body's own dedicated worker thread, never the composeai
+                # runtime loop itself -- the async path routes through
+                # `_arun_flow_journaled` instead (see its docstring), so
+                # bridging back into the runtime loop here via
+                # `_runtime.run_sync` is safe, not a deadlock or a
+                # re-entrant-call error. Without this, calling an
+                # async-bodied inner @flow through the sync sugar
+                # (`inner(...)`) called `flow_obj._fn(...)` directly, which
+                # for an `async def` body returns an un-awaited coroutine
+                # instead of its result -- journaled as-is, this produced a
+                # baffling `SerializationError` downstream (plus a
+                # "coroutine was never awaited" warning), nowhere near the
+                # actual bug.
+                output = _runtime.run_sync(flow_obj._fn(*args, **kwargs))
+            else:
+                output = flow_obj._fn(*args, **kwargs)
         flow_span.set_output(output)
     recorded = ctx.journal_record(key, output)
+    trace = tracing.current_trace()
+    assert trace is not None
+    return Run(
+        id=new_ulid(),
+        status="completed",
+        output=recorded,
+        usage=trace.rollup_usage(flow_span),
+        trace=trace,
+        messages=[],
+        pending=None,
+    )
+
+
+async def _arun_flow_journaled(
+    flow_obj: Flow, ctx: JournalScope, args: tuple[Any, ...], kwargs: dict[str, Any]
+) -> Run:
+    """Async twin of :func:`_run_flow_journaled` (v0.4.0 Plan B, Task 8) --
+    same replay/miss contract, byte-identical -- see its docstring first.
+
+    Reached from :meth:`Flow.arun` when there's an ambient
+    :class:`~composeai.runs.JournalScope` -- i.e. a nested ``await
+    inner.arun(...)`` from inside another ``@flow`` body, sync or async.
+    Mirrors ``agentfn._arun_agent_journaled``'s own relationship to
+    ``agentfn._run_agent_journaled`` for the identical reason: two things
+    differ from the sync version, both because this may run on an arbitrary
+    caller's own event loop (``Flow.arun`` never touches the composeai
+    runtime loop at all -- see its docstring) rather than an arbitrary
+    worker thread:
+
+    - The miss path's journal write goes through ``ctx.ajournal_record``
+      instead of ``ctx.journal_record`` -- same reasoning as
+      ``agentfn._arun_agent_journaled``/``Task._arun_journaled``: it awaits
+      the store's dedicated writer thread rather than blocking whatever
+      loop this coroutine is running on.
+    - The inner flow body's own dispatch mirrors ``_aexecute_flow``'s own
+      sync-vs-async split exactly (see its docstring): an ``async def``
+      body is awaited directly on this coroutine's own loop (every nested
+      ``@task``/``@agent``/``@flow`` call it makes must go through its own
+      ``.arun(...)`` twin, every clock/random read through
+      ``anow()``/``arandom()``); a sync body instead runs via
+      ``_dispatch.run_stage`` on its own dedicated worker thread (so any
+      nested sync facade call it makes is legal re-entry from a worker
+      thread, never the loop this coroutine itself is running on).
+
+    ``ctx.reserve_scope_segment``/``ctx.qualify``/``ctx.journal_lookup``
+    stay direct, synchronous calls (as in the sync version): all three only
+    ever touch the in-memory ``preloaded`` dict/counter, never the
+    store/disk, so there is nothing to await and no risk of blocking the
+    loop.
+
+    A pause (``composeai.hitl._Pause``) raised from inside the inner flow's
+    body is, same as the sync version, deliberately not caught here -- it
+    propagates to the outermost flow's own pause handling
+    (``_aexecute_flow``'s ``except`` clause).
+    """
+    segment = ctx.reserve_scope_segment(flow_obj.name)
+    key = ctx.qualify(segment)
+    hit, value = ctx.journal_lookup(key)
+    if hit:
+        with tracing.span("flow", flow_obj.name, attributes={"step_key": key}) as flow_span:
+            flow_span.replayed = True
+            flow_span.set_output(value)
+        trace = tracing.current_trace()
+        assert trace is not None
+        return Run(
+            id=new_ulid(),
+            status="completed",
+            output=value,
+            usage=Usage(),
+            trace=trace,
+            messages=[],
+            pending=None,
+        )
+
+    with tracing.span("flow", flow_obj.name, attributes={"step_key": key}) as flow_span:
+        with runs.push_scope(segment):
+            if inspect.iscoroutinefunction(flow_obj._fn):
+                output = await flow_obj._fn(*args, **kwargs)
+            else:
+                output = await run_stage(
+                    flow_obj._fn, args, kwargs, timeout=None, name=flow_obj.name, kind="@flow"
+                )
+        flow_span.set_output(output)
+    recorded = await ctx.ajournal_record(key, output)
     trace = tracing.current_trace()
     assert trace is not None
     return Run(
@@ -682,4 +1049,86 @@ def resume(
     )
 
 
-__all__ = ["Flow", "Task", "flow", "now", "random", "resume", "task"]
+async def aresume(
+    run_id: str,
+    answers: dict[str, Any] | None = None,
+    *,
+    budget: Budget | None = None,
+    allow_code_change: bool = False,
+) -> Run:
+    """Async twin of :func:`resume` (v0.4.0 Plan B, Task 7) -- same
+    contract and the same check order (nothing persisted before the
+    abort-checks below -- see :func:`resume`'s docstring first, unchanged
+    here).
+
+    Runs natively on the CALLER's own running event loop: every store
+    read/write this function makes itself -- ``get_run``, the
+    budget-override ``update_run`` -- routes through ``await
+    worker_for(store).call(...)`` instead of calling ``store`` directly,
+    same reasoning as ``_aexecute_flow``/``composeai.runs
+    .arun_standalone_agent``, so a durable resume driven through this async
+    entry point never blocks the caller's loop with SQLite I/O.
+    :func:`~composeai.runs.apply_resume_answers` becomes
+    :func:`~composeai.runs.aapply_resume_answers` (identical first-write-
+    wins/``resolve_answer_key`` logic, every store call it makes awaited
+    through the worker instead of direct). The flow path awaits
+    ``_aexecute_flow`` directly (no ``_runtime.run_sync`` bridge at all);
+    the agent path awaits
+    :func:`~composeai.agentfn.aresume_standalone_agent`, the async twin of
+    :func:`~composeai.agentfn.resume_standalone_agent`.
+    """
+    store = _open_default_store()
+    row = await worker_for(store).call("get_run", run_id)
+    if row is None:
+        raise ConfigError(f"no run found with run_id {run_id!r}")
+
+    if row["kind"] == "agent":
+        return await agentfn.aresume_standalone_agent(run_id, row, answers, budget=budget)
+
+    flow_obj = _FLOW_REGISTRY.get(row["name"])
+    if flow_obj is None:
+        raise ConfigError(
+            f"flow {row['name']!r} is not registered in this process -- import the "
+            "module that defines it (so its @flow decoration runs) before calling resume()"
+        )
+
+    if row["status"] == "completed":
+        output = from_jsonable(json.loads(row["output_json"])) if row["output_json"] else None
+        trace = tracing.Trace(trace_id=row["trace_id"] or "")
+        return Run(
+            id=run_id,
+            status="completed",
+            output=output,
+            usage=Usage(),
+            trace=trace,
+            messages=[],
+            pending=None,
+        )
+
+    if row["fingerprint"] != flow_obj.fingerprint and not allow_code_change:
+        raise ResumeMismatchError(
+            f"@flow {flow_obj.name!r}'s source changed since run {run_id!r} was created "
+            "(fingerprint mismatch) -- pass allow_code_change=True to resume anyway "
+            "(the journal may no longer match the new code's call sequence)"
+        )
+
+    if budget is not None:
+        # Persist AFTER every abort-check above, same reasoning as answers:
+        # an override alongside an impossible resume must not be locked in.
+        await worker_for(store).call(
+            "update_run", run_id, budget_json=runs.encode_budget(budget), updated_at=time.time()
+        )
+    await aapply_resume_answers(store, run_id, answers)
+    args, kwargs = _decode_call(row["args_json"])
+    effective_budget = budget if budget is not None else runs.decode_budget(row.get("budget_json"))
+    return await _aexecute_flow(
+        flow_obj,
+        run_id=run_id,
+        trace_id=row["trace_id"],
+        args=args,
+        kwargs=kwargs,
+        budget=effective_budget,
+    )
+
+
+__all__ = ["Flow", "Task", "anow", "arandom", "aresume", "flow", "now", "random", "resume", "task"]
