@@ -35,7 +35,7 @@ from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
 from . import tracing
 from ._encoding import from_jsonable, to_jsonable
 from ._ids import new_ulid
-from .errors import BudgetExceededError, ConfigError, SerializationError
+from .errors import BudgetExceededError, ConfigError, SerializationError, TaskTimeoutError
 from .events import Event, Subscription
 from .messages import Message, Usage
 from .tracing import Span, Trace, current_trace
@@ -234,6 +234,74 @@ def check_budgets() -> None:
                     f"budget exceeded on {root_span.kind} {root_span.name!r}: "
                     f"usd budget={budget.usd}, used=${used_usd:.4f}"
                 )
+
+
+def _run_with_timeout(
+    fn: Callable[..., Any],
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    timeout: float,
+    name: str,
+    *,
+    kind: str = "@task",
+) -> Any:
+    """Run ``fn(*args, **kwargs)`` on a dedicated daemon thread, bounded by ``timeout``.
+
+    Deliberately a raw daemon :class:`threading.Thread`, not a
+    ``concurrent.futures.ThreadPoolExecutor``: CPython registers an
+    ``atexit`` hook that joins every executor worker thread at interpreter
+    shutdown, which would hang the process forever waiting on a task
+    that's genuinely stuck (e.g. an infinite loop) -- exactly the case a
+    timeout exists to route around. A daemon thread carries none of that
+    baggage: on timeout this raises immediately and the abandoned thread
+    keeps running in the background (harvested only when it finishes on
+    its own, or the process exits).
+
+    That abandoned thread must not keep mutating the run's journal after
+    the caller has moved on (the run might already be marked "completed" by
+    then, if the caller caught ``TaskTimeoutError`` and continued -- or a
+    fresh ``resume()`` might later build an independent ``RunContext`` whose
+    zeroed-out counters can legitimately collide with the zombie's own).
+    So: if there's an ambient :class:`~composeai.runs.RunContext`, the
+    worker thread's *own copied context* (never the caller's) gets a guard
+    proxy installed in its place (see
+    :func:`~composeai.runs.abandon_guard`/:func:`~composeai.runs.use_journal_scope`)
+    with an ``abandoned`` event this function sets the instant it gives up
+    waiting -- any journal touch after that point raises internally inside
+    the worker and unwinds its stack at that point. Pure side effects
+    already in flight (a network call, a file write, ...) still run to
+    completion regardless -- there is no safe way to interrupt an arbitrary
+    Python thread; that part is inherent, not something this guard changes.
+    """
+    result: dict[str, Any] = {}
+    error: dict[str, BaseException] = {}
+    done = threading.Event()
+    abandoned = threading.Event()
+
+    def _worker() -> None:
+        ctx = current_run_context()
+        guarded = abandon_guard(ctx, abandoned)
+        with use_journal_scope(guarded):
+            try:
+                result["value"] = fn(*args, **kwargs)
+            except BaseException as exc:  # noqa: BLE001 -- forwarded to the caller thread below
+                error["exc"] = exc
+            finally:
+                done.set()
+
+    thread = threading.Thread(target=tracing.propagate(_worker), daemon=True)
+    thread.start()
+    if not done.wait(timeout=timeout):
+        abandoned.set()
+        raise TaskTimeoutError(
+            f"{kind} {name!r} exceeded timeout={timeout}s -- the abandoned thread keeps "
+            "running in the background as a daemon; its eventual result is discarded, "
+            "and it loses journal write access immediately (its pure side effects, if "
+            "any, still run to completion -- there is no safe way to stop that)"
+        )
+    if "exc" in error:
+        raise error["exc"]
+    return result["value"]
 
 
 # --- RunStore: the SQLite-backed durable store (Phase 7) ------------------
@@ -576,6 +644,48 @@ class RunStore:
                 total = total + Usage.model_validate(value)
         return total
 
+    def prior_llm_usage_for_step(self, run_id: str, step_key: str) -> Usage:
+        """Sum of persisted llm-span usage under agent spans tagged ``step_key``.
+
+        The per-step analog of :meth:`prior_llm_usage`, for a nested
+        ``@agent(budget=...)`` call inside a resumed flow: only THAT step's
+        earlier attempts may count against the agent's own budget --
+        charging the whole run's spend here would over-count. Agent spans
+        carry their journal key in ``attributes_json["step_key"]``; their
+        descendant llm spans hold the usage. Replayed steps re-create no
+        llm spans, so replays contribute nothing.
+        """
+        conn = self._connect()
+        rows = conn.execute(
+            "SELECT span_id, parent_span_id, kind, usage_json, attributes_json "
+            "FROM spans WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+        children: dict[str | None, list[Any]] = {}
+        matching_roots: list[str] = []
+        for row in rows:
+            children.setdefault(row["parent_span_id"], []).append(row)
+            if row["kind"] == "agent" and row["attributes_json"]:
+                try:
+                    attributes = json.loads(row["attributes_json"])
+                except json.JSONDecodeError:
+                    continue
+                if attributes.get("step_key") == step_key:
+                    matching_roots.append(row["span_id"])
+
+        total = Usage()
+        stack = list(matching_roots)
+        while stack:
+            span_id = stack.pop()
+            for child in children.get(span_id, []):
+                stack.append(child["span_id"])
+                if child["kind"] == "llm" and child["usage_json"]:
+                    payload = json.loads(child["usage_json"])
+                    value = payload.get("value") if isinstance(payload, dict) else None
+                    if isinstance(value, dict):
+                        total = total + Usage.model_validate(value)
+        return total
+
     def journal_put(self, run_id: str, step_key: str, value_json: str) -> str:
         """INSERT OR IGNORE (first-write-wins); return the value that ended up stored.
 
@@ -828,19 +938,25 @@ class RunStore:
 
     def delete_run(self, run_id: str) -> None:
         """Purge every row keyed by ``run_id`` (``runs``, ``journal``, ``spans``,
-        ``pending_interrupts``, ``agent_state``) in one transaction.
+        ``pending_interrupts``, ``agent_state``) in one transaction, along
+        with each purged span's ``span_payloads`` row.
 
         Used when a run must leave nothing behind that an operator (or
         ``compose runs``) could mistake for something resumable -- see
         ``composeai.combinators._run_top``'s refusal of a paused bare
         ``pipe()``/``aggregate()`` run (durable pauses need a ``@flow`` root;
-        see that function's docstring). ``span_payloads`` rows (keyed by
-        ``span_id``, not ``run_id``) are deliberately left behind: they're
-        unreachable without a ``spans`` row pointing at them (which this
-        does delete), and joining through to delete them isn't worth the
-        extra query for what's already a rare edge case.
+        see that function's docstring). ``span_payloads`` rows are keyed by
+        ``span_id``, not ``run_id``, so they're purged via a subselect
+        against ``spans`` *before* the ``spans`` rows themselves are
+        deleted -- otherwise they'd be unreachable orphans left behind
+        forever.
         """
         conn = self._connect()
+        conn.execute(
+            "DELETE FROM span_payloads WHERE span_id IN "
+            "(SELECT span_id FROM spans WHERE run_id = ?)",
+            (run_id,),
+        )
         for table in ("runs", "journal", "spans", "pending_interrupts", "agent_state"):
             conn.execute(f"DELETE FROM {table} WHERE run_id = ?", (run_id,))  # noqa: S608
         conn.commit()
@@ -1096,7 +1212,7 @@ class _AbandonedTaskError(BaseException):
     after its timeout already fired (see :class:`_AbandonGuardedRunContext`).
 
     Never meant to be caught by user code, or even to be observed --
-    ``composeai.flow._run_with_timeout``'s worker's own top-level ``except
+    ``_run_with_timeout``'s worker's own top-level ``except
     BaseException`` swallows it (the caller thread already has its
     ``TaskTimeoutError``; there's nothing further to report). A
     ``BaseException``, not an ``Exception``, specifically so a task's own
@@ -1110,7 +1226,7 @@ class _AbandonGuardedRunContext:
     """Wraps a real :class:`RunContext` so a timed-out ``@task``'s abandoned
     worker thread loses journal write access the instant it's abandoned.
 
-    Installed by ``composeai.flow._run_with_timeout`` *only* inside the
+    Installed by ``_run_with_timeout`` *only* inside the
     worker thread's own copied context (via :func:`use_journal_scope`) --
     the caller thread (and its own copy of the ambient context, taken by
     ``tracing.propagate`` before the worker ever starts) keeps referencing
@@ -1346,7 +1462,7 @@ def use_journal_scope(scope: JournalScope | None) -> Iterator[None]:
     also tags spans with the run id).
 
     Used to install a per-thread journal-access guard: see
-    ``composeai.flow._run_with_timeout``, which calls this (inside the
+    ``_run_with_timeout``, which calls this (inside the
     timed-out task's own worker thread, on its own copied context -- see
     ``composeai.tracing.propagate``) to swap in an
     :func:`abandon_guard`-wrapped context that only that thread (and

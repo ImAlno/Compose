@@ -736,3 +736,37 @@ def test_map_invalid_on_error_rejected():
 
     with pytest.raises(ConfigError):
         compose.map(lambda x: x, [1], on_error="ignore")
+
+
+def test_aggregate_timeout_per_branch_raises():
+    import time as _time
+
+    from composeai.errors import TaskTimeoutError
+
+    def fast(x: int) -> int:
+        return x + 1
+
+    def hung(x: int) -> int:
+        _time.sleep(10)
+        return x
+
+    agg = compose.aggregate(timeout_per_branch=0.2, fast=fast, hung=hung)
+    with pytest.raises(TaskTimeoutError):
+        agg(1)
+
+
+def test_aggregate_no_timeout_unchanged():
+    agg = compose.aggregate(a=lambda x: x + 1, b=lambda x: x * 2)
+    assert agg(3) == {"a": 4, "b": 6}
+
+
+def test_aggregate_rejects_positional_stage():
+    with pytest.raises(TypeError):
+        compose.aggregate(lambda x: x)  # type: ignore[misc]  # positional args are not branches
+
+
+def test_aggregate_rejects_non_numeric_timeout():
+    from composeai.errors import ConfigError
+
+    with pytest.raises(ConfigError):
+        compose.aggregate(timeout_per_branch=lambda x: x, a=lambda x: x)  # type: ignore[arg-type]

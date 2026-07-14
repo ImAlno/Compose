@@ -570,7 +570,17 @@ def _execute_one_tool(agent_fn: AgentFunction, call: ToolCallPart) -> ToolResult
                 raise UnknownToolError(
                     f"the model called tool {call.name!r} but this agent has no such tool"
                 )
-            content = tool_obj.execute(call.arguments)
+            if tool_obj.timeout is None:
+                content = tool_obj.execute(call.arguments)
+            else:
+                content = runs._run_with_timeout(
+                    tool_obj.execute,
+                    (call.arguments,),
+                    {},
+                    tool_obj.timeout,
+                    call.name,
+                    kind="@tool",
+                )
             tool_span.set_output(content)
     except UnknownToolError:
         return ToolResultPart(tool_call_id=call.id, content="unknown tool", is_error=True)
@@ -888,12 +898,18 @@ def _run_agent_journaled(
             messages=[],
             pending=None,
         )
+    budget_baseline = (
+        runs.open_default().prior_llm_usage_for_step(ctx.run_id, key)
+        if budget is not None
+        else None
+    )
     run = _run_agent_uncached(
         agent_fn,
         call_args,
         call_kwargs,
         streaming=streaming,
         budget=budget,
+        budget_baseline=budget_baseline,
         scope_key=key,
         step_key=key,
     )

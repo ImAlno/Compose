@@ -33,6 +33,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import replace
@@ -582,8 +583,8 @@ class CachingModel:
     response but returns it with ``usage=Usage()`` (zeroed) -- a cache hit
     must never re-report the tokens it originally cost, since no new call
     was made. ``composeai.agentfn._call_llm`` reads :attr:`last_was_hit`
-    (a plain, duck-typed ``getattr(model, "last_was_hit", False)`` check,
-    right after invoking the model) to tag the llm span's
+    (a duck-typed ``getattr(model, "last_was_hit", False)`` check, right
+    after invoking the model) to tag the llm span's
     ``attributes["cached"] = True`` on a hit.
 
     Applies to :meth:`complete` only -- when the inner model also supports
@@ -593,11 +594,13 @@ class CachingModel:
     implemented, so streaming calls always run for real and are never
     cached, by design.
 
-    Not safe for concurrent :meth:`complete` calls on the *same* instance
-    from multiple threads -- :attr:`last_was_hit` is one plain instance
-    attribute, not thread-local. A ``CachingModel`` is normally private to
-    one agent's model slot (built fresh per run by ``_make_slot``), so this
-    is a narrow, documented limitation rather than a solved problem.
+    Safe for concurrent :meth:`complete` calls on the *same* instance from
+    multiple threads -- :attr:`last_was_hit` is thread-local (backed by
+    ``threading.local``), so each thread observes only the outcome of its
+    own most recent call, never another thread's hit/miss racing in
+    between the call and the read. This matters because a single agent's
+    model slot (and thus its ``CachingModel``) is shared across a
+    ``pipe.map``/``aggregate`` fan-out's worker threads.
 
     Writes the full, unredacted response to disk regardless of
     ``COMPOSE_TRACE_CONTENT`` -- that flag only governs what a *trace span*
@@ -612,19 +615,30 @@ class CachingModel:
     def __init__(self, inner: Model, cache_dir: str | Path | None = None) -> None:
         self._inner = inner
         self._cache_dir = Path(cache_dir) if cache_dir is not None else _default_cache_dir()
-        self.last_was_hit = False
+        self._hit_flag = threading.local()
         inner_stream = getattr(inner, "stream", None)
         if inner_stream is not None:
             self.stream = inner_stream
+
+    @property
+    def last_was_hit(self) -> bool:
+        """Whether THIS THREAD's most recent :meth:`complete` was served from cache.
+
+        Thread-local: parallel map/aggregate branches sharing one
+        ``CachingModel`` instance each observe their own flag (a plain
+        instance attribute let one thread's hit/miss overwrite another's
+        between the call and the read).
+        """
+        return getattr(self._hit_flag, "value", False)
 
     def complete(self, request: ModelRequest) -> ModelResponse:
         key = compute_full_hash(request)
         path = self._cache_dir / f"{key}.json"
         if path.exists():
-            self.last_was_hit = True
+            self._hit_flag.value = True
             cached = from_jsonable(json.loads(path.read_text()))
             return replace(cached, usage=Usage())
-        self.last_was_hit = False
+        self._hit_flag.value = False
         response = self._inner.complete(request)
         self._cache_dir.mkdir(parents=True, exist_ok=True)
         # Atomic write: a plain `write_text` on `path` directly would leave

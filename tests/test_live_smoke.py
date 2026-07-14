@@ -80,3 +80,34 @@ def test_live_openai_structured_output():
     response = model.complete(request)
     assert response.parsed is not None
     assert response.parsed["n"] == 7
+
+
+def test_live_openai_compatible_prompt_mode():
+    """Gated: the module-level ``pytestmark`` above already requires
+    ``COMPOSE_LIVE_TESTS=1``; this test additionally needs
+    ``COMPOSE_LIVE_COMPAT_BASE_URL`` (e.g. a local Ollama at
+    http://localhost:11434/v1) AND ``COMPOSE_LIVE_COMPAT_MODEL``. Verifies
+    both native and prompt schema_mode against a real server end-to-end.
+    """
+    base_url = os.environ.get("COMPOSE_LIVE_COMPAT_BASE_URL")
+    model_id = os.environ.get("COMPOSE_LIVE_COMPAT_MODEL")
+    if not base_url or not model_id:
+        pytest.skip("set COMPOSE_LIVE_COMPAT_BASE_URL and COMPOSE_LIVE_COMPAT_MODEL")
+
+    from pydantic import BaseModel
+
+    from composeai import agent, openai_compatible, prompt
+
+    class LiveAnswer(BaseModel):
+        answer: str
+
+    for mode in ("native", "prompt"):
+        model = openai_compatible(base_url, model_id, schema_mode=mode, timeout=120)
+
+        @agent(model=model, name=f"live_compat_{mode}", max_repairs=1)
+        def live_asker(question: str) -> LiveAnswer:
+            """Answer in one word."""
+            return prompt(question)
+
+        result = live_asker("What color is the sky on a clear day?")
+        assert isinstance(result, LiveAnswer)

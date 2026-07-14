@@ -41,7 +41,12 @@ class Tool:
     """
 
     def __init__(
-        self, fn: Callable[..., Any], spec: ToolSpec, param_model: type[BaseModel]
+        self,
+        fn: Callable[..., Any],
+        spec: ToolSpec,
+        param_model: type[BaseModel],
+        *,
+        timeout: float | None = None,
     ) -> None:
         self.fn = fn
         self.spec = spec
@@ -52,6 +57,7 @@ class Tool:
         # for a @tool used directly as a stage -- derived from `fn`'s own
         # signature, not `Tool.__call__`'s untyped `(*args, **kwargs)` one.
         self.input_type, self.output_type = _tool_types(fn)
+        self.timeout = timeout
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.fn(*args, **kwargs)
@@ -91,6 +97,7 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     requires_approval: bool = False,
+    timeout: float | None = None,
 ) -> Callable[[Callable[..., Any]], Tool]: ...
 
 
@@ -100,6 +107,7 @@ def tool(
     name: str | None = None,
     description: str | None = None,
     requires_approval: bool = False,
+    timeout: float | None = None,
 ) -> Tool | Callable[[Callable[..., Any]], Tool]:
     """Decorate a plain, typed function into a model-callable :class:`Tool`.
 
@@ -108,11 +116,20 @@ def tool(
     description and, via a Google-style ``Args:`` section, per-parameter
     descriptions merged into the generated JSON Schema -- unless overridden
     by an explicit ``description=``.
+
+    ``timeout`` (seconds) bounds one execution of the tool body (the same
+    daemon-thread race ``@task(timeout=)`` uses). A timed-out call surfaces
+    to the model as an ``is_error`` tool result -- the agent keeps running
+    and the model can react -- never as a run abort.
     """
 
     def decorator(func: Callable[..., Any]) -> Tool:
         return _build_tool(
-            func, name=name, description=description, requires_approval=requires_approval
+            func,
+            name=name,
+            description=description,
+            requires_approval=requires_approval,
+            timeout=timeout,
         )
 
     if fn is not None:
@@ -126,6 +143,7 @@ def _build_tool(
     name: str | None,
     description: str | None,
     requires_approval: bool,
+    timeout: float | None = None,
 ) -> Tool:
     tool_name = name or fn.__name__
     doc = fn.__doc__
@@ -155,7 +173,7 @@ def _build_tool(
         requires_approval=requires_approval,
         strict=True,
     )
-    return Tool(fn=fn, spec=spec, param_model=param_model)
+    return Tool(fn=fn, spec=spec, param_model=param_model, timeout=timeout)
 
 
 def _tool_types(fn: Callable[..., Any]) -> tuple[Any, Any]:

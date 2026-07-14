@@ -484,3 +484,25 @@ def test_tool_exposes_input_output_types_for_composition_type_checking():
 
     assert search.input_type is str
     assert search.output_type is str
+
+
+def test_tool_timeout_param_stored():
+    @tool(timeout=5.0)
+    def slow_lookup(q: str) -> str:
+        """Look something up.
+
+        Args:
+            q: the query.
+        """
+        return q
+
+    assert slow_lookup.timeout == 5.0
+
+
+def test_tool_timeout_default_none():
+    @tool
+    def plain_lookup(q: str) -> str:
+        """Look something up."""
+        return q
+
+    assert plain_lookup.timeout is None

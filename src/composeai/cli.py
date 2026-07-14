@@ -851,6 +851,24 @@ def _positive_int(value: str) -> int:
     return n
 
 
+def _add_import_argument(parser: argparse.ArgumentParser) -> None:
+    """Add the shared ``--import MODULE`` (repeatable) option to a subparser.
+
+    Four subcommands (``runs``, ``trace``, ``diff``, ``export``) all decode
+    stored data and so all need a way to import modules that register
+    pydantic/dataclass/enum types before decoding -- this is the one place
+    that argument is defined, instead of four byte-identical blocks.
+    """
+    parser.add_argument(
+        "--import",
+        dest="imports",
+        action="append",
+        metavar="MODULE",
+        help="Import MODULE and register its pydantic/dataclass/enum types "
+        "before decoding stored data (repeatable).",
+    )
+
+
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="compose", description="Inspect composeai's durable run store."
@@ -864,40 +882,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_runs.add_argument("--kind", choices=["agent", "flow", "pipe", "aggregate"])
     p_runs.add_argument("--since")
     p_runs.add_argument("-q", "--query", dest="query")
-    p_runs.add_argument(
-        "--import",
-        dest="imports",
-        action="append",
-        metavar="MODULE",
-        help="Import MODULE and register its pydantic/dataclass/enum types "
-        "before decoding stored data (repeatable).",
-    )
+    _add_import_argument(p_runs)
     p_runs.set_defaults(func=cmd_runs)
 
     p_trace = sub.add_parser("trace", help="Render one run's trace.")
     p_trace.add_argument("run_id", nargs="?")
     p_trace.add_argument("--last", action="store_true")
-    p_trace.add_argument(
-        "--import",
-        dest="imports",
-        action="append",
-        metavar="MODULE",
-        help="Import MODULE and register its pydantic/dataclass/enum types "
-        "before decoding stored data (repeatable).",
-    )
+    _add_import_argument(p_trace)
     p_trace.set_defaults(func=cmd_trace)
 
     p_diff = sub.add_parser("diff", help="Structurally diff two runs' traces.")
     p_diff.add_argument("run_a")
     p_diff.add_argument("run_b")
-    p_diff.add_argument(
-        "--import",
-        dest="imports",
-        action="append",
-        metavar="MODULE",
-        help="Import MODULE and register its pydantic/dataclass/enum types "
-        "before decoding stored data (repeatable).",
-    )
+    _add_import_argument(p_diff)
     p_diff.set_defaults(func=cmd_diff)
 
     p_costs = sub.add_parser("costs", help="Group-by spend report over llm spans.")
@@ -911,14 +908,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_export = sub.add_parser("export", help="Export a run's llm spans as a cassette.")
     p_export.add_argument("run_id")
     p_export.add_argument("--cassette", required=True)
-    p_export.add_argument(
-        "--import",
-        dest="imports",
-        action="append",
-        metavar="MODULE",
-        help="Import MODULE and register its pydantic/dataclass/enum types "
-        "before decoding stored data (repeatable).",
-    )
+    _add_import_argument(p_export)
     p_export.set_defaults(func=cmd_export)
 
     return parser

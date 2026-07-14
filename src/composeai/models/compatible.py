@@ -40,6 +40,16 @@ from .prices import ModelPrice, compute_cost, get_price, register_price
 
 _PROVIDER = "openai-compatible"
 
+
+class _NonJsonContentError(ProviderError):
+    """The generic 'accepted the request, returned non-JSON' failure -- the
+    ONLY condition schema_mode="auto" demotes on. Module-private: external
+    behavior (isinstance ProviderError, message text) is unchanged; the
+    subclass exists so complete() can distinguish it from transport errors
+    and the reasoning-tokens diagnostic without string-matching messages.
+    """
+
+
 _SCHEMA_NAME_RE = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 _DEFAULT_SCHEMA_NAME = "response"
 
@@ -132,6 +142,19 @@ class OpenAICompatibleModel:
     repairable ``ComposeError`` -- eligible for ``@agent(max_repairs=)``
     corrective turns, not ``retries=`` (which stays provider-error
     territory, e.g. a dropped connection).
+
+    ``schema_mode="auto"`` starts native and demotes permanently to prompt
+    mode on the first generic non-JSON structured reply (the server accepted
+    ``response_format`` but returned prose anyway) -- that one ``complete()``
+    call is retried in prompt mode, and every subsequent call on this
+    instance goes straight to prompt mode for the rest of the process, so at
+    most one native call is ever wasted per instance. ``stream()`` follows
+    the current effective mode but never itself demotes -- a mid-stream
+    retry would re-emit already-yielded deltas -- so a streaming caller that
+    wants auto-demotion benefits should route at least one ``complete()``
+    call through the same instance first. Transport errors (``openai.
+    APIError``) and the reasoning-tokens-only diagnostic never demote and
+    raise in every mode, including ``"auto"``.
     """
 
     def __init__(
@@ -145,9 +168,9 @@ class OpenAICompatibleModel:
         timeout: float | None = None,
         schema_mode: str = "native",
     ) -> None:
-        if schema_mode not in ("native", "prompt"):
+        if schema_mode not in ("native", "prompt", "auto"):
             raise ConfigError(
-                f"schema_mode must be 'native' or 'prompt', got {schema_mode!r}"
+                f"schema_mode must be 'native', 'prompt', or 'auto', got {schema_mode!r}"
             )
         self.model_id = model_id
         self._base_url = base_url
@@ -156,6 +179,7 @@ class OpenAICompatibleModel:
         self._max_retries = max_retries
         self._timeout = timeout
         self._schema_mode = schema_mode
+        self._demoted = False
 
     def _get_client(self) -> Any:
         if self._client is not None:
@@ -178,6 +202,13 @@ class OpenAICompatibleModel:
         self._client = openai.OpenAI(**client_kwargs)
         return self._client
 
+    def _effective_schema_mode(self) -> str:
+        # A benign race if two threads demote at once (worst case: one
+        # extra native attempt) -- deliberately unsynchronized.
+        if self._schema_mode == "auto":
+            return "prompt" if self._demoted else "native"
+        return self._schema_mode
+
     def complete(self, request: ModelRequest) -> ModelResponse:
         import openai
 
@@ -191,7 +222,30 @@ class OpenAICompatibleModel:
 
         choice = response.choices[0]
         usage = _map_usage(getattr(response, "usage", None), self.model_id)
-        return self._finalize(choice.message, choice.finish_reason, usage, request)
+        try:
+            return self._finalize(choice.message, choice.finish_reason, usage, request)
+        except _NonJsonContentError:
+            if self._schema_mode != "auto" or self._demoted:
+                raise
+            # The server accepted response_format but returned prose: demote
+            # this instance permanently and retry this one call in prompt
+            # mode. At most one wasted native call per instance per process.
+            self._demoted = True
+            # The first (native) call still happened and was real, billed
+            # spend -- its usage must not simply be discarded, or trace/costs/
+            # Budget would silently under-count one full completion. Keep it
+            # and sum it into the retry's usage before finalizing.
+            wasted_usage = usage
+            kwargs = self._build_kwargs(request)
+            try:
+                response = client.chat.completions.create(**kwargs)
+            except openai.APIError as exc:
+                raise ProviderError(str(exc), provider=_PROVIDER, model=self.model_id) from exc
+            choice = response.choices[0]
+            usage = _map_usage(getattr(response, "usage", None), self.model_id)
+            return self._finalize(
+                choice.message, choice.finish_reason, wasted_usage + usage, request
+            )
 
     def stream(self, request: ModelRequest) -> Iterator[RawStreamEvent]:
         """Stream a completion, yielding token/tool deltas then ``response_done``.
@@ -323,7 +377,7 @@ class OpenAICompatibleModel:
         if request.tools:
             kwargs["tools"] = [_tool_to_param(spec) for spec in request.tools]
         if request.output_schema is not None:
-            if self._schema_mode == "prompt":
+            if self._effective_schema_mode() == "prompt":
                 # Servers that accept response_format but silently ignore it
                 # (Ollama cloud, some vLLM/LM Studio configs) get the schema
                 # embedded in the prompt instead; _finalize parses leniently.
@@ -380,7 +434,8 @@ class OpenAICompatibleModel:
             try:
                 parsed = json.loads(text)
             except json.JSONDecodeError as exc:
-                if self._schema_mode == "prompt":
+                effective_mode = self._effective_schema_mode()
+                if effective_mode == "prompt":
                     parsed = _lenient_json_parse(text)
                 if parsed is None:
                     if usage.reasoning_tokens and not text.strip():
@@ -393,8 +448,8 @@ class OpenAICompatibleModel:
                             provider=_PROVIDER,
                             model=self.model_id,
                         ) from exc
-                    if self._schema_mode != "prompt":
-                        raise ProviderError(
+                    if effective_mode != "prompt":
+                        raise _NonJsonContentError(
                             "Server returned non-JSON content for a structured-output "
                             f"request: {exc}",
                             provider=_PROVIDER,
@@ -452,6 +507,14 @@ def openai_compatible(
     still doesn't parse, that surfaces as a repairable ``ComposeError``
     from the agent loop -- eligible for ``@agent(max_repairs=)`` turns,
     not ``retries=`` (which stays provider-error territory).
+
+    ``schema_mode="auto"`` starts native and permanently demotes to prompt
+    mode the first time a call gets back a generic non-JSON structured
+    reply, retrying that one call in prompt mode and then staying in prompt
+    mode for the rest of this model instance's lifetime -- at most one
+    wasted native call ever. ``stream()`` follows the current effective
+    mode but never demotes itself. Transport errors and the
+    reasoning-tokens-only diagnostic never demote, in any mode.
     """
     if (input_price is None) != (output_price is None):
         raise ConfigError(

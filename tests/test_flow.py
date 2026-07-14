@@ -806,6 +806,64 @@ def test_budget_accumulates_across_resume_attempts():
         resume(run.id, {"continue": True})
 
 
+def test_task7b_nested_agent_own_budget_accumulates_across_paused_attempt():
+    """A nested ``@agent``'s OWN ``budget=`` (passed on its ``.run()`` call,
+    not the flow's) must also be cumulative across a pause/resume of that
+    SAME step -- the whole-run ``prior_llm_usage`` used for flow-level
+    budgets (see ``test_budget_accumulates_across_resume_attempts`` above)
+    would be the wrong thing to charge here: it would double-count spend
+    from sibling steps this agent's own cap never authorized.
+
+    One agent step, called inside a flow via ``task7b_spender.run(budget=...)``.
+    The agent has an approval-gated tool, so its first attempt pauses mid-run
+    (a genuine mid-step pause, not two separate steps each under their own
+    budget -- see the task brief's note on why the naive two-step version
+    would be vacuous). Its first (pre-pause) model call spends 10 tokens,
+    safely under the 15-token cap. On resume, the SAME step re-attempts:
+    without this fix, the resumed attempt's budget baseline is always
+    ``None`` (a fresh window), so its own model call(s) would need to
+    exceed 15 tokens all on their own to ever raise. With the fix, the
+    resumed attempt's baseline includes the paused attempt's 10 tokens, so
+    its very next model call (10 more) pushes the lifetime total for this
+    step to 20 > 15, and ``resume()`` must raise ``BudgetExceededError``.
+    """
+    from composeai.errors import BudgetExceededError
+    from composeai.messages import Usage
+    from composeai.tools import tool
+
+    @tool(requires_approval=True)
+    def task7b_gated_tool() -> str:
+        """Needs approval."""
+        return "gated-done"
+
+    model = FakeModel(
+        [
+            {"tool_calls": [{"name": "task7b_gated_tool", "arguments": {}, "id": "call_1"}]},
+            "second",
+            "third",
+        ],
+        usage=Usage(input_tokens=5, output_tokens=5),
+    )
+
+    @agent(model=model, tools=[task7b_gated_tool], max_turns=5)
+    def task7b_spender() -> str:
+        """Runner."""
+        return "go"
+
+    @flow
+    def task7b_nested() -> str:
+        # the AGENT's own budget, not the flow's (task7b_nested.run() below
+        # is called with no budget at all)
+        task7b_spender.run(budget=Budget(tokens=15))
+        return "done"
+
+    run = task7b_nested.run()
+    assert run.status == "paused"
+
+    with pytest.raises(BudgetExceededError):
+        resume(run.id, {"tool:task7b_gated_tool:call_1": True})
+
+
 # --- resume() validates before journaling answers ---------------------------
 
 
@@ -1011,3 +1069,41 @@ def test_resume_with_budget_override_allows_recovery():
     stored = store.get_run(run_id)
     assert stored is not None
     assert _json.loads(stored["budget_json"]) == {"usd": None, "tokens": 60}
+
+
+def test_now_and_random_journal_inside_flow(tmp_path):
+    from composeai import now as compose_now
+    from composeai import random as compose_random
+
+    seen: dict[str, list] = {"now": [], "rand": []}
+
+    @flow
+    def task5_clock_flow() -> str:
+        seen["now"].append(compose_now())
+        seen["rand"].append(compose_random())
+        if not approve("go"):
+            return "stopped"
+        return "done"
+
+    run = task5_clock_flow.run()
+    assert run.status == "paused"
+    first_now, first_rand = seen["now"][0], seen["rand"][0]
+
+    result = resume(run.id, {"go": True})
+    assert result.output == "done"
+    # the resumed attempt re-executed the flow body: values must REPLAY, not re-draw
+    assert seen["now"][1] == first_now
+    assert seen["rand"][1] == first_rand
+
+
+def test_now_and_random_plain_outside_flow():
+    import datetime as _dt
+
+    from composeai import now as compose_now
+    from composeai import random as compose_random
+
+    value = compose_now()
+    assert isinstance(value, _dt.datetime)
+    assert value.tzinfo is not None
+    draw = compose_random()
+    assert 0.0 <= draw < 1.0

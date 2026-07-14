@@ -35,8 +35,7 @@ from ._ids import new_ulid
 from ._schema import resolve_annotations
 from .agentfn import AgentFunction
 from .errors import CompositionTypeError, ConfigError
-from .flow import _run_with_timeout
-from .runs import Budget, Run, RunStream, budget_scope
+from .runs import Budget, Run, RunStream, _run_with_timeout, budget_scope
 from .tools import Tool
 
 Stage = Any
@@ -373,8 +372,11 @@ class Aggregate:
     always ``dict``.
     """
 
-    def __init__(self, branches: dict[str, Stage]) -> None:
+    def __init__(
+        self, branches: dict[str, Stage], *, timeout_per_branch: float | None = None
+    ) -> None:
         self._branches = dict(branches)
+        self._timeout_per_branch = timeout_per_branch
         input_types = [_stage_input_type(s) for s in self._branches.values()]
         first = input_types[0]
         self.input_type: Any = first if all(t == first for t in input_types) else Any
@@ -435,12 +437,22 @@ class Aggregate:
             branch_scopes = {name: None for name in self._branches}
 
         def _run_one(name: str, stage: Stage) -> tuple[Any, BaseException | None]:
+            def call() -> Any:
+                return _invoke_stage(stage, x, streaming=streaming)
+
+            def run() -> Any:
+                if self._timeout_per_branch is None:
+                    return call()
+                return _run_with_timeout(
+                    call, (), {}, self._timeout_per_branch, name, kind="aggregate branch"
+                )
+
             try:
                 scope = branch_scopes[name]
                 if scope is None:
-                    return _invoke_stage(stage, x, streaming=streaming), None
+                    return run(), None
                 with runs.push_scope(scope):
-                    return _invoke_stage(stage, x, streaming=streaming), None
+                    return run(), None
             except BaseException as exc:  # settled below, re-raised as-is once every branch is done
                 return None, exc
 
@@ -457,14 +469,25 @@ class Aggregate:
         return {name: output for name, (output, _exc) in outcomes.items()}
 
 
-def aggregate(**branches: Stage) -> Aggregate:
+def aggregate(*, timeout_per_branch: float | None = None, **branches: Stage) -> Aggregate:
     """Build an :class:`Aggregate` running every branch in parallel.
 
-    Requires at least 1 branch (else :class:`~composeai.errors.CompositionTypeError`).
+    ``timeout_per_branch`` (seconds) bounds each branch with the same
+    daemon-thread race ``@task(timeout=)`` and ``map(timeout_per_item=)``
+    use; a timed-out branch raises :class:`~composeai.errors.TaskTimeoutError`
+    under the existing first-branch-in-declaration-order rule. One
+    consequence of taking this as a keyword parameter: a branch cannot
+    itself be named ``timeout_per_branch``. Requires at least 1 branch
+    (else :class:`~composeai.errors.CompositionTypeError`).
     """
+    if timeout_per_branch is not None and not isinstance(timeout_per_branch, (int, float)):
+        raise ConfigError(
+            f"aggregate(): timeout_per_branch must be a number of seconds, "
+            f"got {type(timeout_per_branch)!r}"
+        )
     if not branches:
         raise CompositionTypeError(f"aggregate() requires at least 1 branch, got {len(branches)}")
-    return Aggregate(branches)
+    return Aggregate(branches, timeout_per_branch=timeout_per_branch)
 
 
 # --- map ----------------------------------------------------------------------
@@ -505,7 +528,7 @@ def map(
     ``f"{fn_name}[{i}]"``.
 
     ``timeout_per_item`` bounds each item's run on its own daemon thread
-    (the same race :func:`~composeai.flow._run_with_timeout` uses for
+    (the same race :func:`~composeai.runs._run_with_timeout` uses for
     ``@task(timeout=)``) -- a single hung branch raises
     :class:`~composeai.errors.TaskTimeoutError` for that item instead of
     blocking every other item, and the whole ``map()`` call, forever.
@@ -578,7 +601,7 @@ def map(
             if timeout_per_item is None:
                 return call()
             # Same daemon-thread race @task(timeout=) uses -- see
-            # flow._run_with_timeout for why not a ThreadPoolExecutor, and
+            # runs._run_with_timeout for why not a ThreadPoolExecutor, and
             # for the journal abandon-guard the worker gets.
             return _run_with_timeout(call, (), {}, timeout_per_item, name)
 

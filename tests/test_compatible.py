@@ -879,6 +879,23 @@ def test_stream_refusal_maps_to_refusal_stop_reason():
     assert done.response.message.text == "I can't help"
 
 
+def test_stream_prompt_mode_lenient_parse():
+    """stream() shares _build_kwargs/_finalize -- prompt mode must work there too."""
+    chunks = [
+        _chunk(_delta(content='```json\n{"answer": "ok"}\n```')),
+        _chunk(_delta(), finish_reason="stop"),
+        _usage_only_chunk(_usage()),
+    ]
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=_StubClient([chunks]), schema_mode="prompt"
+    )
+    raw_events = list(model.stream(_structured_request()))
+    done = raw_events[-1]
+    assert done.kind == "response_done"
+    assert done.response is not None
+    assert done.response.parsed == {"answer": "ok"}
+
+
 def test_stream_sdk_error_becomes_provider_error():
     sdk_error = openai.APIConnectionError(
         message="boom", request=httpx.Request("POST", "http://localhost:11434/v1")
@@ -1181,11 +1198,20 @@ def test_prompt_mode_garbage_is_repairable_via_max_repairs():
     assert "did not match the required output schema" in str(calls[1]["messages"])
 
 
+def test_append_schema_instruction_no_user_message_appends_one():
+    from composeai.models.compatible import _append_schema_instruction
+
+    api_messages: list[dict[str, Any]] = [{"role": "system", "content": "be brief"}]
+    _append_schema_instruction(api_messages, {"type": "object"})
+    assert api_messages[-1]["role"] == "user"
+    assert "JSON Schema" in api_messages[-1]["content"][0]["text"]
+
+
 def test_invalid_schema_mode_raises_config_error():
     from composeai.errors import ConfigError
 
     with pytest.raises(ConfigError):
-        OpenAICompatibleModel("m", base_url="http://x/v1", schema_mode="auto")
+        OpenAICompatibleModel("m", base_url="http://x/v1", schema_mode="bogus")
 
 
 def test_native_mode_unchanged_sends_response_format():
@@ -1218,3 +1244,93 @@ def test_reasoning_only_empty_content_raises_targeted_error():
     model = OpenAICompatibleModel("m", base_url="http://x/v1", client=client)
     with pytest.raises(ProviderError, match="only reasoning tokens"):
         model.complete(_structured_request())
+
+
+# --- schema_mode="auto" -------------------------------------------------------
+
+
+class _AutoModeCompletions:
+    """Returns prose (ignoring response_format) when asked natively; valid JSON
+    is only ever in the content, so success depends on prompt-mode parsing.
+
+    Each wire call gets its own distinct, real usage (prompt_tokens/
+    completion_tokens, with no cache/reasoning details) so a test can verify
+    the demoted native call's "wasted" usage isn't silently discarded -- it
+    must be summed into the retry's usage, not dropped, or trace/costs/
+    Budget would under-count one full billed completion.
+    """
+
+    def __init__(self):
+        self.calls: list[dict] = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        call_number = len(self.calls)
+        msg = SimpleNamespace(
+            content='Sure! {"answer": "ok"} hope that helps',
+            refusal=None,
+            tool_calls=None,
+        )
+        usage = SimpleNamespace(
+            prompt_tokens=7 * call_number,
+            completion_tokens=13 * call_number,
+            prompt_tokens_details=None,
+            completion_tokens_details=None,
+        )
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=msg, finish_reason="stop")], usage=usage
+        )
+
+
+def test_auto_mode_demotes_to_prompt_and_sticks():
+    completions = _AutoModeCompletions()
+    client = SimpleNamespace(chat=SimpleNamespace(completions=completions))
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=client, schema_mode="auto"
+    )
+
+    first = model.complete(_structured_request())
+    assert first.parsed == {"answer": "ok"}
+    # call 1 was native (sent response_format), call 2 was the prompt-mode retry
+    assert len(completions.calls) == 2
+    assert "response_format" in completions.calls[0]
+    assert "response_format" not in completions.calls[1]
+    # The first (native) call was real, billed spend -- its usage must reach
+    # the returned response summed with the retry's, not be discarded.
+    assert first.usage.input_tokens == 7 * 1 + 7 * 2
+    assert first.usage.output_tokens == 13 * 1 + 13 * 2
+
+    second = model.complete(_structured_request())
+    assert second.parsed == {"answer": "ok"}
+    # demotion is sticky: no native attempt this time
+    assert len(completions.calls) == 3
+    assert "response_format" not in completions.calls[2]
+    # Once demoted, only one wire call happens -- no wasted usage to sum.
+    assert second.usage.input_tokens == 7 * 3
+    assert second.usage.output_tokens == 13 * 3
+
+
+def test_auto_mode_native_success_never_demotes():
+    calls: list[dict] = []
+
+    class Completions:
+        def create(self, **kwargs):
+            calls.append(kwargs)
+            msg = SimpleNamespace(content='{"answer": "ok"}', refusal=None, tool_calls=None)
+            return SimpleNamespace(
+                choices=[SimpleNamespace(message=msg, finish_reason="stop")], usage=None
+            )
+
+    client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+    model = OpenAICompatibleModel(
+        "m", base_url="http://x/v1", client=client, schema_mode="auto"
+    )
+    model.complete(_structured_request())
+    model.complete(_structured_request())
+    assert len(calls) == 2
+    assert all("response_format" in c for c in calls)
+
+
+def test_auto_mode_accepted_by_factory():
+    model = openai_compatible("http://x/v1", "m", schema_mode="auto")
+    assert isinstance(model, OpenAICompatibleModel)

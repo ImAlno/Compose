@@ -604,6 +604,27 @@ def test_delete_run_purges_every_associated_table(store):
     assert conn.execute("SELECT * FROM spans WHERE run_id = ?", ("r1",)).fetchall() == []
 
 
+def test_delete_run_purges_span_payloads(store):
+    span = _make_span(span_id="s-task8")
+    store.persist_span(span, "run-task8")
+    conn = store._connect()
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM span_payloads WHERE span_id = ?", ("s-task8",)
+        ).fetchone()[0]
+        == 1
+    )
+
+    store.delete_run("run-task8")
+
+    assert (
+        conn.execute(
+            "SELECT COUNT(*) FROM span_payloads WHERE span_id = ?", ("s-task8",)
+        ).fetchone()[0]
+        == 0
+    )
+
+
 # --- RunContext scope stack: deterministic keys under concurrent dispatch --
 
 

@@ -8,5 +8,5 @@ build/
 .pytest_cache/
 .ruff_cache/
 .superpowers/
-docs/
+plans/
 .env

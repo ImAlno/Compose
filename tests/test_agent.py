@@ -843,3 +843,36 @@ def test_no_repair_by_default():
     with pytest.raises(ComposeError):
         task6_default("go")
     assert len(model.requests) == 1
+
+
+def test_tool_timeout_surfaces_as_error_result():
+    import time as _time
+
+    from composeai import tool
+
+    @tool(timeout=0.2)
+    def stall(q: str) -> str:
+        """Stall forever.
+
+        Args:
+            q: ignored.
+        """
+        _time.sleep(10)
+        return "never"
+
+    model = FakeModel([
+        {"tool_calls": [{"name": "stall", "arguments": {"q": "x"}}]},
+        "done",
+    ])
+
+    @agent(model=model, tools=[stall])
+    def task4_staller(question: str) -> str:
+        return prompt(question)
+
+    assert task4_staller("go") == "done"
+    # the model saw the timeout as an error tool result, not a crash
+    tool_result_message = model.requests[1].messages[-1]
+    result_part = tool_result_message.parts[0]
+    assert isinstance(result_part, ToolResultPart)
+    assert result_part.is_error is True
+    assert "TaskTimeoutError" in result_part.content

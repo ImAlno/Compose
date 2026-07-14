@@ -15,18 +15,23 @@ unfinished tail actually runs, in the same process or a brand new one.
 
 Flow-body determinism is a documented contract, not an enforced one: the
 body must be a deterministic function of its journaled step results (side
-effects, randomness, and wall-clock reads belong inside ``@task`` calls,
-not the flow body itself) -- this module does nothing to detect a
-violation, it just won't replay correctly if the contract is broken.
+effects belong inside ``@task``/``@agent`` calls, not the flow body itself)
+-- this module does nothing to detect a violation, it just won't replay
+correctly if the contract is broken. Wall-clock reads and randomness are
+the two exceptions with dedicated journal-safe helpers: :func:`now` and
+:func:`random` may be called directly in a flow body (each call journals
+one value in flow-body order and replays it verbatim on resume); raw
+``datetime.now()``/``random.random()`` still belong inside ``@task``.
 """
 
 from __future__ import annotations
 
+import datetime
 import hashlib
 import inspect
 import json
+import random as _stdlib_random
 import textwrap
-import threading
 import time
 from collections.abc import Callable
 from typing import Any, overload
@@ -43,6 +48,7 @@ from .runs import (
     Run,
     RunContext,
     RunStream,
+    _run_with_timeout,
     apply_resume_answers,
     budget_scope,
     current_run_context,
@@ -56,68 +62,6 @@ from .runs import open_default as _open_default_store
 
 def _call_input_dict(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str, Any]:
     return {"args": list(args), "kwargs": kwargs}
-
-
-def _run_with_timeout(
-    fn: Callable[..., Any], args: tuple[Any, ...], kwargs: dict[str, Any], timeout: float, name: str
-) -> Any:
-    """Run ``fn(*args, **kwargs)`` on a dedicated daemon thread, bounded by ``timeout``.
-
-    Deliberately a raw daemon :class:`threading.Thread`, not a
-    ``concurrent.futures.ThreadPoolExecutor``: CPython registers an
-    ``atexit`` hook that joins every executor worker thread at interpreter
-    shutdown, which would hang the process forever waiting on a task
-    that's genuinely stuck (e.g. an infinite loop) -- exactly the case a
-    timeout exists to route around. A daemon thread carries none of that
-    baggage: on timeout this raises immediately and the abandoned thread
-    keeps running in the background (harvested only when it finishes on
-    its own, or the process exits).
-
-    That abandoned thread must not keep mutating the run's journal after
-    the caller has moved on (the run might already be marked "completed" by
-    then, if the caller caught ``TaskTimeoutError`` and continued -- or a
-    fresh ``resume()`` might later build an independent ``RunContext`` whose
-    zeroed-out counters can legitimately collide with the zombie's own).
-    So: if there's an ambient :class:`~composeai.runs.RunContext`, the
-    worker thread's *own copied context* (never the caller's) gets a guard
-    proxy installed in its place (see
-    :func:`~composeai.runs.abandon_guard`/:func:`~composeai.runs.use_journal_scope`)
-    with an ``abandoned`` event this function sets the instant it gives up
-    waiting -- any journal touch after that point raises internally inside
-    the worker and unwinds its stack at that point. Pure side effects
-    already in flight (a network call, a file write, ...) still run to
-    completion regardless -- there is no safe way to interrupt an arbitrary
-    Python thread; that part is inherent, not something this guard changes.
-    """
-    result: dict[str, Any] = {}
-    error: dict[str, BaseException] = {}
-    done = threading.Event()
-    abandoned = threading.Event()
-
-    def _worker() -> None:
-        ctx = current_run_context()
-        guarded = runs.abandon_guard(ctx, abandoned)
-        with runs.use_journal_scope(guarded):
-            try:
-                result["value"] = fn(*args, **kwargs)
-            except BaseException as exc:  # noqa: BLE001 -- forwarded to the caller thread below
-                error["exc"] = exc
-            finally:
-                done.set()
-
-    thread = threading.Thread(target=tracing.propagate(_worker), daemon=True)
-    thread.start()
-    if not done.wait(timeout=timeout):
-        abandoned.set()
-        raise TaskTimeoutError(
-            f"@task {name!r} exceeded timeout={timeout}s -- the abandoned thread keeps "
-            "running in the background as a daemon; its eventual result is discarded, "
-            "and it loses journal write access immediately (its pure side effects, if "
-            "any, still run to completion -- there is no safe way to stop that)"
-        )
-    if "exc" in error:
-        raise error["exc"]
-    return result["value"]
 
 
 _TASK_REGISTRY: dict[str, Task] = {}
@@ -255,6 +199,44 @@ def task(
     if fn is not None:
         return decorator(fn)
     return decorator
+
+
+def now() -> datetime.datetime:
+    """Journal-safe clock read for ``@flow`` bodies.
+
+    Inside an active flow, each call journals one timezone-aware UTC
+    timestamp in flow-body order (keys ``now#1``, ``now#2``, ...): the value
+    is drawn once and replays verbatim on every resume, so flow bodies may
+    branch on time without violating the determinism contract. Outside a
+    flow it is exactly ``datetime.now(timezone.utc)``.
+    """
+    ctx = current_run_context()
+    if ctx is None:
+        return datetime.datetime.now(datetime.timezone.utc)
+    key = ctx.next_key("now")
+    hit, value = ctx.journal_lookup(key)
+    if hit:
+        return value
+    return ctx.journal_record(key, datetime.datetime.now(datetime.timezone.utc))
+
+
+def random() -> float:
+    """Journal-safe uniform draw in ``[0, 1)`` for ``@flow`` bodies.
+
+    Same journaling contract as :func:`now`: one draw per call in flow-body
+    order, replayed verbatim on resume. Outside a flow it is exactly
+    ``random.random()``. Shadows the stdlib name inside composeai's own
+    namespace only -- ``compose.random()`` -- same deliberate choice as
+    ``compose.map``.
+    """
+    ctx = current_run_context()
+    if ctx is None:
+        return _stdlib_random.random()
+    key = ctx.next_key("random")
+    hit, value = ctx.journal_lookup(key)
+    if hit:
+        return value
+    return ctx.journal_record(key, _stdlib_random.random())
 
 
 # --- @flow --------------------------------------------------------------
@@ -645,4 +627,4 @@ def resume(
     )
 
 
-__all__ = ["Flow", "Task", "flow", "resume", "task"]
+__all__ = ["Flow", "Task", "flow", "now", "random", "resume", "task"]

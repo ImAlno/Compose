@@ -193,3 +193,56 @@ def test_cache_does_not_serve_across_different_providers_sharing_a_bare_model_id
     assert run_b.output == "from provider B"  # not served provider A's cached response
     assert len(fake_a.requests) == 1
     assert len(fake_b.requests) == 1  # provider B's model was actually called, not skipped
+
+
+def test_caching_model_last_was_hit_is_thread_local(tmp_path):
+    """Regression: `last_was_hit` used to be a single plain instance
+    attribute -- one thread's write could clobber another's between the
+    `complete()` call and the read, on a `CachingModel` shared across
+    threads (e.g. parallel `pipe.map`/`aggregate` branches on one agent's
+    model slot). It must now be thread-local: each thread observes only
+    its own most recent hit/miss, no matter how calls overlap.
+    """
+    import threading
+    import time
+
+    from composeai.messages import Message
+    from composeai.models.base import ModelRequest
+    from composeai.testing import CachingModel
+
+    def _slow_miss_response(request: ModelRequest) -> str:
+        # The miss thread's inner call is deliberately slow so its
+        # complete() call is still in flight, well after it has set its
+        # own (thread-local) flag to False, while the hit thread races
+        # ahead, finishes, and reads its own flag.
+        time.sleep(0.1)
+        return "miss response"
+
+    fake = FakeModel(["pre-warmed response", _slow_miss_response])
+    caching_model = CachingModel(fake, cache_dir=tmp_path / "cache")
+
+    hit_request = ModelRequest(model="m", messages=[Message.user("pre-warm me")])
+    miss_request = ModelRequest(model="m", messages=[Message.user("never cached")])
+
+    # Pre-warm: a real (miss) call so `hit_request` is on disk before the
+    # two threads below race each other.
+    caching_model.complete(hit_request)
+    assert caching_model.last_was_hit is False  # sanity: that call was a genuine miss
+
+    results: dict[str, bool] = {}
+    barrier = threading.Barrier(2)
+
+    def probe(name: str, request: ModelRequest) -> None:
+        barrier.wait()  # release both threads together so the calls overlap
+        caching_model.complete(request)
+        results[name] = caching_model.last_was_hit
+
+    t_miss = threading.Thread(target=probe, args=("miss_thread", miss_request))
+    t_hit = threading.Thread(target=probe, args=("hit_thread", hit_request))
+    t_miss.start()
+    t_hit.start()
+    t_hit.join()
+    t_miss.join()
+
+    assert results["hit_thread"] is True  # unaffected by the concurrent miss
+    assert results["miss_thread"] is False  # unaffected by the concurrent hit
