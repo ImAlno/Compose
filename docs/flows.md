@@ -240,6 +240,8 @@ result = outer_flow(5)   # 11
 
 Without this, resuming `outer_flow` would re-execute `sub_flow`'s entire body — and every `@task`/`@agent` call inside it, including paid LLM calls — from scratch on every attempt, even after it had already completed once. On a journal hit, `sub_flow`'s body never runs again at all; on a miss, it runs for real inside its own nested span (same trace, no new `run_id`) and its output is journaled as the outer flow's step value. A pause raised from inside `sub_flow`'s body isn't caught at the call site — it propagates up to whichever flow (outermost or otherwise) is actually running `resume()`/`.run()`, exactly like a pause inside a nested `@task` would.
 
+The same adoption applies to `pipe()`/`aggregate()` results: calling one directly (not `.run()`/`.stream()`) from inside a flow body joins the enclosing run the same way — one trace, usage rolled up, budgets enforced cumulatively, pauses resuming right through it. See [composition](composition.md#inside-a-flow) for the full contract, including the async-body caveat.
+
 ## Async: `arun()`, `aresume()`, `anow()`/`arandom()`
 
 `@flow` bodies may be `async def`: call other `@task`/`@agent`s through their own `.arun(...)` twin, read the journal-safe clock/random helpers as `anow()`/`arandom()` instead of `now()`/`random()`, and drive the whole flow via `await flow_obj.arun(...)` / `await aresume(run_id, ...)` — both run natively on your own event loop, never composeai's background runtime thread.

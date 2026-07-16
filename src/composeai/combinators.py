@@ -174,6 +174,109 @@ def _types_compatible(out_t: Any, in_t: Any) -> bool:
 # --- shared stage-invocation + top-level run assembly --------------------------
 
 
+async def _arun_pipeline_nested(stage: Pipeline, x: Any, *, streaming: bool = False) -> Any:
+    """Run ``stage`` (a :class:`Pipeline`) as a nested step of whatever
+    trace/run/journal is already ambient.
+
+    Opens the pipe's own ``pipe`` span nested under whatever span is
+    currently active and recurses straight into
+    :meth:`Pipeline._arun_stages` -- never through :func:`_run_top`/
+    :func:`_arun_top`, so no new ``run_id``/``trace_id`` is minted and no
+    ``runs`` row is created. This is the exact shape ``_ainvoke_stage``'s
+    ``Pipeline``-as-a-stage branch has always used (a pipe used as a stage
+    of an outer ``pipe()``/``aggregate()`` never had the cross-trace bug --
+    see the trace-linkage investigation); :meth:`Pipeline.__call__`, when
+    there's already an ambient span or run context, now shares this same
+    helper instead of always routing through ``.run()``/``_run_top``.
+    """
+    with tracing.span("pipe", stage._name):
+        return await stage._arun_stages(x, streaming=streaming)
+
+
+async def _arun_pipeline_nested_run(stage: Pipeline, x: Any, *, streaming: bool = False) -> Run:
+    """:class:`Run`-returning twin of :func:`_arun_pipeline_nested`, used by
+    :meth:`Pipeline.arun`/:meth:`Pipeline.astream`'s own nested-adoption
+    branch (v0.5.0 Plan A follow-up, closing finding I1).
+
+    Identical execution shape -- same ``pipe`` span, same recursion straight
+    into :meth:`Pipeline._arun_stages`, never through :func:`_arun_top` -- so
+    no new ``run_id``/``trace_id``/``runs`` row here either. The only reason
+    this isn't just ``_arun_pipeline_nested`` itself: ``.arun()``/``.astream()``
+    have to return a ``Run`` (their public contract, matched even on this
+    nested path -- see ``agentfn._arun_agent_journaled``'s identical
+    contract for a nested ``@agent`` call), so the span has to stay captured
+    (``as span``) to compute a step-scoped usage rollup, whereas
+    ``_arun_pipeline_nested``'s two callers (``_ainvoke_stage``'s
+    Pipeline-as-a-stage branch and :meth:`Pipeline.__call__`) only ever want
+    the raw output. ``usage=trace.rollup_usage(span)`` is scoped to just this
+    pipe's own subtree -- not the whole enclosing run -- mirroring
+    :func:`~composeai.flow._arun_flow_journaled`'s ``Run.usage`` contract for
+    a nested ``await inner.arun(...)`` flow call.
+    """
+    with tracing.span("pipe", stage._name) as span:
+        output = await stage._arun_stages(x, streaming=streaming)
+    trace = tracing.current_trace()
+    assert trace is not None  # we're inside an active span, so a trace exists
+    return Run(
+        id=new_ulid(),
+        status="completed",
+        output=output,
+        usage=trace.rollup_usage(span),
+        trace=trace,
+        messages=[],
+        pending=None,
+    )
+
+
+async def _arun_aggregate_nested(stage: Aggregate, x: Any, *, streaming: bool = False) -> Any:
+    """Run ``stage`` (an :class:`Aggregate`) as a nested step of whatever
+    trace/run/journal is already ambient.
+
+    Opens the aggregate's own ``aggregate`` span nested under whatever span
+    is currently active and recurses straight into
+    :meth:`Aggregate._arun_branches` -- never through :func:`_run_top`/
+    :func:`_arun_top`, so no new ``run_id``/``trace_id`` is minted and no
+    ``runs`` row is created. This is the exact shape ``_ainvoke_stage``'s
+    ``Aggregate``-as-a-stage branch has always used (an aggregate used as a
+    stage of an outer ``pipe()``/``aggregate()`` never had the cross-trace
+    bug -- see the trace-linkage investigation, and its "worse than pipe"
+    pin: called directly inside a ``@flow`` body, an ``aggregate()`` result
+    used to render ZERO children under the flow root at all);
+    :meth:`Aggregate.__call__`, when there's already an ambient span or run
+    context, now shares this same helper instead of always routing through
+    ``.run()``/``_run_top`` -- see :func:`_arun_pipeline_nested`'s docstring
+    for the parallel ``Pipeline`` fix (v0.5.0 Plan A, Task 1) this mirrors.
+    """
+    with tracing.span("aggregate", stage._name):
+        return await stage._arun_branches(x, streaming=streaming)
+
+
+async def _arun_aggregate_nested_run(
+    stage: Aggregate, x: Any, *, streaming: bool = False
+) -> Run:
+    """:class:`Run`-returning twin of :func:`_arun_aggregate_nested`, used by
+    :meth:`Aggregate.arun`/:meth:`Aggregate.astream`'s own nested-adoption
+    branch -- the ``Aggregate`` twin of :func:`_arun_pipeline_nested_run`
+    (v0.5.0 Plan A follow-up, closing finding I1); see that function's
+    docstring for the full rationale this mirrors exactly (span captured for
+    a step-scoped usage rollup, ``_arun_top`` never involved, no new
+    ``run_id``/``trace_id``/``runs`` row).
+    """
+    with tracing.span("aggregate", stage._name) as span:
+        output = await stage._arun_branches(x, streaming=streaming)
+    trace = tracing.current_trace()
+    assert trace is not None  # we're inside an active span, so a trace exists
+    return Run(
+        id=new_ulid(),
+        status="completed",
+        output=output,
+        usage=trace.rollup_usage(span),
+        trace=trace,
+        messages=[],
+        pending=None,
+    )
+
+
 async def _ainvoke_stage(
     stage: Stage,
     x: Any,
@@ -250,16 +353,14 @@ async def _ainvoke_stage(
     if isinstance(stage, Pipeline):
 
         async def _call() -> Any:
-            with tracing.span("pipe", stage._name):
-                return await stage._arun_stages(x, streaming=streaming)
+            return await _arun_pipeline_nested(stage, x, streaming=streaming)
 
         return await run_stage(_call, (), {}, timeout=timeout, name=tname, kind=timeout_kind)
 
     if isinstance(stage, Aggregate):
 
         async def _call() -> Any:
-            with tracing.span("aggregate", stage._name):
-                return await stage._arun_branches(x, streaming=streaming)
+            return await _arun_aggregate_nested(stage, x, streaming=streaming)
 
         return await run_stage(_call, (), {}, timeout=timeout, name=tname, kind=timeout_kind)
 
@@ -489,6 +590,69 @@ async def _arun_top(
     return result
 
 
+async def _arun_pipeline_on_callers_loop(
+    stage: Pipeline, x: Any, budget: Budget | None, *, streaming: bool = False
+) -> Run:
+    """Shared async core behind both :meth:`Pipeline.arun` and
+    :meth:`Pipeline.astream` -- mirrors
+    ``agentfn._arun_agent_on_callers_loop``'s identical relationship to
+    ``AgentFunction.arun``/``AgentFunction.astream`` (both funnel through
+    that one ctx-checking core; see its docstring) and, in turn,
+    :meth:`Pipeline.__call__`'s own ctx-check (v0.5.0 Plan A, Task 1).
+
+    Closes finding I1 (v0.5.0 Plan A final review): before this, ``arun``/
+    ``astream`` never checked for an ambient span/run context at all -- they
+    always routed through :func:`_arun_top` and minted an independent
+    ``runs`` row, even from inside an active ``@flow`` body, so
+    ``await the_pipe.arun(x)`` nested in an async flow leaked an unbudgeted
+    extra call past ``Budget``, undercounted the enclosing run's
+    ``.usage``, and left an orphan ``kind="pipe"`` row whose own trace
+    rendered header-only (empirically probed -- see the final-review
+    report). Now: an ambient span or run context routes to
+    :func:`_arun_pipeline_nested_run` (join as a nested step, no new
+    ``run_id``/``trace_id``); otherwise :func:`_arun_top` mints the genuine
+    top-level durable run, unchanged.
+
+    ``budget=...`` on the nested path raises :class:`~composeai.errors.ConfigError`
+    instead of silently doing nothing -- mirrors :meth:`~composeai.flow.Flow.arun`'s
+    identical nested budget guard (see its docstring): a nested step can't
+    take its own cap, the enclosing run's budget already governs every span
+    inside it.
+    """
+    if tracing.current_span() is not None or runs.current_run_context() is not None:
+        if budget is not None:
+            raise ConfigError(
+                f"pipe {stage._name!r}: budget= is not supported on a nested "
+                "arun()/astream() call (the enclosing run's budget governs); "
+                "set it on the outer run"
+            )
+        return await _arun_pipeline_nested_run(stage, x, streaming=streaming)
+    return await _arun_top(
+        "pipe", stage._name, budget, lambda: stage._arun_stages(x, streaming=streaming)
+    )
+
+
+async def _arun_aggregate_on_callers_loop(
+    stage: Aggregate, x: Any, budget: Budget | None, *, streaming: bool = False
+) -> Run:
+    """``Aggregate`` twin of :func:`_arun_pipeline_on_callers_loop` -- shared
+    async core behind both :meth:`Aggregate.arun` and
+    :meth:`Aggregate.astream`; see that function's docstring for the full
+    rationale (closing finding I1) this mirrors exactly.
+    """
+    if tracing.current_span() is not None or runs.current_run_context() is not None:
+        if budget is not None:
+            raise ConfigError(
+                f"aggregate {stage._name!r}: budget= is not supported on a nested "
+                "arun()/astream() call (the enclosing run's budget governs); "
+                "set it on the outer run"
+            )
+        return await _arun_aggregate_nested_run(stage, x, streaming=streaming)
+    return await _arun_top(
+        "aggregate", stage._name, budget, lambda: stage._arun_branches(x, streaming=streaming)
+    )
+
+
 # --- Pipeline -------------------------------------------------------------------
 
 
@@ -508,6 +672,25 @@ class Pipeline:
         self._name = "pipe(" + " → ".join(_stage_name(s) for s in stages) + ")"
 
     def __call__(self, x: Any) -> Any:
+        """Sugar for :meth:`run`'s output -- UNLESS a span or run context is
+        already ambient (a ``@flow``/``@task`` body, another ``@agent``
+        call, ...), in which case this joins that trace/run as a nested step
+        instead of minting an independent one (v0.5.0 Plan A, Task 1 -- see
+        :func:`_arun_pipeline_nested`'s docstring for the full contract and
+        the trace-linkage investigation this fixes). Bridges via
+        ``_runtime.run_sync`` the same way ``.run()``'s own sync facade
+        (:meth:`_run_stages`) does -- legal here because this is only ever
+        reached from a non-runtime thread (the caller's own thread, or a
+        sync ``@flow``/``@task`` body's dedicated worker thread -- never the
+        composeai runtime loop itself), exactly like every other nested
+        sync-facade call in this codebase (e.g. ``_run_flow_journaled``'s
+        identical ``_runtime.run_sync`` re-entry for a nested ``@flow``
+        call). The genuine trace-root case (no ambient span/context at all)
+        is untouched: still ``self.run(x).output``, byte-identical to
+        before.
+        """
+        if tracing.current_span() is not None or runs.current_run_context() is not None:
+            return _runtime.run_sync(_arun_pipeline_nested(self, x))
         return self.run(x).output
 
     def __rshift__(self, other: Any) -> Pipeline:
@@ -521,11 +704,19 @@ class Pipeline:
 
     async def arun(self, x: Any, budget: Budget | None = None) -> Run:
         """Async twin of :meth:`run` (v0.4.0 Plan B, Task 5) -- runs entirely
-        on the CALLER's own running event loop via :func:`_arun_top`, never
-        the composeai runtime loop."""
-        return await _arun_top(
-            "pipe", self._name, budget, lambda: self._arun_stages(x, streaming=False)
-        )
+        on the CALLER's own running event loop, never the composeai runtime
+        loop. Ctx-checks for an ambient span/run context exactly like
+        :meth:`__call__` does (v0.5.0 Plan A follow-up, finding I1): a
+        nested ``await inner.arun(x)`` from inside an active ``@flow``/
+        ``@task``/``@agent`` body joins that enclosing trace/run as a nested
+        step (:func:`_arun_pipeline_nested_run`) instead of always minting
+        an independent one via :func:`_arun_top` the way this used to,
+        unconditionally -- see :func:`_arun_pipeline_on_callers_loop`'s
+        docstring for the full contract, and
+        ``agentfn._arun_agent_on_callers_loop`` for the identical shape
+        ``AgentFunction.arun`` already had.
+        """
+        return await _arun_pipeline_on_callers_loop(self, x, budget, streaming=False)
 
     def stream(self, x: Any, budget: Budget | None = None) -> RunStream:
         return agentfn._stream_run(
@@ -538,11 +729,20 @@ class Pipeline:
         """Async twin of :meth:`stream` (v0.4.0 Plan B, Task 5) -- mirrors
         ``AgentFunction.astream``'s shape (:func:`~composeai.agentfn._astream_run`):
         a fresh, private bus, subscribed before the task is created, run as
-        an ``asyncio.Task`` on the caller's own loop."""
+        an ``asyncio.Task`` on the caller's own loop. Wraps
+        :func:`_arun_pipeline_on_callers_loop` -- the SAME ctx-checking core
+        :meth:`arun` uses (v0.5.0 Plan A follow-up, finding I1) -- so a
+        nested ``the_pipe.astream(x)`` inside an active flow/task/agent body
+        adopts the enclosing trace/run exactly like ``arun`` does, instead
+        of always minting an independent run the way this used to.
+        Confirmed empirically to mirror ``AgentFunction.astream``'s own
+        nested behavior (it already ctx-checks via the same
+        ``_arun_agent_on_callers_loop`` core its ``arun`` uses) -- i.e. this
+        was the one combinator entry point NOT already matching its
+        ``@agent`` counterpart.
+        """
         return agentfn._astream_run(
-            lambda: _arun_top(
-                "pipe", self._name, budget, lambda: self._arun_stages(x, streaming=True)
-            )
+            lambda: _arun_pipeline_on_callers_loop(self, x, budget, streaming=True)
         )
 
     def _run_stages(self, x: Any, *, streaming: bool) -> Any:
@@ -617,6 +817,21 @@ class Aggregate:
         self._name = "aggregate(" + ", ".join(self._branches.keys()) + ")"
 
     def __call__(self, x: Any) -> dict[str, Any]:
+        """Sugar for :meth:`run`'s output -- UNLESS a span or run context is
+        already ambient (a ``@flow``/``@task`` body, another ``@agent``
+        call, ...), in which case this joins that trace/run as a nested step
+        instead of minting an independent one (v0.5.0 Plan A, Task 2 -- the
+        ``Aggregate`` twin of Task 1's ``Pipeline.__call__`` fix; see
+        :func:`_arun_aggregate_nested`'s docstring for the full contract and
+        the trace-linkage investigation this fixes). Bridges via
+        ``_runtime.run_sync`` the same way ``.run()``'s own sync facade
+        (:meth:`_run_branches`) does -- legal here for the same reason as
+        ``Pipeline.__call__``: only ever reached from a non-runtime thread.
+        The genuine trace-root case (no ambient span/context at all) is
+        untouched: still ``self.run(x).output``, byte-identical to before.
+        """
+        if tracing.current_span() is not None or runs.current_run_context() is not None:
+            return _runtime.run_sync(_arun_aggregate_nested(self, x))
         return self.run(x).output
 
     def __rshift__(self, other: Any) -> Pipeline:
@@ -632,11 +847,18 @@ class Aggregate:
 
     async def arun(self, x: Any, budget: Budget | None = None) -> Run:
         """Async twin of :meth:`run` (v0.4.0 Plan B, Task 5) -- runs entirely
-        on the CALLER's own running event loop via :func:`_arun_top`, never
-        the composeai runtime loop."""
-        return await _arun_top(
-            "aggregate", self._name, budget, lambda: self._arun_branches(x, streaming=False)
-        )
+        on the CALLER's own running event loop, never the composeai runtime
+        loop. Ctx-checks for an ambient span/run context exactly like
+        :meth:`__call__` does (v0.5.0 Plan A follow-up, finding I1): a
+        nested ``await inner.arun(x)`` from inside an active ``@flow``/
+        ``@task``/``@agent`` body joins that enclosing trace/run as a nested
+        step (:func:`_arun_aggregate_nested_run`) instead of always minting
+        an independent one via :func:`_arun_top` the way this used to,
+        unconditionally -- see :func:`_arun_aggregate_on_callers_loop`'s
+        docstring (and :func:`_arun_pipeline_on_callers_loop`'s, which it
+        mirrors) for the full contract.
+        """
+        return await _arun_aggregate_on_callers_loop(self, x, budget, streaming=False)
 
     def stream(self, x: Any, budget: Budget | None = None) -> RunStream:
         return agentfn._stream_run(
@@ -649,11 +871,17 @@ class Aggregate:
         """Async twin of :meth:`stream` (v0.4.0 Plan B, Task 5) -- mirrors
         ``AgentFunction.astream``'s shape (:func:`~composeai.agentfn._astream_run`):
         a fresh, private bus, subscribed before the task is created, run as
-        an ``asyncio.Task`` on the caller's own loop."""
+        an ``asyncio.Task`` on the caller's own loop. Wraps
+        :func:`_arun_aggregate_on_callers_loop` -- the SAME ctx-checking
+        core :meth:`arun` uses (v0.5.0 Plan A follow-up, finding I1) -- so a
+        nested ``the_agg.astream(x)`` inside an active flow/task/agent body
+        adopts the enclosing trace/run exactly like ``arun`` does. See
+        :meth:`Pipeline.astream`'s docstring for the empirical confirmation
+        (against ``AgentFunction.astream``) that motivates mirroring this
+        shape rather than leaving it independent.
+        """
         return agentfn._astream_run(
-            lambda: _arun_top(
-                "aggregate", self._name, budget, lambda: self._arun_branches(x, streaming=True)
-            )
+            lambda: _arun_aggregate_on_callers_loop(self, x, budget, streaming=True)
         )
 
     def _run_branches(self, x: Any, *, streaming: bool) -> dict[str, Any]:
