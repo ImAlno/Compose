@@ -67,7 +67,7 @@ def test_provider_error_attrs_are_keyword_only():
 
 def test_provider_error_rejects_positional_attrs():
     with pytest.raises(TypeError):
-        ProviderError("boom", "anthropic", "claude-sonnet-5")  # type: ignore[misc]
+        ProviderError("boom", "anthropic", "claude-sonnet-5")  # pyright: ignore[reportCallIssue]
 
 
 def test_all_error_classes_have_docstrings():

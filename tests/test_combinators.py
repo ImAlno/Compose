@@ -126,10 +126,13 @@ def test_pipe_rejects_zero_or_one_stage():
     def f(x: str) -> str:
         return x
 
+    # The arity-2..9 overload ladder (v0.5.0 Plan B, Task 3) also rejects
+    # fewer than 2 stages statically -- no overload matches -- mirroring the
+    # runtime CompositionTypeError these lines exercise.
     with pytest.raises(CompositionTypeError):
-        pipe()
+        pipe()  # pyright: ignore[reportCallIssue]
     with pytest.raises(CompositionTypeError):
-        pipe(f)
+        pipe(f)  # pyright: ignore[reportCallIssue]
 
 
 def test_pipe_type_mismatch_raises_before_any_api_spend():
@@ -139,7 +142,7 @@ def test_pipe_type_mismatch_raises_before_any_api_spend():
     def researcher(topic: str) -> FactSheet:
         """Research."""
         calls.append("researcher")
-        return topic  # type: ignore[return-value]
+        return topic  # pyright: ignore[reportReturnType]
 
     @agent(model=FakeModel(["never used"]))
     def copywriter(summary: Summary) -> str:
@@ -148,7 +151,10 @@ def test_pipe_type_mismatch_raises_before_any_api_spend():
         return "go"
 
     with pytest.raises(CompositionTypeError) as exc_info:
-        pipe(researcher, copywriter)
+        # AgentFunction[P, R] is now precisely typed (v0.5.0 Plan B, Task 4), so
+        # pyright statically agrees with the runtime CompositionTypeError this
+        # test asserts: FactSheet (researcher out) isn't Summary (copywriter in).
+        pipe(researcher, copywriter)  # pyright: ignore[reportArgumentType]
 
     message = str(exc_info.value)
     assert "researcher" in message
@@ -167,7 +173,7 @@ def test_pipe_names_correct_stage_pair_in_a_three_stage_chain():
     @agent(model=FakeModel(["x"]))
     def b(x: str) -> FactSheet:
         """B."""
-        return x  # type: ignore[return-value]
+        return x  # pyright: ignore[reportReturnType]
 
     @agent(model=FakeModel(["x"]))
     def c(summary: Summary) -> str:
@@ -175,7 +181,9 @@ def test_pipe_names_correct_stage_pair_in_a_three_stage_chain():
         return "go"
 
     with pytest.raises(CompositionTypeError) as exc_info:
-        pipe(a, b, c)
+        # Static mismatch at stage 3 (b returns FactSheet, c expects Summary) --
+        # pyright now agrees with the runtime CompositionTypeError (Task 4).
+        pipe(a, b, c)  # pyright: ignore[reportArgumentType]
 
     message = str(exc_info.value)
     assert "stage 2" in message
@@ -188,7 +196,7 @@ def test_pipe_pydantic_chain_type_match_succeeds():
     @agent(model=FakeModel([{"json": {"facts": ["a"]}}]))
     def researcher(topic: str) -> FactSheet:
         """Research."""
-        return topic  # type: ignore[return-value]
+        return topic  # pyright: ignore[reportReturnType]
 
     @agent(model=FakeModel(["a summary"]))
     def copywriter(sheet: FactSheet) -> str:
@@ -242,9 +250,14 @@ def test_pipe_with_tool_stage_gets_real_composition_type_checking():
     p = pipe(to_upper, to_upper)
     assert p("hi") == "HI"
 
-    # str -> int is a real mismatch and must now be caught at build time.
+    # str -> int is a real mismatch and must now be caught at build time. The
+    # static ladder now agrees (v0.5.0 Plan B, Task 5 -- `@tool` is
+    # ParamSpec-typed, so `count_words` is `Tool[(n: int), int]`, a real
+    # `Stage[int, int]` that can't follow `to_upper`'s `str` output): the
+    # rule-scoped ignore pins that intended static rejection, mirroring
+    # `test_typing_inline.test_pipe_wrong_wiring_in_ladder_is_rejected`.
     with pytest.raises(CompositionTypeError) as exc_info:
-        pipe(to_upper, count_words)
+        pipe(to_upper, count_words)  # pyright: ignore[reportArgumentType]
     message = str(exc_info.value)
     assert "str" in message
     assert "int" in message
@@ -275,12 +288,12 @@ def test_pipeline_input_output_type_first_and_last_stage():
     @agent(model=FakeModel(["x"]))
     def a(x: str) -> FactSheet:
         """A."""
-        return x  # type: ignore[return-value]
+        return x  # pyright: ignore[reportReturnType]
 
     @agent(model=FakeModel([{"json": {"text": "s"}}]))
     def b(sheet: FactSheet) -> Summary:
         """B."""
-        return str(sheet)  # type: ignore[return-value]
+        return str(sheet)  # pyright: ignore[reportReturnType]
 
     pipeline = pipe(a, b)
     assert pipeline.input_type is str
@@ -323,7 +336,7 @@ def test_pipe_two_agents_chained_output_and_trace():
     @agent(model=FakeModel([{"json": {"facts": ["quantum supremacy"]}}]))
     def researcher(topic: str) -> FactSheet:
         """Research the topic."""
-        return topic  # type: ignore[return-value]
+        return topic  # pyright: ignore[reportReturnType]
 
     @agent(model=FakeModel(["A great blog post."]))
     def copywriter(sheet: FactSheet) -> str:
@@ -712,7 +725,9 @@ def test_map_collect_returns_per_item_results():
     assert results[0] == MapResult(ok=True, value=0)
     assert results[2].value == 4
     assert results[1].error_type == "ValueError"
-    assert "boom" in results[1].error
+    # `MapResult[int].error` is now typed `str | None` (Task 3 typed map's
+    # collect return) -- narrow before the membership test.
+    assert results[1].error is not None and "boom" in results[1].error
 
 
 def test_map_collect_captures_timeouts_too():
@@ -734,8 +749,12 @@ def test_map_collect_captures_timeouts_too():
 def test_map_invalid_on_error_rejected():
     from composeai.errors import ConfigError
 
+    # `on_error="ignore"` matches neither the `Literal["raise"]` nor the
+    # `Literal["collect"]` overload (Task 3), so it's a static no-overload
+    # match too -- the runtime ConfigError this asserts is the belt to that
+    # suspenders.
     with pytest.raises(ConfigError):
-        compose.map(lambda x: x, [1], on_error="ignore")
+        compose.map(lambda x: x, [1], on_error="ignore")  # pyright: ignore[reportCallIssue, reportArgumentType]
 
 
 def test_aggregate_timeout_per_branch_raises():
@@ -756,20 +775,26 @@ def test_aggregate_timeout_per_branch_raises():
 
 
 def test_aggregate_no_timeout_unchanged():
+    # Bare, unannotated lambda branches are idiomatic and runtime-legit;
+    # `aggregate`'s `Stage[AggIn, Any] | Callable[[Any], Any]` signature
+    # (finding I1) gives each lambda's parameter `Any` so `x + 1`/`x * 2`
+    # type-check cleanly (no `reportOperatorIssue`) -- the old `Stage[AggIn,
+    # Any]`-only signature fed the unsolved `AggIn` into the body and tripped
+    # a false positive. Runtime behavior is unchanged.
     agg = compose.aggregate(a=lambda x: x + 1, b=lambda x: x * 2)
     assert agg(3) == {"a": 4, "b": 6}
 
 
 def test_aggregate_rejects_positional_stage():
     with pytest.raises(TypeError):
-        compose.aggregate(lambda x: x)  # type: ignore[misc]  # positional args are not branches
+        compose.aggregate(lambda x: x)  # pyright: ignore[reportCallIssue]
 
 
 def test_aggregate_rejects_non_numeric_timeout():
     from composeai.errors import ConfigError
 
     with pytest.raises(ConfigError):
-        compose.aggregate(timeout_per_branch=lambda x: x, a=lambda x: x)  # type: ignore[arg-type]
+        compose.aggregate(timeout_per_branch=lambda x: x, a=lambda x: x)  # pyright: ignore[reportArgumentType]
 
 
 # --- >> composition sugar -------------------------------------------------------
@@ -816,7 +841,7 @@ def test_rshift_mismatched_types_raises_composition_type_error():
     @agent(model=FakeModel(["never used"]))
     def researcher(topic: str) -> FactSheet:
         """Research."""
-        return topic  # type: ignore[return-value]
+        return topic  # pyright: ignore[reportReturnType]
 
     @agent(model=FakeModel(["never used"]))
     def copywriter(summary: Summary) -> str:
@@ -824,7 +849,10 @@ def test_rshift_mismatched_types_raises_composition_type_error():
         return "go"
 
     with pytest.raises(CompositionTypeError):
-        _ = researcher >> copywriter
+        # Variant-A `>>` (Task 4): FactSheet (researcher out) isn't Summary
+        # (copywriter in), so no overload matches -- pyright reports the
+        # operator itself as unsupported, mirroring the runtime error.
+        _ = researcher >> copywriter  # pyright: ignore[reportOperatorIssue]
 
 
 def test_rshift_plain_function_on_left_hits_agent_rrshift():

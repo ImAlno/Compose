@@ -18,7 +18,7 @@ from __future__ import annotations
 import dataclasses
 import datetime
 import enum
-from typing import Any
+from typing import Any, TypeVar
 
 from pydantic import BaseModel
 
@@ -32,14 +32,22 @@ _VALUE = "value"
 # that some part of this process has already imported and registered.
 _REGISTRY: dict[str, type] = {}
 
+_C = TypeVar("_C", bound=type)
 
-def register_serializable(cls: type) -> type:
+
+def register_serializable(cls: _C) -> _C:
     """Register ``cls`` so :func:`from_jsonable` can rehydrate it by tag.
 
     Encoding a pydantic model, dataclass, or enum auto-registers its
     class. Call this explicitly in a process that decodes data it never
     encoded (e.g. a fresh journal reader started in a new process).
     Returns ``cls`` unchanged, so it can also be used as a decorator.
+
+    Typed ``_C bound=type`` (not plain ``type``) so decorating a
+    ``Generic`` dataclass (e.g. ``combinators.MapResult``) preserves its
+    subscriptability to static checkers -- a bare ``-> type`` return would
+    erase it to plain ``type``, making ``MapResult[int]`` a pyright error
+    even though ``Generic`` supplies ``__class_getitem__`` at runtime.
     """
     _REGISTRY[_type_tag(cls)] = cls
     return cls

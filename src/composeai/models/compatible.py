@@ -189,8 +189,8 @@ class OpenAICompatibleModel:
             # discovery (models/base.py), so it falls back to running the
             # injected client's sync complete()/stream() off-thread --
             # exactly the 0.3.x behavior an injected client bought you.
-            self.acomplete = None  # type: ignore[assignment]
-            self.astream = None  # type: ignore[assignment]
+            self.acomplete = None  # pyright: ignore[reportAttributeAccessIssue]
+            self.astream = None  # pyright: ignore[reportAttributeAccessIssue]
 
     def _get_client(self) -> Any:
         if self._client is not None:

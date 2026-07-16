@@ -137,7 +137,7 @@ class _AsyncStubClient:
 
 def _amodel(responses, model_id: str = "claude-sonnet-5") -> AnthropicModel:
     model = AnthropicModel(model_id)
-    model._async_client = _AsyncStubClient(responses)  # type: ignore[attr-defined]
+    model._async_client = _AsyncStubClient(responses)
     return model
 
 
@@ -232,7 +232,7 @@ class _AsyncStubMessageStream:
 
 def _amodel_stream(stream_responses, model_id: str = "claude-sonnet-5") -> AnthropicModel:
     model = AnthropicModel(model_id)
-    model._async_client = _AsyncStubClient([], stream_responses)  # type: ignore[attr-defined]
+    model._async_client = _AsyncStubClient([], stream_responses)
     return model
 
 
@@ -270,7 +270,7 @@ def test_system_omitted_when_none():
     model = _model([_response([_text_block("ok")])])
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")])
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert "system" not in call
 
 
@@ -281,7 +281,7 @@ def test_system_included_when_set():
         model="claude-sonnet-5", messages=[Message.user("hi")], system="be terse"
     )
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["system"] == "be terse"
 
 
@@ -289,7 +289,7 @@ def test_temperature_omitted_when_none():
     model = _model([_response([_text_block("ok")])])
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")])
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert "temperature" not in call
 
 
@@ -299,7 +299,7 @@ def test_temperature_passed_through_when_set_even_for_modern_models():
         model="claude-sonnet-5", messages=[Message.user("hi")], temperature=0.7
     )
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["temperature"] == 0.7
 
 
@@ -307,7 +307,7 @@ def test_max_tokens_passed_through():
     model = _model([_response([_text_block("ok")])])
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")], max_tokens=42)
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["max_tokens"] == 42
 
 
@@ -318,7 +318,7 @@ def test_text_part_maps_to_text_block():
     model = _model([_response([_text_block("ok")])])
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user("hello")])
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["messages"][0] == {"role": "user", "content": [{"type": "text", "text": "hello"}]}
 
 
@@ -327,7 +327,7 @@ def test_image_part_base64_maps_to_base64_source():
     image = ImagePart(media_type="image/png", data="YWJj")
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user([image])])
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     block = call["messages"][0]["content"][0]
     assert block == {
         "type": "image",
@@ -340,7 +340,7 @@ def test_image_part_url_maps_to_url_source():
     image = ImagePart(media_type="image/png", url="https://example.com/x.png")
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user([image])])
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     block = call["messages"][0]["content"][0]
     assert block == {
         "type": "image",
@@ -353,7 +353,7 @@ def test_tool_call_part_maps_to_tool_use_block():
     call_part = ToolCallPart(id="tc1", name="search", arguments={"q": "cats"})
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.assistant([call_part])])
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     block = call["messages"][0]["content"][0]
     assert block == {"type": "tool_use", "id": "tc1", "name": "search", "input": {"q": "cats"}}
 
@@ -363,7 +363,7 @@ def test_tool_result_part_maps_without_is_error_when_false():
     result = ToolResultPart(tool_call_id="tc1", content="42")
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user([result])])
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     block = call["messages"][0]["content"][0]
     assert block == {"type": "tool_result", "tool_use_id": "tc1", "content": "42"}
     assert "is_error" not in block
@@ -374,7 +374,7 @@ def test_tool_result_part_includes_is_error_when_true():
     result = ToolResultPart(tool_call_id="tc1", content="boom", is_error=True)
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user([result])])
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     block = call["messages"][0]["content"][0]
     assert block["is_error"] is True
 
@@ -414,7 +414,7 @@ def test_multiple_tool_results_in_one_message_stay_together():
         ],
     )
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert len(call["messages"]) == 1
     assert len(call["messages"][0]["content"]) == 2
 
@@ -434,7 +434,7 @@ def test_tools_mapped_with_strict_and_input_schema():
         model="claude-sonnet-5", messages=[Message.user("hi")], tools=[spec]
     )
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["tools"] == [
         {
             "name": "search",
@@ -449,7 +449,7 @@ def test_tools_omitted_when_none():
     model = _model([_response([_text_block("ok")])])
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")])
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert "tools" not in call
 
 
@@ -460,7 +460,7 @@ def test_output_schema_maps_to_output_config():
         model="claude-sonnet-5", messages=[Message.user("hi")], output_schema=schema
     )
     resp = model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["output_config"] == {"format": {"type": "json_schema", "schema": schema}}
     assert resp.parsed == {"a": 1}
 
@@ -476,7 +476,7 @@ def test_output_schema_can_coexist_with_tools():
         output_schema=schema,
     )
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert "tools" in call
     assert "output_config" in call
 
@@ -720,7 +720,7 @@ def test_thinking_part_echoed_verbatim_when_same_model():
         ],
     )
     model.complete(request2)
-    call2 = model._client.messages.calls[1]  # type: ignore[attr-defined]
+    call2 = model._client.messages.calls[1]  # pyright: ignore[reportAttributeAccessIssue]
     assistant_msg = call2["messages"][1]
     thinking_blocks = [b for b in assistant_msg["content"] if b["type"] == "thinking"]
     assert len(thinking_blocks) == 1
@@ -746,7 +746,7 @@ def test_thinking_part_dropped_when_different_model():
         ],
     )
     consumer.complete(request2)
-    call = consumer._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = consumer._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assistant_msg = call["messages"][1]
     thinking_blocks = [b for b in assistant_msg["content"] if b["type"] == "thinking"]
     assert thinking_blocks == []
@@ -760,7 +760,7 @@ def test_thinking_part_dropped_when_different_provider():
         messages=[Message.assistant([other_provider_part])],
     )
     model.complete(request)
-    call = model._client.messages.calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["messages"][0]["content"] == []
 
 
@@ -787,7 +787,7 @@ def test_thinking_part_with_missing_signature_omits_signature_key_when_echoed():
         ],
     )
     model.complete(request2)
-    call2 = model._client.messages.calls[1]  # type: ignore[attr-defined]
+    call2 = model._client.messages.calls[1]  # pyright: ignore[reportAttributeAccessIssue]
     assistant_msg = call2["messages"][1]
     thinking_blocks = [b for b in assistant_msg["content"] if b["type"] == "thinking"]
     assert len(thinking_blocks) == 1
@@ -821,7 +821,7 @@ def test_pause_turn_continues_and_returns_single_merged_response():
     )
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user("go")])
     resp = model.complete(request)
-    assert len(model._client.messages.calls) == 3  # type: ignore[attr-defined]
+    assert len(model._client.messages.calls) == 3  # pyright: ignore[reportAttributeAccessIssue]
     assert resp.stop_reason == StopReason.END_TURN
     assert resp.raw_stop_reason == "end_turn"
     assert resp.message.text == "part onepart twopart three"
@@ -850,7 +850,7 @@ def test_pause_turn_exceeding_limit_raises_provider_error():
     request = ModelRequest(model="claude-sonnet-5", messages=[Message.user("go")])
     with pytest.raises(ProviderError):
         model.complete(request)
-    assert len(model._client.messages.calls) == 6  # type: ignore[attr-defined]
+    assert len(model._client.messages.calls) == 6  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_pause_turn_never_surfaces_as_a_stop_reason():
@@ -1029,7 +1029,7 @@ def test_stream_records_request_shape_via_stub_calls():
         model="claude-sonnet-5", messages=[Message.user("hi")], system="be terse"
     )
     list(model.stream(request))
-    call = model._client.messages.stream_calls[0]  # type: ignore[attr-defined]
+    call = model._client.messages.stream_calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["system"] == "be terse"
     assert call["model"] == "claude-sonnet-5"
 
@@ -1064,7 +1064,7 @@ def test_stream_pause_turn_continuation_yields_deltas_across_calls_and_merges_re
     assert done.response is not None
     assert done.response.message.text == "part onepart two"
     assert done.response.stop_reason == StopReason.END_TURN
-    assert len(model._client.messages.stream_calls) == 2  # type: ignore[attr-defined]
+    assert len(model._client.messages.stream_calls) == 2  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_stream_pause_turn_exceeding_limit_raises_provider_error():
@@ -1400,4 +1400,4 @@ def test_injected_sync_client_used_by_async_engine():
 
     assert run.output == "Hello there."
     assert run.status == "completed"
-    assert len(model._client.messages.calls) == 1  # type: ignore[attr-defined]
+    assert len(model._client.messages.calls) == 1

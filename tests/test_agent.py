@@ -247,7 +247,7 @@ def test_structured_output_via_json_dict():
     @agent(model=model, max_turns=3)
     def researcher(topic: str) -> FactSheet:
         """Researcher."""
-        return topic  # type: ignore[return-value]
+        return topic  # pyright: ignore[reportReturnType]
 
     run = researcher.run("x")
     assert run.output == FactSheet(core_discoveries=["a", "b"])
@@ -259,7 +259,7 @@ def test_structured_output_wrapped_list_str():
     @agent(model=model, max_turns=3)
     def lister(topic: str) -> list[str]:
         """Lister."""
-        return topic  # type: ignore[return-value]
+        return topic  # pyright: ignore[reportReturnType]
 
     run = lister.run("x")
     assert run.output == ["a", "b", "c"]
@@ -274,7 +274,7 @@ def test_structured_output_parsed_fallback_via_json_text():
     @agent(model=model, max_turns=3)
     def runner() -> Out:
         """Runner."""
-        return "go"  # type: ignore[return-value]
+        return "go"  # pyright: ignore[reportReturnType]
 
     run = runner.run()
     assert run.output == Out(x=1)
@@ -289,7 +289,7 @@ def test_no_structured_payload_raises_compose_error():
     @agent(model=model, max_turns=3)
     def runner() -> Out:
         """Runner."""
-        return "go"  # type: ignore[return-value]
+        return "go"  # pyright: ignore[reportReturnType]
 
     with pytest.raises(ComposeError, match="structured payload"):
         runner.run()
@@ -303,7 +303,7 @@ def test_dict_str_float_output_schema_keeps_value_type_not_collapsed_to_empty_ob
     @agent(model=FakeModel(["placeholder"]), max_turns=3)
     def counts_agent(text: str) -> dict[str, float]:
         """Counts agent."""
-        return text  # type: ignore[return-value]
+        return text  # pyright: ignore[reportReturnType]
 
     schema = counts_agent._output_schema
     assert schema is not None
@@ -315,7 +315,7 @@ def test_dict_str_float_output_schema_keeps_value_type_not_collapsed_to_empty_ob
     @agent(model=model, max_turns=3)
     def counts_agent2(text: str) -> dict[str, float]:
         """Counts agent."""
-        return text  # type: ignore[return-value]
+        return text  # pyright: ignore[reportReturnType]
 
     run = counts_agent2.run("x")
     assert run.output == {"a": 1.5, "b": 2.5}
@@ -663,7 +663,7 @@ def test_body_list_of_messages_used_verbatim():
     @agent(model=model, max_turns=3)
     def runner() -> str:
         """System prompt."""
-        return conversation  # type: ignore[return-value]
+        return conversation  # pyright: ignore[reportReturnType]
 
     run = runner.run()
     assert model.requests[0].messages[: len(conversation)] == conversation
@@ -676,7 +676,7 @@ def test_body_return_type_other_than_str_or_message_list_raises_config_error():
     @agent(model=model, max_turns=3)
     def runner() -> str:
         """Runner."""
-        return 12345  # type: ignore[return-value]
+        return 12345  # pyright: ignore[reportReturnType]
 
     with pytest.raises(ConfigError):
         runner.run()
@@ -713,7 +713,7 @@ def test_name_and_output_type_introspection():
     @agent(model=model, max_turns=3)
     def my_agent(topic: str) -> Out:
         """System."""
-        return topic  # type: ignore[return-value]
+        return topic  # pyright: ignore[reportReturnType]
 
     assert my_agent.name == "my_agent"
     assert my_agent.output_type is Out

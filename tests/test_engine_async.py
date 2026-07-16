@@ -537,6 +537,10 @@ def test_async_def_map_stage_inside_flow_journals_by_input_order():
 
     @flow(name="t9_async_map_flow")
     def run_map() -> list[int]:
+        # map()'s async-stage overload (`fn: Callable[[A], Awaitable[B]] ->
+        # list[B]`, finding I2) unwraps the coroutine so an `async def` stage's
+        # B is its awaited `int`, giving `list[int]` statically -- matching what
+        # map() collects at runtime, so no cast/ignore is needed here.
         return compose_map(double_then_record, [0, 1, 2, 3])
 
     run = run_map.run()

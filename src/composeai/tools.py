@@ -16,9 +16,10 @@ import inspect
 import json
 import re
 from collections.abc import Callable
-from typing import Any, overload
+from typing import Any, Generic, overload
 
 from pydantic import BaseModel, ConfigDict, create_model
+from typing_extensions import ParamSpec, TypeVar
 
 from ._encoding import to_jsonable
 from ._schema import resolve_annotations, seal_schema
@@ -29,8 +30,23 @@ _ARG_LINE_RE = re.compile(
     r"^(?P<indent>[ \t]+)(?P<name>[A-Za-z_][A-Za-z0-9_]*)\s*:\s*(?P<desc>.*)$"
 )
 
+# --- typing: `Tool[P, R]` generics (v0.5.0 Plan B, Task 5) --------------------
+#
+# `P`/`R` carry PEP 696 defaults (via `typing_extensions`, same convention as
+# `AgentFunction[P, R]` -- Task 4) so a *bare* `Tool` annotation means
+# `Tool[..., Any]` rather than tripping `reportMissingTypeArgument` under strict
+# pyright. `P` captures the decorated function's whole parameter list (names
+# included, so a keyword call `search(query=...)` type-checks) and `R` its
+# return type -- both seen only by `Tool.__call__` (a plain passthrough to the
+# wrapped fn). The model-facing marshaling path (`.execute`/`.aexecute`, driven
+# from model-supplied JSON, not a Python call site) stays deliberately loose
+# (`dict[str, Any] -> str`), and an executor-backed (remote/MCP) tool -- which
+# has no local `fn` at all -- simply infers the `[..., Any]` default.
+P = ParamSpec("P", default=...)
+R = TypeVar("R", default=Any)
 
-class Tool:
+
+class Tool(Generic[P, R]):
     """The callable produced by ``@tool``.
 
     Still plainly callable as the original function (``tool_obj(...)``
@@ -42,7 +58,7 @@ class Tool:
 
     def __init__(
         self,
-        fn: Callable[..., Any] | None = None,
+        fn: Callable[P, R] | None = None,
         spec: ToolSpec | None = None,
         param_model: type[BaseModel] | None = None,
         *,
@@ -58,7 +74,14 @@ class Tool:
             )
         if fn is not None and param_model is None:
             raise ConfigError("Tool with fn= also requires param_model=")
-        self.fn = fn
+        # Stored deliberately loose (`Callable[..., Any] | None`, widened from the
+        # `Callable[P, R]` __init__ param that binds the class's `P`/`R`): the
+        # model-facing marshaling path (`.execute`/`.aexecute`) calls `self.fn`
+        # with dynamically-built `**kwargs`, which a `Callable[P, R]` would reject
+        # (`ParamSpec "P" arguments are missing`). `__call__` stays fully typed --
+        # its `P.args`/`P.kwargs`/`-> R` come from the class generic, not from
+        # reading this attribute -- so callers still get a precisely-typed call.
+        self.fn: Callable[..., Any] | None = fn
         self.spec = spec
         self._param_model = param_model
         self._executor = executor
@@ -74,7 +97,7 @@ class Tool:
             self.input_type, self.output_type = Any, str
         self.timeout = timeout
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         if self.fn is None:
             raise ConfigError(
                 f"tool {self.spec.name!r} is not a local function (it executes on a "
@@ -152,7 +175,7 @@ class Tool:
 
 
 @overload
-def tool(fn: Callable[..., Any]) -> Tool: ...
+def tool(fn: Callable[P, R], /) -> Tool[P, R]: ...
 
 
 @overload
@@ -162,7 +185,7 @@ def tool(
     description: str | None = None,
     requires_approval: bool = False,
     timeout: float | None = None,
-) -> Callable[[Callable[..., Any]], Tool]: ...
+) -> Callable[[Callable[P, R]], Tool[P, R]]: ...
 
 
 def tool(
@@ -172,11 +195,16 @@ def tool(
     description: str | None = None,
     requires_approval: bool = False,
     timeout: float | None = None,
-) -> Tool | Callable[[Callable[..., Any]], Tool]:
+) -> Any:
     """Decorate a plain, typed function into a model-callable :class:`Tool`.
 
     Usable bare (``@tool``) or with arguments (``@tool(name=..., description=...,
-    requires_approval=...)``). The function's docstring supplies the tool's
+    requires_approval=...)``) -- the two-overload dual form (v0.5.0 Plan B,
+    Task 5) mirrors ``@agent``/``@flow``/``@task``: the bare form infers
+    ``Tool[P, R]`` straight from the decorated function's own signature (``P``
+    its parameters -- names included, so a keyword call type-checks -- and
+    ``R`` its return type), so ``tool_obj(...)`` is fully typed. The function's
+    docstring supplies the tool's
     description and, via a Google-style ``Args:`` section, per-parameter
     descriptions merged into the generated JSON Schema -- unless overridden
     by an explicit ``description=``.
@@ -308,7 +336,7 @@ def _build_param_model(fn: Callable[..., Any], tool_name: str) -> type[BaseModel
     # loop's existing `except Exception` handling in `_aexecute_one_tool`
     # already turns it into an `is_error` tool result, same as any other
     # validation failure.
-    return create_model(  # type: ignore[call-overload, no-any-return]
+    return create_model(
         model_name, __config__=ConfigDict(extra="forbid"), **fields
     )
 

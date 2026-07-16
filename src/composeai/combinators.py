@@ -25,9 +25,11 @@ import inspect
 import time
 import types
 import typing
-from collections.abc import Callable, Coroutine, Sequence
+from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generic, Literal, Protocol, overload
+
+from typing_extensions import TypeVar
 
 from . import _runtime, agentfn, runs, tracing
 from ._dispatch import gather_settled, run_stage
@@ -40,10 +42,77 @@ from .errors import CompositionTypeError, ConfigError
 from .runs import AsyncRunStream, Budget, Run, RunStream, budget_scope
 from .tools import Tool
 
-Stage = Any
-"""Anything usable as a pipe/aggregate/map stage: an :class:`~composeai.agentfn.AgentFunction`,
-a :class:`Pipeline`, an :class:`Aggregate`, or a plain callable taking one
-positional argument."""
+# `In`/`Out` carry PEP 696 `default=Any` (via `typing_extensions`, same as
+# `runs.R` -- v0.5.0 Plan B, Task 1) so a bare `Stage`/`Pipeline`/`Aggregate`
+# annotation still means `Stage[Any, Any]`/`Pipeline[Any, Any]`/
+# `Aggregate[Any]` rather than tripping `reportMissingTypeArgument` if strict
+# pyright is ever turned on. They are intentionally the SAME TypeVar objects
+# reused across `Stage`'s `Protocol[In, Out]` base and `Pipeline`'s
+# `Generic[In, Out]` base below (and `Aggregate`'s `Generic[In]`) -- not a
+# naming coincidence: `In` only ever appears in an input (parameter) position
+# and `Out` only ever in an output (return) position across all three types,
+# so the same contravariant/covariant variance is correct for all of them,
+# exactly mirroring `Callable[[In], Out]`'s own variance.
+In = TypeVar("In", contravariant=True, default=Any)
+Out = TypeVar("Out", covariant=True, default=Any)
+# Method-scoped: only ever solved from a `__rshift__`/`__rrshift__` call's own
+# argument, never left bare in an annotation -- no `default=` needed here.
+NewOut = TypeVar("NewOut")
+NewIn = TypeVar("NewIn")
+
+# `pipe()`'s overload-ladder typevars (v0.5.0 Plan B, Task 3): plain and
+# invariant (no variance, no `default=`) -- each is solved from a concrete
+# stage callable at the call site, never left bare. One per rung boundary:
+# stage k is `Stage[<k>, <k+1>]`, so the arity-9 ladder threads A -> B -> ...
+# -> K across nine stages and returns `Pipeline[A, K]`. `I`/`O`/`l` are
+# skipped (ruff E741 ambiguous-name). `A`/`B` are reused by `map`/`amap`'s own
+# `fn: Stage[A, B]` / `items: Sequence[A]` overloads further down.
+A = TypeVar("A")
+B = TypeVar("B")
+C = TypeVar("C")
+D = TypeVar("D")
+E = TypeVar("E")
+F = TypeVar("F")
+G = TypeVar("G")
+H = TypeVar("H")
+J = TypeVar("J")
+K = TypeVar("K")
+# `aggregate()`'s common-branch-input typevar (Task 3): solved from every
+# typed `**branches` value through the `Stage[AggIn, Any]` arm of its
+# parameter union -- see `aggregate`'s own docstring for the full contract,
+# including why the `| Callable[[Any], Any]` escape-hatch arm (finding I1) is
+# what keeps a bare, unannotated lambda branch's body clean (its parameter
+# gets `Any`, not the still-unsolved `AggIn`). `default=Any` (same convention
+# as `In`/`Out`/`runs.R`/`T_mr`) makes the all-bare-lambda case -- nothing to
+# solve `AggIn` from -- fall back to `Aggregate[Any]` rather than
+# `Aggregate[Unknown]`.
+AggIn = TypeVar("AggIn", default=Any)
+
+
+class Stage(Protocol[In, Out]):
+    """Anything usable as a pipe/aggregate/map stage: an :class:`~composeai.agentfn.AgentFunction`,
+    a :class:`Pipeline`, an :class:`Aggregate`, or a plain callable taking one
+    positional argument.
+
+    A structural :class:`~typing.Protocol` -- replaces the old ``Stage = Any``
+    runtime alias in every annotation below (v0.5.0 Plan B, Task 2). It is
+    never referenced at runtime anywhere in this module -- no
+    ``isinstance(x, Stage)``, no ``Stage(...)`` construction; the isinstance
+    cluster a few lines down dispatches by concrete type
+    (``AgentFunction``/``Pipeline``/``Aggregate``/``Tool``) instead, and
+    ``never isinstance() against a subscripted generic`` applies there, not
+    here -- so there was no runtime alias to preserve. Every site that used
+    to read ``stage: Stage`` keeps reading ``stage: Stage``, now resolving to
+    this ``Protocol`` (bare, i.e. ``Stage[Any, Any]``) instead of ``Any``.
+
+    The ``/`` in ``__call__`` is load-bearing: without it, the protocol would
+    require the matching callable's parameter to be literally named ``x``
+    (pyright: "Parameter name mismatch"), and almost nothing would
+    structurally match -- see
+    ``plans/superpowers/research/2026-07-16-typing/prototype/proto.py``.
+    """
+
+    def __call__(self, x: In, /) -> Out: ...
 
 
 # --- >> composition sugar --------------------------------------------------------
@@ -59,6 +128,18 @@ def _rshift_pipe(left: Any, right: Any) -> Pipeline:
     itself, so ``(a >> b) >> c`` and ``a >> (b >> c)`` both build a
     ``Pipeline`` whose ``_stages`` is ``(a, b, c)``, not a ``Pipeline``
     nested inside a ``Pipeline``.
+
+    Stays fully ``Any``-erased (the bare ``Pipeline`` return annotation means
+    ``Pipeline[Any, Any]`` under the ``default=Any`` TypeVars above,
+    v0.5.0 Plan B, Task 2) -- it is the single runtime body behind FOUR
+    differently-parameterized call sites (``Pipeline``/``Aggregate`` ×
+    ``__rshift__``/``__rrshift__``), each of which already carries its own
+    precise ``Stage[...] -> Pipeline[...]`` generic signature. A
+    ``Pipeline[Any, Any]`` return is freely assignable to any of those
+    (``Any`` type arguments bypass pyright's generic-argument invariance),
+    so nothing is lost by leaving this shared helper itself untyped --
+    ``pipe()`` itself stays untyped this task too (its overload ladder is
+    v0.5.0 Plan B, Task 3).
     """
 
     def _flat(stage: Any) -> tuple[Any, ...]:
@@ -68,6 +149,15 @@ def _rshift_pipe(left: Any, right: Any) -> Pipeline:
 
 
 # --- type introspection --------------------------------------------------------
+
+# NOTE: never isinstance() against a subscripted generic (Pipeline[X]) --
+# TypeError at runtime. Every isinstance() below (and in _ainvoke_stage
+# further down) checks against the bare runtime classes (AgentFunction,
+# Pipeline, Aggregate, Tool) -- Pipeline/Aggregate becoming Generic[...]
+# (v0.5.0 Plan B, Task 2) doesn't change that: `isinstance(x, Pipeline)`
+# stays legal (Generic supplies plain __class_getitem__, the runtime class
+# itself is still unparameterized), but `isinstance(x, Pipeline[str, int])`
+# would raise immediately -- never write the latter.
 
 
 def _plain_callable_types(fn: Callable[..., Any]) -> tuple[Any, Any]:
@@ -193,7 +283,9 @@ async def _arun_pipeline_nested(stage: Pipeline, x: Any, *, streaming: bool = Fa
         return await stage._arun_stages(x, streaming=streaming)
 
 
-async def _arun_pipeline_nested_run(stage: Pipeline, x: Any, *, streaming: bool = False) -> Run:
+async def _arun_pipeline_nested_run(
+    stage: Pipeline, x: Any, *, streaming: bool = False
+) -> Run[Any]:
     """:class:`Run`-returning twin of :func:`_arun_pipeline_nested`, used by
     :meth:`Pipeline.arun`/:meth:`Pipeline.astream`'s own nested-adoption
     branch (v0.5.0 Plan A follow-up, closing finding I1).
@@ -253,7 +345,7 @@ async def _arun_aggregate_nested(stage: Aggregate, x: Any, *, streaming: bool = 
 
 async def _arun_aggregate_nested_run(
     stage: Aggregate, x: Any, *, streaming: bool = False
-) -> Run:
+) -> Run[Any]:
     """:class:`Run`-returning twin of :func:`_arun_aggregate_nested`, used by
     :meth:`Aggregate.arun`/:meth:`Aggregate.astream`'s own nested-adoption
     branch -- the ``Aggregate`` twin of :func:`_arun_pipeline_nested_run`
@@ -373,7 +465,7 @@ async def _ainvoke_stage(
 
 def _run_top(
     kind: tracing.SpanKind, name: str, budget: Budget | None, run_body: Callable[[], Any]
-) -> Run:
+) -> Run[Any]:
     """Wrap a top-level ``pipe``/``aggregate`` ``.run()``/``.stream()`` call with a durable run row.
 
     Regression fix (build-ledger item, Phase 9): a trace-root
@@ -426,7 +518,7 @@ def _run_top(
         args_json=None,
     )
 
-    def _thunk() -> Run:
+    def _thunk() -> Run[Any]:
         root_span: tracing.Span | None = None
         try:
             with tracing.span(kind, name) as root_span:
@@ -490,7 +582,7 @@ async def _arun_top(
     name: str,
     budget: Budget | None,
     run_body: Callable[[], Coroutine[Any, Any, Any]],
-) -> Run:
+) -> Run[Any]:
     """Async twin of :func:`_run_top` (v0.4.0 Plan B, Task 5) -- see its
     docstring for the full contract (durable row, budget scope, terminal
     ``run_finished``, and the paused-bare-pipe/aggregate ``ConfigError``
@@ -537,7 +629,7 @@ async def _arun_top(
         args_json=None,
     )
 
-    async def _thunk() -> Run:
+    async def _thunk() -> Run[Any]:
         root_span: tracing.Span | None = None
         try:
             with tracing.span(kind, name) as root_span:
@@ -592,7 +684,7 @@ async def _arun_top(
 
 async def _arun_pipeline_on_callers_loop(
     stage: Pipeline, x: Any, budget: Budget | None, *, streaming: bool = False
-) -> Run:
+) -> Run[Any]:
     """Shared async core behind both :meth:`Pipeline.arun` and
     :meth:`Pipeline.astream` -- mirrors
     ``agentfn._arun_agent_on_callers_loop``'s identical relationship to
@@ -634,7 +726,7 @@ async def _arun_pipeline_on_callers_loop(
 
 async def _arun_aggregate_on_callers_loop(
     stage: Aggregate, x: Any, budget: Budget | None, *, streaming: bool = False
-) -> Run:
+) -> Run[Any]:
     """``Aggregate`` twin of :func:`_arun_pipeline_on_callers_loop` -- shared
     async core behind both :meth:`Aggregate.arun` and
     :meth:`Aggregate.astream`; see that function's docstring for the full
@@ -656,13 +748,25 @@ async def _arun_aggregate_on_callers_loop(
 # --- Pipeline -------------------------------------------------------------------
 
 
-class Pipeline:
+class Pipeline(Generic[In, Out]):
     """The callable object produced by :func:`pipe`.
 
     ``pipeline(x)`` is sugar for ``pipeline.run(x).output``. ``.input_type``/
     ``.output_type`` are the first stage's input and the last stage's
     output -- so a ``Pipeline`` can itself be a stage of an outer ``pipe()``
     or a branch of an ``aggregate()``, and still be type-checked correctly.
+
+    ``Generic[In, Out]`` (v0.5.0 Plan B, Task 2) is erasure-only, same as
+    :class:`~composeai.runs.Run`'s ``Generic[R]`` (Task 1): ``__init__``
+    itself stays ``Any``-typed (it builds ``.input_type``/``.output_type`` by
+    runtime introspection, same as always), so constructing a ``Pipeline``
+    directly -- or via the still-untyped :func:`pipe` -- infers bare
+    ``Pipeline[Any, Any]`` (the ``default=Any`` TypeVars' fallback); only an
+    explicit ``Pipeline[X, Y]`` annotation, or chaining onward with ``>>``
+    (whose ``NewOut``/``NewIn`` genuinely get solved from the other operand),
+    narrows it further. :func:`pipe`'s own overload ladder -- which infers
+    ``In``/``Out`` from the actual stage callables -- is v0.5.0 Plan B,
+    Task 3.
     """
 
     def __init__(self, stages: tuple[Stage, ...]) -> None:
@@ -671,7 +775,7 @@ class Pipeline:
         self.output_type: Any = _stage_output_type(stages[-1])
         self._name = "pipe(" + " → ".join(_stage_name(s) for s in stages) + ")"
 
-    def __call__(self, x: Any) -> Any:
+    def __call__(self, x: In) -> Out:
         """Sugar for :meth:`run`'s output -- UNLESS a span or run context is
         already ambient (a ``@flow``/``@task`` body, another ``@agent``
         call, ...), in which case this joins that trace/run as a nested step
@@ -693,16 +797,16 @@ class Pipeline:
             return _runtime.run_sync(_arun_pipeline_nested(self, x))
         return self.run(x).output
 
-    def __rshift__(self, other: Any) -> Pipeline:
+    def __rshift__(self, other: Stage[Out, NewOut]) -> Pipeline[In, NewOut]:
         return _rshift_pipe(self, other)
 
-    def __rrshift__(self, other: Any) -> Pipeline:
+    def __rrshift__(self, other: Stage[NewIn, In]) -> Pipeline[NewIn, Out]:
         return _rshift_pipe(other, self)
 
-    def run(self, x: Any, budget: Budget | None = None) -> Run:
+    def run(self, x: In, budget: Budget | None = None) -> Run[Out]:
         return _run_top("pipe", self._name, budget, lambda: self._run_stages(x, streaming=False))
 
-    async def arun(self, x: Any, budget: Budget | None = None) -> Run:
+    async def arun(self, x: In, budget: Budget | None = None) -> Run[Out]:
         """Async twin of :meth:`run` (v0.4.0 Plan B, Task 5) -- runs entirely
         on the CALLER's own running event loop, never the composeai runtime
         loop. Ctx-checks for an ambient span/run context exactly like
@@ -718,14 +822,14 @@ class Pipeline:
         """
         return await _arun_pipeline_on_callers_loop(self, x, budget, streaming=False)
 
-    def stream(self, x: Any, budget: Budget | None = None) -> RunStream:
+    def stream(self, x: In, budget: Budget | None = None) -> RunStream[Out]:
         return agentfn._stream_run(
             lambda: _run_top(
                 "pipe", self._name, budget, lambda: self._run_stages(x, streaming=True)
             )
         )
 
-    def astream(self, x: Any, budget: Budget | None = None) -> AsyncRunStream:
+    def astream(self, x: In, budget: Budget | None = None) -> AsyncRunStream[Out]:
         """Async twin of :meth:`stream` (v0.4.0 Plan B, Task 5) -- mirrors
         ``AgentFunction.astream``'s shape (:func:`~composeai.agentfn._astream_run`):
         a fresh, private bus, subscribed before the task is created, run as
@@ -766,6 +870,79 @@ class Pipeline:
         return current
 
 
+# --- pipe() overload ladder (v0.5.0 Plan B, Task 3) ---------------------------
+#
+# Eight overloads, arities 2..9, each returning a fully-typed
+# ``Pipeline[A, <last>]`` inferred from the actual stage callables. There is
+# deliberately NO ``Any`` fallback overload: a 10-or-more-stage ``pipe()`` call
+# is a STATIC no-matching-overload error (pyright ``reportCallIssue``) by
+# design -- the runtime ``*stages`` implementation below still accepts any
+# count, and docs (Plan C) point longer chains at ``>>`` (which types
+# end-to-end at any length). EVERY overload's params are positional-only
+# (trailing ``/``) to stay consistent with the ``*stages`` implementation --
+# without it pyright reports ``reportInconsistentOverload`` against the impl
+# (see prototype/proto.py). Wrong wiring inside the ladder (stage k's output
+# not assignable to stage k+1's input) is a ``reportArgumentType`` at the
+# offending stage, mirroring the ``CompositionTypeError`` the body raises at
+# build time.
+@overload
+def pipe(s1: Stage[A, B], s2: Stage[B, C], /) -> Pipeline[A, C]: ...
+@overload
+def pipe(s1: Stage[A, B], s2: Stage[B, C], s3: Stage[C, D], /) -> Pipeline[A, D]: ...
+@overload
+def pipe(
+    s1: Stage[A, B], s2: Stage[B, C], s3: Stage[C, D], s4: Stage[D, E], /
+) -> Pipeline[A, E]: ...
+@overload
+def pipe(
+    s1: Stage[A, B], s2: Stage[B, C], s3: Stage[C, D], s4: Stage[D, E], s5: Stage[E, F], /
+) -> Pipeline[A, F]: ...
+@overload
+def pipe(
+    s1: Stage[A, B],
+    s2: Stage[B, C],
+    s3: Stage[C, D],
+    s4: Stage[D, E],
+    s5: Stage[E, F],
+    s6: Stage[F, G],
+    /,
+) -> Pipeline[A, G]: ...
+@overload
+def pipe(
+    s1: Stage[A, B],
+    s2: Stage[B, C],
+    s3: Stage[C, D],
+    s4: Stage[D, E],
+    s5: Stage[E, F],
+    s6: Stage[F, G],
+    s7: Stage[G, H],
+    /,
+) -> Pipeline[A, H]: ...
+@overload
+def pipe(
+    s1: Stage[A, B],
+    s2: Stage[B, C],
+    s3: Stage[C, D],
+    s4: Stage[D, E],
+    s5: Stage[E, F],
+    s6: Stage[F, G],
+    s7: Stage[G, H],
+    s8: Stage[H, J],
+    /,
+) -> Pipeline[A, J]: ...
+@overload
+def pipe(
+    s1: Stage[A, B],
+    s2: Stage[B, C],
+    s3: Stage[C, D],
+    s4: Stage[D, E],
+    s5: Stage[E, F],
+    s6: Stage[F, G],
+    s7: Stage[G, H],
+    s8: Stage[H, J],
+    s9: Stage[J, K],
+    /,
+) -> Pipeline[A, K]: ...
 def pipe(*stages: Stage) -> Pipeline:
     """Build a :class:`Pipeline` chaining ``stages`` in sequence.
 
@@ -796,13 +973,20 @@ def pipe(*stages: Stage) -> Pipeline:
 # --- Aggregate ------------------------------------------------------------------
 
 
-class Aggregate:
+class Aggregate(Generic[In]):
     """The callable object produced by :func:`aggregate`.
 
     ``agg(x)`` is sugar for ``agg.run(x).output`` -- a ``{branch_name:
     output}`` dict in declaration order. ``.input_type`` is the branches'
     common input type, or ``Any`` if they disagree; ``.output_type`` is
     always ``dict``.
+
+    ``Generic[In]`` (v0.5.0 Plan B, Task 2) -- output stays plain
+    ``dict[str, Any]`` (never generic: branches can return unrelated types,
+    there is no single ``Out`` to speak of), same erasure-only relationship
+    to ``__init__`` as :class:`Pipeline`'s (see its docstring): direct
+    construction infers bare ``Aggregate[Any]``; an explicit ``Aggregate[X]``
+    annotation, or ``>>``-chaining onward, is what narrows it.
     """
 
     def __init__(
@@ -816,7 +1000,7 @@ class Aggregate:
         self.output_type: Any = dict
         self._name = "aggregate(" + ", ".join(self._branches.keys()) + ")"
 
-    def __call__(self, x: Any) -> dict[str, Any]:
+    def __call__(self, x: In) -> dict[str, Any]:
         """Sugar for :meth:`run`'s output -- UNLESS a span or run context is
         already ambient (a ``@flow``/``@task`` body, another ``@agent``
         call, ...), in which case this joins that trace/run as a nested step
@@ -834,18 +1018,18 @@ class Aggregate:
             return _runtime.run_sync(_arun_aggregate_nested(self, x))
         return self.run(x).output
 
-    def __rshift__(self, other: Any) -> Pipeline:
+    def __rshift__(self, other: Stage[dict[str, Any], NewOut]) -> Pipeline[In, NewOut]:
         return _rshift_pipe(self, other)
 
-    def __rrshift__(self, other: Any) -> Pipeline:
+    def __rrshift__(self, other: Stage[NewIn, In]) -> Pipeline[NewIn, dict[str, Any]]:
         return _rshift_pipe(other, self)
 
-    def run(self, x: Any, budget: Budget | None = None) -> Run:
+    def run(self, x: In, budget: Budget | None = None) -> Run[dict[str, Any]]:
         return _run_top(
             "aggregate", self._name, budget, lambda: self._run_branches(x, streaming=False)
         )
 
-    async def arun(self, x: Any, budget: Budget | None = None) -> Run:
+    async def arun(self, x: In, budget: Budget | None = None) -> Run[dict[str, Any]]:
         """Async twin of :meth:`run` (v0.4.0 Plan B, Task 5) -- runs entirely
         on the CALLER's own running event loop, never the composeai runtime
         loop. Ctx-checks for an ambient span/run context exactly like
@@ -860,14 +1044,14 @@ class Aggregate:
         """
         return await _arun_aggregate_on_callers_loop(self, x, budget, streaming=False)
 
-    def stream(self, x: Any, budget: Budget | None = None) -> RunStream:
+    def stream(self, x: In, budget: Budget | None = None) -> RunStream[dict[str, Any]]:
         return agentfn._stream_run(
             lambda: _run_top(
                 "aggregate", self._name, budget, lambda: self._run_branches(x, streaming=True)
             )
         )
 
-    def astream(self, x: Any, budget: Budget | None = None) -> AsyncRunStream:
+    def astream(self, x: In, budget: Budget | None = None) -> AsyncRunStream[dict[str, Any]]:
         """Async twin of :meth:`stream` (v0.4.0 Plan B, Task 5) -- mirrors
         ``AgentFunction.astream``'s shape (:func:`~composeai.agentfn._astream_run`):
         a fresh, private bus, subscribed before the task is created, run as
@@ -981,7 +1165,11 @@ class Aggregate:
         return {name: output for name, (output, _exc) in outcomes.items()}
 
 
-def aggregate(*, timeout_per_branch: float | None = None, **branches: Stage) -> Aggregate:
+def aggregate(
+    *,
+    timeout_per_branch: float | None = None,
+    **branches: Stage[AggIn, Any] | Callable[[Any], Any],
+) -> Aggregate[AggIn]:
     """Build an :class:`Aggregate` running every branch in parallel.
 
     ``timeout_per_branch`` (seconds) bounds each branch with the same
@@ -991,6 +1179,31 @@ def aggregate(*, timeout_per_branch: float | None = None, **branches: Stage) -> 
     consequence of taking this as a keyword parameter: a branch cannot
     itself be named ``timeout_per_branch``. Requires at least 1 branch
     (else :class:`~composeai.errors.CompositionTypeError`).
+
+    Statically (v0.5.0 Plan B, Task 3) this infers ``Aggregate[AggIn]`` where
+    ``AggIn`` is the branches' common input type, solved from every branch via
+    ``**branches: Stage[AggIn, Any] | Callable[[Any], Any]`` (a DIRECT typed
+    signature, not an ``@overload`` -- a lone overload trips
+    ``reportInconsistentOverload``). The ``| Callable[[Any], Any]`` arm is the
+    fix for finding I1 (v0.5.0 Plan B, Task 3 review): a bare, unannotated
+    lambda branch (``aggregate(a=lambda x: x + 1)``) is idiomatic and
+    runtime-legit, but a lone ``Stage[AggIn, Any]`` fed the still-unsolved
+    ``AggIn`` into the lambda's own parameter, so ``x + 1`` tripped
+    ``reportOperatorIssue`` inside the body -- a static regression against the
+    old untyped signature. The escape-hatch arm gives such a lambda's
+    parameter ``Any`` (clean body, ``Aggregate[Any]`` result) while a typed
+    branch still solves ``AggIn`` through the ``Stage`` arm.
+
+    One consequence of that escape hatch, accepted deliberately: a
+    *mismatched* typed branch (``aggregate(a=str_stage, c=int_stage)``) is no
+    longer statically rejected -- pyright can't tell a bare lambda from a
+    mismatched typed callable at the ``Callable[[Any], Any]`` arm, so keeping
+    bare lambdas clean (probe (c)) and rejecting mismatched typed branches
+    (probe (b)) are mutually exclusive. The plan's core promise (no static
+    regression on runtime-legit code) outranks mismatch rejection, and there
+    is no runtime cost either way: unlike ``pipe()``, ``aggregate()`` does NOT
+    raise on disagreeing branches -- ``Aggregate.__init__`` just falls back to
+    ``input_type = Any`` (probed before adoption; see this task's report).
     """
     if timeout_per_branch is not None and not isinstance(timeout_per_branch, (int, float)):
         raise ConfigError(
@@ -1004,10 +1217,14 @@ def aggregate(*, timeout_per_branch: float | None = None, **branches: Stage) -> 
 
 # --- map ----------------------------------------------------------------------
 
+T_mr = TypeVar("T_mr", default=Any)
+"""``default=Any`` (PEP 696, via ``typing_extensions``) so a bare ``MapResult``
+annotation means ``MapResult[Any]`` -- same rationale as ``runs.R``."""
+
 
 @register_serializable
 @dataclass
-class MapResult:
+class MapResult(Generic[T_mr]):
     """One item's settled outcome from ``compose.map(..., on_error="collect")``.
 
     ``error``/``error_type`` are plain strings (exceptions don't round-trip
@@ -1016,11 +1233,57 @@ class MapResult:
     """
 
     ok: bool
-    value: Any = None
+    value: T_mr | None = None
     error: str | None = None
     error_type: str | None = None
 
 
+# The async-stage overload pair comes FIRST (finding I2, v0.5.0 Plan B, Task 3
+# review): map()/amap() DO accept an ``async def`` plain callable as a stage
+# (it runs natively through ``_ainvoke_stage``/``run_stage``; see
+# ``test_engine_async``), and map() collects each item's AWAITED value, not the
+# coroutine. A lone ``fn: Stage[A, B] -> list[B]`` overload would bind ``B`` to
+# an async stage's returned ``Coroutine[..., R]``, mistyping the result as
+# ``list[Coroutine[...]]``. Matching ``fn: Callable[[A], Awaitable[B]]`` first
+# unwraps the awaitable so ``B`` is the value map() actually returns; a sync
+# stage never matches this arm (its return isn't an ``Awaitable``) and falls
+# through to the ``Stage[A, B]`` pair below.
+@overload
+def map(
+    fn: Callable[[A], Awaitable[B]],
+    items: Sequence[A],
+    *,
+    max_workers: int | None = ...,
+    timeout_per_item: float | None = ...,
+    on_error: Literal["raise"] = ...,
+) -> list[B]: ...
+@overload
+def map(
+    fn: Callable[[A], Awaitable[B]],
+    items: Sequence[A],
+    *,
+    max_workers: int | None = ...,
+    timeout_per_item: float | None = ...,
+    on_error: Literal["collect"],
+) -> list[MapResult[B]]: ...
+@overload
+def map(
+    fn: Stage[A, B],
+    items: Sequence[A],
+    *,
+    max_workers: int | None = ...,
+    timeout_per_item: float | None = ...,
+    on_error: Literal["raise"] = ...,
+) -> list[B]: ...
+@overload
+def map(
+    fn: Stage[A, B],
+    items: Sequence[A],
+    *,
+    max_workers: int | None = ...,
+    timeout_per_item: float | None = ...,
+    on_error: Literal["collect"],
+) -> list[MapResult[B]]: ...
 def map(
     fn: Stage,
     items: Sequence[Any],
@@ -1047,7 +1310,17 @@ def map(
     ``None`` (the default) means no per-item timeout.
 
     ``on_error`` controls how failures (including per-item timeouts) are
-    reported:
+    reported -- and, statically (v0.5.0 Plan B, Task 3), the return type:
+    overloads select ``list[B]`` for the default ``on_error="raise"`` (that
+    overload carries the default) versus ``list[MapResult[B]]`` for the
+    explicit ``on_error="collect"``, with ``B`` inferred from ``fn``'s own
+    output and ``items`` checked against ``fn``'s input (``items:
+    Sequence[A]``). Each ``on_error`` value has an async-stage overload
+    (``fn: Callable[[A], Awaitable[B]]``, matched first so an ``async def``
+    stage's ``B`` is its AWAITED value, not the ``Coroutine`` it returns --
+    finding I2) and a sync-stage one (``fn: Stage[A, B]``). The implementation
+    signature below stays loose (``on_error: str``); ``amap`` carries the
+    identical overload set:
 
     - ``"raise"`` (default): the first failure *by index* is re-raised
       from ``map()`` once every item has settled, exactly as above.
@@ -1105,6 +1378,43 @@ def map(
     )
 
 
+# Async-stage overload pair first, exactly like :func:`map` above (finding I2).
+@overload
+async def amap(
+    fn: Callable[[A], Awaitable[B]],
+    items: Sequence[A],
+    *,
+    max_workers: int | None = ...,
+    timeout_per_item: float | None = ...,
+    on_error: Literal["raise"] = ...,
+) -> list[B]: ...
+@overload
+async def amap(
+    fn: Callable[[A], Awaitable[B]],
+    items: Sequence[A],
+    *,
+    max_workers: int | None = ...,
+    timeout_per_item: float | None = ...,
+    on_error: Literal["collect"],
+) -> list[MapResult[B]]: ...
+@overload
+async def amap(
+    fn: Stage[A, B],
+    items: Sequence[A],
+    *,
+    max_workers: int | None = ...,
+    timeout_per_item: float | None = ...,
+    on_error: Literal["raise"] = ...,
+) -> list[B]: ...
+@overload
+async def amap(
+    fn: Stage[A, B],
+    items: Sequence[A],
+    *,
+    max_workers: int | None = ...,
+    timeout_per_item: float | None = ...,
+    on_error: Literal["collect"],
+) -> list[MapResult[B]]: ...
 async def amap(
     fn: Stage,
     items: Sequence[Any],

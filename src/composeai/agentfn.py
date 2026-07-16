@@ -23,9 +23,10 @@ import threading
 import time
 from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Generic, overload
 
 from pydantic import TypeAdapter, ValidationError
+from typing_extensions import ParamSpec, TypeVar
 
 from . import _runtime, events, runs, tracing
 from ._dispatch import _run_sync_on_own_thread, gather_settled, run_stage
@@ -49,7 +50,27 @@ from .runs import AsyncRunStream, Budget, Run, RunStream, budget_scope, check_bu
 from .tools import Tool
 
 if TYPE_CHECKING:
-    from .combinators import Pipeline
+    from .combinators import Pipeline, Stage
+
+# --- typing: `AgentFunction[P, R]` generics (v0.5.0 Plan B, Task 4) -----------
+#
+# `P`/`R` carry PEP 696 defaults (via `typing_extensions`, same convention as
+# `runs.R` -- Task 1) so a *bare* `AgentFunction` annotation means
+# `AgentFunction[..., Any]` rather than tripping `reportMissingTypeArgument` if
+# strict pyright is ever turned on (probed: pyright 1.1.411 accepts
+# `ParamSpec("P", default=...)` on pythonVersion 3.10). `P` captures the
+# decorated function's whole parameter list -- names included -- so a keyword
+# call (`extract(text=...)`) type-checks, and `R` is its return
+# (structured-output) type. `X`/`R2`/`NewOut`/`NewIn` are method-scoped: solved
+# only from a `>>`/`<<` operand at the call site (the Variant-A single-arg
+# `__rshift__` self-type trick, see its docstring), never left bare -- no
+# `default=` needed.
+P = ParamSpec("P", default=...)
+R = TypeVar("R", default=Any)
+X = TypeVar("X")
+R2 = TypeVar("R2")
+NewOut = TypeVar("NewOut")
+NewIn = TypeVar("NewIn")
 
 # --- agent registry (Phase 8: resume() routing) ------------------------------
 #
@@ -59,7 +80,7 @@ if TYPE_CHECKING:
 _AGENT_REGISTRY: dict[str, AgentFunction] = {}
 
 
-class AgentFunction:
+class AgentFunction(Generic[P, R]):
     """The callable object produced by ``@agent``.
 
     ``agent_fn(...)`` is sugar for ``agent_fn.run(...).output``; ``.run(...)``
@@ -85,7 +106,7 @@ class AgentFunction:
 
     def __init__(
         self,
-        fn: Callable[..., Any],
+        fn: Callable[P, R],
         *,
         model: str | Model,
         tools: Sequence[Tool],
@@ -141,10 +162,18 @@ class AgentFunction:
         self._cache = cache
         self._output_schema, self._wrap_result = _build_output_schema(self.output_type)
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         return self.run(*args, **kwargs).output
 
-    def __rshift__(self, other: Any) -> Pipeline:
+    # Variant A (v0.5.0 Plan B, Task 4): the `self: AgentFunction[[X], R2]`
+    # self-type means only a SINGLE-positional-arg agent may compose with
+    # `>>` -- a 2-param (or 0-param) agent is a hard static `reportOperatorIssue`
+    # (see prototype/probe_variants.py). `X` is the agent's input, `R2` its
+    # output, so `a >> b` types the chain end-to-end as `Pipeline[X, NewOut]`.
+    # `**kwargs`-only annotations are the only change: the runtime body is
+    # byte-identical (still `_rshift_pipe`), and `pipe()` stays the single owner
+    # of composition-time type checking.
+    def __rshift__(self: AgentFunction[[X], R2], other: Stage[R2, NewOut]) -> Pipeline[X, NewOut]:
         # Local import: composeai.combinators already imports AgentFunction
         # from this module at module scope, so importing it back at module
         # scope here would be circular -- deferring to call time avoids it.
@@ -152,21 +181,21 @@ class AgentFunction:
 
         return _rshift_pipe(self, other)
 
-    def __rrshift__(self, other: Any) -> Pipeline:
+    def __rrshift__(self: AgentFunction[[X], R2], other: Stage[NewIn, X]) -> Pipeline[NewIn, R2]:
         from .combinators import _rshift_pipe
 
         return _rshift_pipe(other, self)
 
-    def run(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run:
+    def run(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run[R]:
         return _run_agent(self, args, kwargs, budget=budget)
 
-    async def arun(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run:
+    async def arun(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run[R]:
         return await _arun_agent_on_callers_loop(self, args, kwargs, budget=budget)
 
-    def stream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> RunStream:
+    def stream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> RunStream[R]:
         return _stream_agent(self, args, kwargs, budget=budget)
 
-    def astream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> AsyncRunStream:
+    def astream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> AsyncRunStream[R]:
         return _astream_agent(self, args, kwargs, budget=budget)
 
 
@@ -192,6 +221,9 @@ def prompt(text_or_messages: str | Sequence[Message]) -> Any:
     return text_or_messages
 
 
+@overload
+def agent(fn: Callable[P, R], /) -> AgentFunction[P, R]: ...
+@overload
 def agent(
     *,
     model: str | Model,
@@ -206,8 +238,37 @@ def agent(
     cache: bool = False,
     name: str | None = None,
     replace: bool = False,
-) -> Callable[[Callable[..., Any]], AgentFunction]:
+) -> Callable[[Callable[P, R]], AgentFunction[P, R]]: ...
+def agent(
+    fn: Callable[..., Any] | None = None,
+    *,
+    model: Any = None,
+    tools: Sequence[Tool] = (),
+    temperature: float | None = None,
+    max_tokens: int = 16000,
+    max_turns: int = 10,
+    retries: int = 0,
+    max_repairs: int = 0,
+    timeout: float | None = None,
+    fallback: str | Model | None = None,
+    cache: bool = False,
+    name: str | None = None,
+    replace: bool = False,
+) -> Any:
     """Decorate a function into an :class:`AgentFunction` -- a typed, runnable agent.
+
+    Usable bare (``@agent``) or with keyword arguments (``@agent(model=...)``)
+    -- the two-overload dual form (v0.5.0 Plan B, Task 4) mirrors ``@flow``/
+    ``@task``. The bare form infers ``AgentFunction[P, R]`` straight from the
+    decorated function's own signature (``P`` its parameters -- names included,
+    so keyword calls type-check -- and ``R`` its return/structured-output
+    type); a single-positional-arg agent then composes with ``>>`` (see
+    :meth:`AgentFunction.__rshift__`). ``model`` is still *required* in the
+    parenthesized form (the second overload) and only defaults in the loosely
+    typed implementation, which the bare form routes through -- model
+    resolution stays lazy (at run time, via ``composeai.models.registry``), so
+    a bare-decorated agent that never sets a model only errors when actually
+    run.
 
     ``model`` is required and keyword-only: either a ``"provider/model-id"``
     string (resolved lazily via :mod:`composeai.models.registry`) or an
@@ -259,9 +320,9 @@ def agent(
     multi-tenant factories -- those want distinct ``name=``s.
     """
 
-    def decorator(fn: Callable[..., Any]) -> AgentFunction:
+    def decorator(f: Callable[..., Any]) -> AgentFunction:
         return AgentFunction(
-            fn,
+            f,
             model=model,
             tools=tools,
             temperature=temperature,
@@ -276,6 +337,10 @@ def agent(
             replace=replace,
         )
 
+    # Bare `@agent` (fn passed positionally) applies the decorator immediately;
+    # `@agent(...)` (fn is None) returns it to be applied to the function next.
+    if fn is not None:
+        return decorator(fn)
     return decorator
 
 
@@ -1048,7 +1113,7 @@ def _run_agent(
     *,
     streaming: bool = False,
     budget: Budget | None = None,
-) -> Run:
+) -> Run[Any]:
     # --- Phase 7 (durable flows): minimal, well-marked touch -----------------
     # Inside an active @flow body, the whole agent run auto-journals as one
     # step (see composeai.runs.RunContext) instead of running the loop below
@@ -1086,7 +1151,7 @@ async def _arun_agent(
     *,
     streaming: bool = False,
     budget: Budget | None = None,
-) -> Run:
+) -> Run[Any]:
     """Async twin of :func:`_run_agent` (v0.4.0 Plan A, Task 8).
 
     Same three-way routing, each branch calling its own async twin:
@@ -1136,7 +1201,7 @@ async def _arun_agent_on_callers_loop(
     *,
     streaming: bool = False,
     budget: Budget | None = None,
-) -> Run:
+) -> Run[Any]:
     """The async engine behind ``AgentFunction.arun``/``.astream`` (v0.4.0 Plan B, Task 4).
 
     Same three-way routing as :func:`_run_agent`/:func:`_arun_agent`
@@ -1184,7 +1249,7 @@ def _run_agent_journaled(
     *,
     streaming: bool,
     budget: Budget | None,
-) -> Run:
+) -> Run[Any]:
     """Treat one whole agent run as a single journaled flow step.
 
     Replay: a journal hit returns a completed ``Run`` built straight from
@@ -1244,7 +1309,7 @@ async def _arun_agent_journaled(
     *,
     streaming: bool,
     budget: Budget | None,
-) -> Run:
+) -> Run[Any]:
     """Async twin of :func:`_run_agent_journaled` (v0.4.0 Plan A, Task 8) --
     see its docstring for the replay/miss contract, byte-identical here.
 
@@ -1319,7 +1384,7 @@ def resume_standalone_agent(
     row: dict[str, Any],
     answers: dict[str, Any] | None = None,
     budget: Budget | None = None,
-) -> Run:
+) -> Run[Any]:
     """Resume a paused (or crashed) standalone ``@agent`` run.
 
     Called by ``composeai.flow.resume()`` when the run row's ``kind`` is
@@ -1417,7 +1482,7 @@ async def aresume_standalone_agent(
     row: dict[str, Any],
     answers: dict[str, Any] | None = None,
     budget: Budget | None = None,
-) -> Run:
+) -> Run[Any]:
     """Async twin of :func:`resume_standalone_agent` (v0.4.0 Plan B, Task 7)
     -- called by ``composeai.flow.aresume()`` when the run row's ``kind`` is
     ``"agent"``. Same contract and the same check order as the sync
@@ -1500,7 +1565,7 @@ def _run_agent_uncached(
     budget_baseline: Usage | None = None,
     scope_key: str = "",
     step_key: str | None = None,
-) -> Run:
+) -> Run[Any]:
     """Sync facade over the async engine (:func:`_arun_agent_uncached`) --
     see its docstring for the full loop contract.
 
@@ -1541,7 +1606,7 @@ async def _arun_agent_uncached(
     budget_baseline: Usage | None = None,
     scope_key: str = "",
     step_key: str | None = None,
-) -> Run:
+) -> Run[Any]:
     """The actual agent loop -- shared by standalone runs, resumed standalone
     runs, and agents nested in a flow (see the three callers of the sync
     facade :func:`_run_agent_uncached` above). Driven by that facade via
@@ -1762,7 +1827,7 @@ async def _arun_agent_uncached(
 # --- streaming -------------------------------------------------------------
 
 
-def _stream_run(run_thunk: Callable[[], Run]) -> RunStream:
+def _stream_run(run_thunk: Callable[[], Run[Any]]) -> RunStream:
     """Run ``run_thunk`` on a background thread against a fresh, private bus.
 
     The generic engine behind every ``.stream(...)`` in composeai --
@@ -1810,7 +1875,7 @@ def _stream_agent(
     )
 
 
-def _astream_run(run_thunk: Callable[[], Coroutine[Any, Any, Run]]) -> AsyncRunStream:
+def _astream_run(run_thunk: Callable[[], Coroutine[Any, Any, Run[Any]]]) -> AsyncRunStream:
     """Async twin of :func:`_stream_run` (v0.4.0 Plan B, Task 4).
 
     ``run_thunk`` is a zero-arg coroutine *factory* (same contract as
@@ -1849,7 +1914,7 @@ def _astream_run(run_thunk: Callable[[], Coroutine[Any, Any, Run]]) -> AsyncRunS
     bus = events.EventBus()
     subscription = bus.asubscribe()
 
-    async def _wrapper() -> Run:
+    async def _wrapper() -> Run[Any]:
         with events.use_bus(bus):
             try:
                 return await run_thunk()

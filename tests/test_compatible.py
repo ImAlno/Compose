@@ -214,7 +214,7 @@ def _amodel(
     base_url: str = "http://localhost:11434/v1",
 ) -> OpenAICompatibleModel:
     model = OpenAICompatibleModel(model_id, base_url=base_url)
-    model._async_client = _AsyncStubClient(responses)  # type: ignore[attr-defined]
+    model._async_client = _AsyncStubClient(responses)
     return model
 
 
@@ -317,7 +317,7 @@ def test_system_maps_to_system_role_message():
     model = _model([_response([_choice(_message(content="ok"))])])
     request = ModelRequest(model="llama3-test", messages=[Message.user("hi")], system="be terse")
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["messages"][0] == {"role": "system", "content": "be terse"}
 
 
@@ -325,7 +325,7 @@ def test_system_omitted_when_none():
     model = _model([_response([_choice(_message(content="ok"))])])
     request = ModelRequest(model="llama3-test", messages=[Message.user("hi")])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert all(m.get("role") != "system" for m in call["messages"])
 
 
@@ -333,7 +333,7 @@ def test_user_text_part_maps_to_user_message():
     model = _model([_response([_choice(_message(content="ok"))])])
     request = ModelRequest(model="llama3-test", messages=[Message.user("hello")])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["messages"] == [
         {"role": "user", "content": [{"type": "text", "text": "hello"}]}
     ]
@@ -344,7 +344,7 @@ def test_user_image_part_maps_to_image_url_content():
     image = ImagePart(media_type="image/png", url="https://example.com/x.png")
     request = ModelRequest(model="llama3-test", messages=[Message.user([image])])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     part = call["messages"][0]["content"][0]
     assert part == {"type": "image_url", "image_url": {"url": "https://example.com/x.png"}}
 
@@ -354,7 +354,7 @@ def test_user_image_part_base64_maps_to_data_url():
     image = ImagePart(media_type="image/png", data="YWJj")
     request = ModelRequest(model="llama3-test", messages=[Message.user([image])])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     part = call["messages"][0]["content"][0]
     assert part["image_url"]["url"] == "data:image/png;base64,YWJj"
 
@@ -364,7 +364,7 @@ def test_assistant_tool_call_part_maps_to_nested_tool_calls():
     call_part = ToolCallPart(id="tc1", name="search", arguments={"q": "cats"})
     request = ModelRequest(model="llama3-test", messages=[Message.assistant([call_part])])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     msg = call["messages"][0]
     assert msg["role"] == "assistant"
     assert msg["tool_calls"] == [
@@ -381,7 +381,7 @@ def test_tool_result_part_maps_to_tool_role_message():
     result = ToolResultPart(tool_call_id="tc1", content="42")
     request = ModelRequest(model="llama3-test", messages=[Message.user([result])])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["messages"][0] == {"role": "tool", "tool_call_id": "tc1", "content": "42"}
 
 
@@ -390,7 +390,7 @@ def test_tool_result_part_with_is_error_prepends_error_prefix():
     result = ToolResultPart(tool_call_id="tc1", content="boom", is_error=True)
     request = ModelRequest(model="llama3-test", messages=[Message.user([result])])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["messages"][0]["content"] == "ERROR: boom"
 
 
@@ -408,7 +408,7 @@ def test_multiple_tool_results_become_separate_tool_messages():
         ],
     )
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["messages"] == [
         {"role": "tool", "tool_call_id": "tc1", "content": "a"},
         {"role": "tool", "tool_call_id": "tc2", "content": "b"},
@@ -422,7 +422,7 @@ def test_thinking_parts_are_never_echoed_even_same_provider_and_model():
         model="llama3-test", messages=[Message.assistant([part, TextPart(text="hi")])]
     )
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["messages"] == [{"role": "assistant", "content": [{"type": "text", "text": "hi"}]}]
 
 
@@ -439,7 +439,7 @@ def test_tools_mapped_nested_under_function():
     )
     request = ModelRequest(model="llama3-test", messages=[Message.user("hi")], tools=[spec])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["tools"] == [
         {
             "type": "function",
@@ -457,7 +457,7 @@ def test_tools_omitted_when_none():
     model = _model([_response([_choice(_message(content="ok"))])])
     request = ModelRequest(model="llama3-test", messages=[Message.user("hi")])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert "tools" not in call
 
 
@@ -475,7 +475,7 @@ def test_output_schema_maps_to_response_format_json_schema():
     model = _model([_response([_choice(_message(content='{"a": 1}'))])])
     request = ModelRequest(model="llama3-test", messages=[Message.user("hi")], output_schema=schema)
     resp = model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["response_format"] == {
         "type": "json_schema",
         "json_schema": {"name": "response", "schema": schema, "strict": True},
@@ -488,7 +488,7 @@ def test_output_schema_uses_title_as_name_when_valid():
     model = _model([_response([_choice(_message(content='{"a": 1}'))])])
     request = ModelRequest(model="llama3-test", messages=[Message.user("hi")], output_schema=schema)
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["response_format"]["json_schema"]["name"] == "MyAnswer"
 
 
@@ -514,7 +514,7 @@ def test_default_valued_property_downgrades_tool_to_non_strict():
     model = _model([_response([_choice(_message(content="ok"))])])
     request = ModelRequest(model="llama3-test", messages=[Message.user("hi")], tools=[spec])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["tools"][0]["function"]["strict"] is False
     assert call["tools"][0]["function"]["parameters"] == schema
 
@@ -530,7 +530,7 @@ def test_schema_valued_additional_properties_downgrades_tool_to_non_strict():
     model = _model([_response([_choice(_message(content="ok"))])])
     request = ModelRequest(model="llama3-test", messages=[Message.user("hi")], tools=[spec])
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["tools"][0]["function"]["strict"] is False
     assert call["tools"][0]["function"]["parameters"] == schema
 
@@ -548,7 +548,7 @@ def test_default_valued_property_downgrades_output_schema_to_non_strict():
     model = _model([_response([_choice(_message(content='{"answer": "x"}'))])])
     request = ModelRequest(model="llama3-test", messages=[Message.user("hi")], output_schema=schema)
     model.complete(request)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["response_format"]["json_schema"]["strict"] is False
     assert call["response_format"]["json_schema"]["schema"] == schema
 
@@ -873,7 +873,7 @@ def test_stream_requests_include_usage_stream_option():
     chunks = [_chunk(_delta(), finish_reason="stop"), _usage_only_chunk(_usage())]
     model = _model([chunks])
     list(model.stream(ModelRequest(model="llama3-test", messages=[Message.user("hi")])))
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["stream"] is True
     assert call["stream_options"] == {"include_usage": True}
 
@@ -886,7 +886,7 @@ def test_stream_uses_sdk_stream_as_a_context_manager():
     chunks = [_chunk(_delta(content="hi"), finish_reason="stop"), _usage_only_chunk(_usage())]
     model = _model([chunks])
     list(model.stream(ModelRequest(model="llama3-test", messages=[Message.user("hi")])))
-    stream = model._client.chat.completions.last_stream  # type: ignore[attr-defined]
+    stream = model._client.chat.completions.last_stream  # pyright: ignore[reportAttributeAccessIssue]
     assert stream is not None
     assert stream.closed is True
 
@@ -1637,7 +1637,7 @@ def test_acomplete_auto_mode_demotes_and_sums_usage():
     model = OpenAICompatibleModel(
         "m", base_url="http://x/v1", client=None, schema_mode="auto"
     )
-    model._async_client = client  # type: ignore[attr-defined]
+    model._async_client = client
 
     first = asyncio.run(model.acomplete(_structured_request()))
     assert first.parsed == {"answer": "ok"}
@@ -1691,7 +1691,7 @@ def test_injected_sync_client_used_by_async_engine():
 
     assert run.output == "Hello there."
     assert run.status == "completed"
-    assert len(model._client.chat.completions.calls) == 1  # type: ignore[attr-defined]
+    assert len(model._client.chat.completions.calls) == 1
 
 
 def test_agent_stream_uses_injected_sync_streaming_client():
@@ -1724,5 +1724,5 @@ def test_agent_stream_uses_injected_sync_streaming_client():
     assert run_stream.run.output == "Hello there."
     assert run_stream.run.status == "completed"
     assert any(e.kind == "text_delta" for e in events)
-    call = model._client.chat.completions.calls[0]  # type: ignore[attr-defined]
+    call = model._client.chat.completions.calls[0]
     assert call["stream"] is True

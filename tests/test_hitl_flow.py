@@ -30,7 +30,15 @@ def test_approve_pauses_flow_with_paused_run_pending_row_and_span_statuses():
             return "published"
         return "rejected"
 
-    run = publish_flow.run()
+    # Annotated bare `runs.Run` (i.e. `Run[Any]`) so the paused-run assertion
+    # `run.output is None` below type-checks: `publish_flow` returns `str`, so
+    # `publish_flow.run()` now statically infers `Run[str]` (v0.5.0 Plan B,
+    # Task 5 -- `Flow.run -> Run[R]`), under which `run.output` is `str` and
+    # `... is None` would narrow `run` to `Never`. A paused run genuinely has
+    # `output=None` at runtime; the success-typed `Run[R]` can't express that,
+    # so this one paused-run test opts back out to `Run[Any]`. Local annotation,
+    # never evaluated at runtime (PEP 526) -- zero behavior change.
+    run: runs.Run = publish_flow.run()
 
     assert run.status == "paused"
     assert run.output is None

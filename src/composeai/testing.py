@@ -417,13 +417,13 @@ def record_cassette(path: str | Path) -> Iterator[None]:
         real = original_resolve(model)
         return RecordingModel(real, entries)
 
-    _wrapped_resolve._compose_cassette_active = True  # type: ignore[attr-defined]
+    _wrapped_resolve._compose_cassette_active = True  # pyright: ignore[reportFunctionMemberAccess]
 
-    registry.resolve = _wrapped_resolve  # type: ignore[assignment]
+    registry.resolve = _wrapped_resolve
     try:
         yield
     finally:
-        registry.resolve = original_resolve  # type: ignore[assignment]
+        registry.resolve = original_resolve
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps({"version": _CASSETTE_VERSION, "entries": entries}, indent=2))
 
@@ -515,13 +515,13 @@ def replay_cassette(path: str | Path) -> Iterator[None]:
     def _wrapped_resolve(model: str | Model) -> Model:
         return replay_model
 
-    _wrapped_resolve._compose_cassette_active = True  # type: ignore[attr-defined]
+    _wrapped_resolve._compose_cassette_active = True  # pyright: ignore[reportFunctionMemberAccess]
 
-    registry.resolve = _wrapped_resolve  # type: ignore[assignment]
+    registry.resolve = _wrapped_resolve
     try:
         yield
     finally:
-        registry.resolve = original_resolve  # type: ignore[assignment]
+        registry.resolve = original_resolve
 
 
 # --- cassette pytest fixture --------------------------------------------------
@@ -569,7 +569,7 @@ if _pytest is not None:
         return _use
 
 else:
-    cassette = None  # type: ignore[assignment]
+    cassette = None  # pyright: ignore[reportAssignmentType]
 
 
 # --- CachingModel: the `@agent(cache=True)` response cache -------------------
@@ -652,9 +652,9 @@ class CachingModel:
             # Discovery-defeat: the inner model has no async complete, so
             # this instance must not appear to either -- the engine falls
             # back to running this model's sync `complete()` off-thread.
-            self.acomplete = None  # type: ignore[assignment]
+            self.acomplete = None  # pyright: ignore[reportAttributeAccessIssue]
         if getattr(inner, "astream", None) is None:
-            self.astream = None  # type: ignore[assignment]
+            self.astream = None  # pyright: ignore[reportAttributeAccessIssue]
 
     @property
     def last_was_hit(self) -> bool:

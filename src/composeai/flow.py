@@ -33,8 +33,10 @@ import json
 import random as _stdlib_random
 import textwrap
 import time
-from collections.abc import Callable
-from typing import Any, overload
+from collections.abc import Callable, Coroutine
+from typing import Any, Generic, Protocol, overload
+
+from typing_extensions import ParamSpec, TypeVar
 
 from . import _runtime, agentfn, runs, tracing
 from ._dispatch import run_stage
@@ -60,6 +62,24 @@ from .runs import (
 )
 from .runs import open_default as _open_default_store
 
+# --- typing: `Task[P, R]` / `Flow[P, R]` generics (v0.5.0 Plan B, Task 5) -----
+#
+# `P`/`R` carry PEP 696 defaults (via `typing_extensions`, same convention as
+# `AgentFunction[P, R]` -- Task 4) so a *bare* `Task`/`Flow` annotation means
+# `Task[..., Any]`/`Flow[..., Any]` rather than tripping
+# `reportMissingTypeArgument` under strict pyright. `P` captures the decorated
+# function's whole parameter list (names included, so a keyword call
+# type-checks) and `R` its return type. These module-level TypeVars are reused
+# across both `Task` and `Flow` -- each only ever appears in `P`-in/`R`-out
+# positions, so the reuse is correct (same convention as `combinators.In`/`Out`
+# shared across `Stage`/`Pipeline`/`Aggregate`). NO `Flow.__rshift__` is added:
+# a `Flow` is not a first-class pipe stage today (not in
+# `combinators._stage_input_type`'s isinstance set, has no `.input_type`/
+# `.output_type`, and has no existing `__rshift__`), so adding one would be new
+# runtime behavior -- YAGNI, and this task changes zero runtime behavior.
+P = ParamSpec("P", default=...)
+R = TypeVar("R", default=Any)
+
 # --- @task ------------------------------------------------------------------
 
 
@@ -70,7 +90,7 @@ def _call_input_dict(args: tuple[Any, ...], kwargs: dict[str, Any]) -> dict[str,
 _TASK_REGISTRY: dict[str, Task] = {}
 
 
-class Task:
+class Task(Generic[P, R]):
     """The callable object produced by ``@task``.
 
     Directly callable (``task_obj(...)``) whether or not a flow is
@@ -92,7 +112,7 @@ class Task:
 
     def __init__(
         self,
-        fn: Callable[..., Any],
+        fn: Callable[P, R],
         *,
         retries: int,
         timeout: float | None,
@@ -120,7 +140,7 @@ class Task:
             )
         _TASK_REGISTRY[self.name] = self
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         ctx = current_run_context()
         if ctx is None:
             return self._run_uncached(args, kwargs)
@@ -190,7 +210,7 @@ class Task:
                     continue
                 raise
 
-    async def arun(self, *args: Any, **kwargs: Any) -> Any:
+    async def arun(self, *args: P.args, **kwargs: P.kwargs) -> R:
         """Async twin of :meth:`__call__` -- runs natively on the CALLER's own
         running event loop (v0.4.0 Plan B, Task 6; T7 consumes this from an
         async ``@flow`` body).
@@ -264,8 +284,33 @@ class Task:
                 raise
 
 
+class _TaskDecorator(Protocol):
+    """Return type of the parenthesized ``@task(...)`` form -- a decorator with
+    the SAME coroutine-unwrapping overload pair as the bare ``task`` below, so
+    ``@task(retries=...)`` on an ``async def`` body infers the awaited ``R``
+    too (not ``Coroutine[..., R]``)."""
+
+    @overload
+    def __call__(self, fn: Callable[P, Coroutine[Any, Any, R]], /) -> Task[P, R]: ...
+    @overload
+    def __call__(self, fn: Callable[P, R], /) -> Task[P, R]: ...
+
+
+# A `@task` on an `async def` body BRIDGES the coroutine to its awaited value at
+# call time (`Task.__call__`/`Task._execute` run it via `_runtime.run_sync`) --
+# so the coroutine-unwrapping overload (`Callable[P, Coroutine[Any, Any, R]] ->
+# Task[P, R]`) makes `task_obj(...)` type as the awaited `R`, matching runtime,
+# rather than a never-returned `Coroutine`. This is the same house pattern
+# `combinators.map`/`amap` already use for their own `async def` stages
+# (v0.5.0 Plan B, Task 3 -- finding I2); it is the one shape difference from
+# Task 4's plain 2-overload `@agent` (whose body is a prompt builder, not a
+# sync-bridged callable). Sync bodies never match the coroutine arm (their
+# return type is a plain value, not `Coroutine[...]`) and fall through to the
+# second overload unchanged.
 @overload
-def task(fn: Callable[..., Any]) -> Task: ...
+def task(fn: Callable[P, Coroutine[Any, Any, R]], /) -> Task[P, R]: ...
+@overload
+def task(fn: Callable[P, R], /) -> Task[P, R]: ...
 
 
 @overload
@@ -275,7 +320,7 @@ def task(
     timeout: float | None = None,
     name: str | None = None,
     replace: bool = False,
-) -> Callable[[Callable[..., Any]], Task]: ...
+) -> _TaskDecorator: ...
 
 
 def task(
@@ -285,11 +330,15 @@ def task(
     timeout: float | None = None,
     name: str | None = None,
     replace: bool = False,
-) -> Task | Callable[[Callable[..., Any]], Task]:
+) -> Any:
     """Decorate a plain function into a :class:`Task` -- journaled when called inside a ``@flow``.
 
     Usable bare (``@task``) or with arguments (``@task(retries=2,
-    timeout=30, name=...)``).
+    timeout=30, name=...)``) -- the two-overload dual form (v0.5.0 Plan B,
+    Task 5) mirrors ``@agent``/``@flow``: the bare form infers ``Task[P, R]``
+    straight from the decorated function's own signature (``P`` its parameters,
+    ``R`` its return type), so ``task_obj(...)`` -- which executes directly, a
+    ``@task`` has no ``.run()`` -- is fully typed.
 
     ``replace=True`` re-binds an existing task name instead of raising
     ``ConfigError``. A replaced task only affects steps not yet journaled --
@@ -414,7 +463,7 @@ def _decode_call(args_json: str) -> tuple[tuple[Any, ...], dict[str, Any]]:
     return tuple(payload["args"]), payload["kwargs"]
 
 
-class Flow:
+class Flow(Generic[P, R]):
     """The callable object produced by ``@flow``.
 
     ``flow_obj(x)`` is sugar for ``flow_obj.run(x).output``. ``.run()``
@@ -422,7 +471,7 @@ class Flow:
     existing one (by ``run_id``), in this process or a fresh one.
     """
 
-    def __init__(self, fn: Callable[..., Any], *, name: str | None, replace: bool) -> None:
+    def __init__(self, fn: Callable[P, R], *, name: str | None, replace: bool) -> None:
         self._fn = fn
         self.name = name or fn.__name__
         self.fingerprint = _compute_fingerprint(fn)
@@ -441,7 +490,7 @@ class Flow:
             )
         _FLOW_REGISTRY[self.name] = self
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+    def __call__(self, *args: P.args, **kwargs: P.kwargs) -> R:
         # A @flow called from inside another active @flow body is a *nested*
         # flow call -- journal it as one step of the ENCLOSING flow (like a
         # nested @agent call -- see agentfn._run_agent), instead of always
@@ -454,7 +503,7 @@ class Flow:
             return _run_flow_journaled(self, ctx, args, kwargs).output
         return self.run(*args, **kwargs).output
 
-    def run(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run:
+    def run(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run[R]:
         args_json = _encode_call(args, kwargs)  # rejects unserializable args up front
         store = _open_default_store()
         run_id = new_ulid()
@@ -478,7 +527,7 @@ class Flow:
             )
         )
 
-    async def arun(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run:
+    async def arun(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run[R]:
         """Async twin of :meth:`run` (v0.4.0 Plan B, Task 7) -- runs natively
         on the CALLER's own running event loop: no ``_runtime.run_sync``,
         no composeai runtime loop involved at all.
@@ -558,26 +607,45 @@ class Flow:
             self, run_id=run_id, trace_id=trace_id, args=args, kwargs=kwargs, budget=budget
         )
 
-    def stream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> RunStream:
+    def stream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> RunStream[R]:
         return agentfn._stream_run(lambda: self.run(*args, budget=budget, **kwargs))
 
 
+class _FlowDecorator(Protocol):
+    """Return type of the parenthesized ``@flow(...)`` form -- the ``Flow`` twin
+    of :class:`_TaskDecorator` (same coroutine-unwrapping rationale)."""
+
+    @overload
+    def __call__(self, fn: Callable[P, Coroutine[Any, Any, R]], /) -> Flow[P, R]: ...
+    @overload
+    def __call__(self, fn: Callable[P, R], /) -> Flow[P, R]: ...
+
+
+# Same coroutine-unwrapping as ``@task`` above (see :class:`_TaskDecorator`'s
+# module comment): a ``@flow`` on an ``async def`` body sync-bridges its
+# coroutine (``Flow.run``/``Flow.__call__`` via ``_runtime.run_sync``), so the
+# unwrapping overload makes ``flow_obj(...) -> R`` and ``flow_obj.run(...) ->
+# Run[R]`` report the awaited ``R``, not ``Coroutine[..., R]``.
 @overload
-def flow(fn: Callable[..., Any]) -> Flow: ...
+def flow(fn: Callable[P, Coroutine[Any, Any, R]], /) -> Flow[P, R]: ...
+@overload
+def flow(fn: Callable[P, R], /) -> Flow[P, R]: ...
 
 
 @overload
-def flow(
-    *, name: str | None = None, replace: bool = False
-) -> Callable[[Callable[..., Any]], Flow]: ...
+def flow(*, name: str | None = None, replace: bool = False) -> _FlowDecorator: ...
 
 
 def flow(
     fn: Callable[..., Any] | None = None, *, name: str | None = None, replace: bool = False
-) -> Flow | Callable[[Callable[..., Any]], Flow]:
+) -> Any:
     """Decorate a plain function into a :class:`Flow` -- a durable, journaled run.
 
-    Usable bare (``@flow``) or with arguments (``@flow(name=...)``).
+    Usable bare (``@flow``) or with arguments (``@flow(name=...)``) -- the
+    two-overload dual form (v0.5.0 Plan B, Task 5) mirrors ``@agent``/``@task``:
+    the bare form infers ``Flow[P, R]`` straight from the decorated function's
+    own signature (``P`` its parameters, ``R`` its return type), so
+    ``flow_obj(...) -> R`` and ``flow_obj.run(...)/.arun(...) -> Run[R]``.
     Registers ``name -> Flow`` in a module-level registry (duplicate names
     raise :class:`~composeai.errors.ConfigError`) so :func:`resume` can
     look a flow up by name from a run row.
@@ -605,7 +673,7 @@ async def _aexecute_flow(
     args: tuple[Any, ...],
     kwargs: dict[str, Any],
     budget: Budget | None,
-) -> Run:
+) -> Run[Any]:
     """Async core of the flow engine (v0.4.0 Plan A, Task 9; docstring
     harmonized in Plan B, Task 9) -- mirrors the former ``_execute_flow``
     exactly on the sync path. Four callers reach it now: ``Flow.run()``/
@@ -775,7 +843,7 @@ async def _aexecute_flow(
 
 def _run_flow_journaled(
     flow_obj: Flow, ctx: JournalScope, args: tuple[Any, ...], kwargs: dict[str, Any]
-) -> Run:
+) -> Run[Any]:
     """Treat one whole nested ``@flow`` call (invoked from inside another
     active ``@flow`` body) as a single journaled step of the ENCLOSING flow.
 
@@ -859,7 +927,7 @@ def _run_flow_journaled(
 
 async def _arun_flow_journaled(
     flow_obj: Flow, ctx: JournalScope, args: tuple[Any, ...], kwargs: dict[str, Any]
-) -> Run:
+) -> Run[Any]:
     """Async twin of :func:`_run_flow_journaled` (v0.4.0 Plan B, Task 8) --
     same replay/miss contract, byte-identical -- see its docstring first.
 
@@ -950,7 +1018,7 @@ def resume(
     *,
     budget: Budget | None = None,
     allow_code_change: bool = False,
-) -> Run:
+) -> Run[Any]:
     """Resume a durable run (``@flow`` or standalone ``@agent``) by ``run_id``.
 
     The one entry point for every kind of durable run, in this process or a
@@ -1055,7 +1123,7 @@ async def aresume(
     *,
     budget: Budget | None = None,
     allow_code_change: bool = False,
-) -> Run:
+) -> Run[Any]:
     """Async twin of :func:`resume` (v0.4.0 Plan B, Task 7) -- same
     contract and the same check order (nothing persisted before the
     abort-checks below -- see :func:`resume`'s docstring first, unchanged

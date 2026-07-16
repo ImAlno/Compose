@@ -31,7 +31,9 @@ from collections.abc import AsyncIterator, Callable, Coroutine, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Any, Generic, Literal, Protocol, runtime_checkable
+
+from typing_extensions import TypeVar
 
 from . import tracing
 from ._encoding import from_jsonable, to_jsonable
@@ -49,9 +51,22 @@ if TYPE_CHECKING:
     # runtime anyway; this import only serves static type checkers.
     from .hitl import Interrupt
 
+# `default=Any` (PEP 696, via `typing_extensions` since this repo's floor is
+# py>=3.10 -- native `typing.TypeVar(default=...)` only exists from 3.13) is
+# what makes a *bare* `Run`/`RunStream`/`AsyncRunStream` annotation mean
+# `Run[Any]` rather than tripping `reportMissingTypeArgument` under strict
+# pyright -- verified in
+# plans/superpowers/research/2026-07-16-typing/prototype/probe_run_default.py.
+# composeai's own ~40 internal producer/consumer sites (agentfn.py,
+# combinators.py, flow.py, this module) are re-annotated `Run[Any]`
+# explicitly below regardless, since they're pyright-only concerned with
+# suppressing the reportMissingTypeArgument the moment strict is ever
+# turned on -- the default only has to carry *external* bare usage.
+R = TypeVar("R", default=Any)
+
 
 @dataclass
-class Run:
+class Run(Generic[R]):
     """The outcome of one ``@agent`` invocation.
 
     ``pending`` is set (to the :class:`~composeai.hitl.Interrupt` that
@@ -65,14 +80,14 @@ class Run:
 
     id: str
     status: Literal["completed", "paused", "failed"]
-    output: Any
+    output: R
     usage: Usage
     trace: Trace
     messages: list[Message]
     pending: Interrupt | None = None
 
 
-class RunStream:
+class RunStream(Generic[R]):
     """Iterable of :class:`~composeai.events.Event` for one streaming ``@agent`` call.
 
     Constructed by :meth:`~composeai.agentfn.AgentFunction.stream` -- never
@@ -93,7 +108,7 @@ class RunStream:
     def __init__(self, subscription: Subscription, thread: threading.Thread) -> None:
         self._subscription = subscription
         self._thread = thread
-        self._run: Run | None = None
+        self._run: Run[R] | None = None
         self._exception: BaseException | None = None
 
     def __iter__(self) -> Iterator[Event]:
@@ -110,13 +125,13 @@ class RunStream:
         """
         self._subscription.close()
 
-    def _set_outcome(self, *, run: Run | None, exception: BaseException | None) -> None:
+    def _set_outcome(self, *, run: Run[R] | None, exception: BaseException | None) -> None:
         """Record the worker thread's result. Called once, by that thread itself."""
         self._run = run
         self._exception = exception
 
     @property
-    def run(self) -> Run:
+    def run(self) -> Run[R]:
         """Join the worker thread and return its :class:`Run`.
 
         Re-raises the loop's original exception (same object) if it failed.
@@ -128,7 +143,7 @@ class RunStream:
         return self._run
 
 
-class AsyncRunStream:
+class AsyncRunStream(Generic[R]):
     """Asyncio-native twin of :class:`RunStream` (v0.4.0 Plan B).
 
     Constructed by the async engine's streaming entry point -- never
@@ -156,7 +171,7 @@ class AsyncRunStream:
     :meth:`run` or iterate to completion to avoid it.
     """
 
-    def __init__(self, task: asyncio.Task[Run], subscription: AsyncSubscription) -> None:
+    def __init__(self, task: asyncio.Task[Run[R]], subscription: AsyncSubscription) -> None:
         self._task = task
         self._subscription = subscription
 
@@ -172,7 +187,7 @@ class AsyncRunStream:
         """
         self._subscription.close()
 
-    async def run(self) -> Run:
+    async def run(self) -> Run[R]:
         """Await the task and return its :class:`Run`.
 
         Re-raises the task's original exception verbatim if it failed.
@@ -1748,10 +1763,10 @@ def _error_payload(exc: BaseException) -> dict[str, str]:
 def run_standalone_agent(
     name: str,
     args_json: str | None,
-    thunk: Callable[[], Run],
+    thunk: Callable[[], Run[Any]],
     *,
     budget: Budget | None = None,
-) -> Run:
+) -> Run[Any]:
     """Wrap a root-level ``agent.run()`` call with a durable ``runs`` row (kind ``"agent"``).
 
     Called by :mod:`composeai.agentfn` only when the agent call is a trace
@@ -1792,7 +1807,7 @@ def run_standalone_agent(
         return settle_agent_run(store, run_id, thunk)
 
 
-def settle_agent_run(store: RunStore, run_id: str, thunk: Callable[[], Run]) -> Run:
+def settle_agent_run(store: RunStore, run_id: str, thunk: Callable[[], Run[Any]]) -> Run[Any]:
     """Run ``thunk`` to completion or pause, persisting the outcome to ``run_id``'s row.
 
     Shared by a fresh standalone agent run (:func:`run_standalone_agent`) and
@@ -1870,8 +1885,8 @@ def settle_agent_run(store: RunStore, run_id: str, thunk: Callable[[], Run]) -> 
 
 
 async def asettle_agent_run(
-    store: RunStore, run_id: str, thunk: Callable[[], Coroutine[Any, Any, Run]]
-) -> Run:
+    store: RunStore, run_id: str, thunk: Callable[[], Coroutine[Any, Any, Run[Any]]]
+) -> Run[Any]:
     """Async twin of :func:`settle_agent_run` (v0.4.0 Plan B, Task 4).
 
     Same status transitions/pause handling as the sync version -- read its
@@ -1936,10 +1951,10 @@ async def asettle_agent_run(
 async def arun_standalone_agent(
     name: str,
     args_json: str | None,
-    thunk: Callable[[], Coroutine[Any, Any, Run]],
+    thunk: Callable[[], Coroutine[Any, Any, Run[Any]]],
     *,
     budget: Budget | None = None,
-) -> Run:
+) -> Run[Any]:
     """Async twin of :func:`run_standalone_agent` (v0.4.0 Plan B, Task 4).
 
     Same shape as the sync version -- read its docstring first -- pre-

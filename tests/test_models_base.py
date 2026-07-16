@@ -139,7 +139,7 @@ def test_raw_stream_event_defaults():
 def test_raw_stream_event_is_frozen():
     event = RawStreamEvent(kind="text_delta")
     with pytest.raises(AttributeError):
-        event.text = "x"  # type: ignore[misc]
+        event.text = "x"  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_raw_stream_event_carries_tool_fields():

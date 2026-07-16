@@ -176,7 +176,7 @@ def test_stream_structured_output():
     @agent(model=model, max_turns=3)
     def runner() -> Out:
         """Runner."""
-        return "go"  # type: ignore[return-value]
+        return "go"  # pyright: ignore[reportReturnType]
 
     run_stream = runner.stream()
     list(run_stream)

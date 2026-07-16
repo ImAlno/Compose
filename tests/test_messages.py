@@ -153,7 +153,7 @@ def test_message_round_trip_from_dict():
 def test_message_is_frozen():
     msg = Message.user("hi")
     with pytest.raises(ValidationError):
-        msg.role = "assistant"  # type: ignore[misc]
+        msg.role = "assistant"
 
 
 # --- Usage ---
@@ -242,7 +242,7 @@ def test_usage_add_both_known_but_one_incomplete_still_sums_and_flags_incomplete
 def test_usage_is_frozen():
     u = Usage()
     with pytest.raises(ValidationError):
-        u.cost_usd = 5.0  # type: ignore[misc]
+        u.cost_usd = 5.0
 
 
 # --- StopReason ---

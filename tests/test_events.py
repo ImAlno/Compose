@@ -28,7 +28,7 @@ def test_event_defaults():
 def test_event_is_frozen():
     e = Event(kind="text_delta")
     with pytest.raises(AttributeError):
-        e.text = "x"  # type: ignore[misc]
+        e.text = "x"  # pyright: ignore[reportAttributeAccessIssue]
 
 
 def test_event_has_slots_no_dict():

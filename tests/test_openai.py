@@ -182,7 +182,7 @@ class _AsyncStubClient:
 
 def _amodel(responses, model_id: str = "gpt-5-test") -> OpenAIModel:
     model = OpenAIModel(model_id)
-    model._async_client = _AsyncStubClient(responses)  # type: ignore[attr-defined]
+    model._async_client = _AsyncStubClient(responses)
     return model
 
 
@@ -313,7 +313,7 @@ class _AsyncStubResponseStream:
 
 def _amodel_stream(stream_responses, model_id: str = "gpt-5-test") -> OpenAIModel:
     model = OpenAIModel(model_id)
-    model._async_client = _AsyncStubClient([], stream_responses)  # type: ignore[attr-defined]
+    model._async_client = _AsyncStubClient([], stream_responses)
     return model
 
 
@@ -349,7 +349,7 @@ def test_instructions_omitted_when_system_none():
     model = _model([_response([_message_item(_output_text_content("ok"))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert "instructions" not in call
 
 
@@ -357,7 +357,7 @@ def test_instructions_included_when_system_set():
     model = _model([_response([_message_item(_output_text_content("ok"))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")], system="be terse")
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["instructions"] == "be terse"
 
 
@@ -365,7 +365,7 @@ def test_temperature_omitted_when_none():
     model = _model([_response([_message_item(_output_text_content("ok"))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert "temperature" not in call
 
 
@@ -373,7 +373,7 @@ def test_temperature_passed_through_when_set():
     model = _model([_response([_message_item(_output_text_content("ok"))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")], temperature=0.4)
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["temperature"] == 0.4
 
 
@@ -381,7 +381,7 @@ def test_max_output_tokens_passed_through():
     model = _model([_response([_message_item(_output_text_content("ok"))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")], max_tokens=42)
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["max_output_tokens"] == 42
 
 
@@ -392,7 +392,7 @@ def test_user_text_part_maps_to_message_item_with_input_text():
     model = _model([_response([_message_item(_output_text_content("ok"))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hello")])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["input"] == [{"role": "user", "content": [{"type": "input_text", "text": "hello"}]}]
 
 
@@ -401,7 +401,7 @@ def test_user_image_part_base64_maps_to_input_image_data_url():
     image = ImagePart(media_type="image/png", data="YWJj")
     request = ModelRequest(model="gpt-5-test", messages=[Message.user([image])])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     item = call["input"][0]["content"][0]
     assert item["type"] == "input_image"
     assert item["image_url"] == "data:image/png;base64,YWJj"
@@ -412,7 +412,7 @@ def test_user_image_part_url_maps_to_input_image_url():
     image = ImagePart(media_type="image/png", url="https://example.com/x.png")
     request = ModelRequest(model="gpt-5-test", messages=[Message.user([image])])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     item = call["input"][0]["content"][0]
     assert item["type"] == "input_image"
     assert item["image_url"] == "https://example.com/x.png"
@@ -424,7 +424,7 @@ def test_assistant_text_part_maps_to_assistant_message_item():
         model="gpt-5-test", messages=[Message.assistant("prior reply"), Message.user("go on")]
     )
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["input"][0] == {
         "role": "assistant",
         "content": [{"type": "input_text", "text": "prior reply"}],
@@ -436,7 +436,7 @@ def test_tool_call_part_maps_to_function_call_item_with_call_id():
     call_part = ToolCallPart(id="tc1", name="search", arguments={"q": "cats"})
     request = ModelRequest(model="gpt-5-test", messages=[Message.assistant([call_part])])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     item = call["input"][0]
     assert item == {
         "type": "function_call",
@@ -451,7 +451,7 @@ def test_tool_result_part_maps_without_error_prefix_when_not_error():
     result = ToolResultPart(tool_call_id="tc1", content="42")
     request = ModelRequest(model="gpt-5-test", messages=[Message.user([result])])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["input"][0] == {"type": "function_call_output", "call_id": "tc1", "output": "42"}
 
 
@@ -460,7 +460,7 @@ def test_tool_result_part_prepends_error_when_is_error():
     result = ToolResultPart(tool_call_id="tc1", content="boom", is_error=True)
     request = ModelRequest(model="gpt-5-test", messages=[Message.user([result])])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["input"][0]["output"] == "ERROR: boom"
 
 
@@ -478,7 +478,7 @@ def test_multiple_tool_results_become_separate_items_not_batched():
         ],
     )
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["input"] == [
         {"type": "function_call_output", "call_id": "tc1", "output": "a"},
         {"type": "function_call_output", "call_id": "tc2", "output": "b"},
@@ -508,7 +508,7 @@ def test_history_echo_includes_function_call_items_with_same_call_id():
         ],
     )
     model.complete(request2)
-    call2 = model._client.responses.calls[1]  # type: ignore[attr-defined]
+    call2 = model._client.responses.calls[1]  # pyright: ignore[reportAttributeAccessIssue]
     function_call_items = [i for i in call2["input"] if i.get("type") == "function_call"]
     assert len(function_call_items) == 1
     assert function_call_items[0]["call_id"] == "call-abc"
@@ -527,7 +527,7 @@ def test_tools_mapped_flat_with_parameters_and_strict():
     )
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")], tools=[spec])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["tools"] == [
         {
             "type": "function",
@@ -543,7 +543,7 @@ def test_tools_omitted_when_none():
     model = _model([_response([_message_item(_output_text_content("ok"))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert "tools" not in call
 
 
@@ -561,7 +561,7 @@ def test_output_schema_maps_to_text_format_json_schema():
     model = _model([_response([_message_item(_output_text_content('{"a": 1}'))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")], output_schema=schema)
     resp = model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["text"] == {
         "format": {"type": "json_schema", "name": "response", "schema": schema, "strict": True}
     }
@@ -573,7 +573,7 @@ def test_output_schema_uses_title_as_name_when_valid():
     model = _model([_response([_message_item(_output_text_content('{"a": 1}'))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")], output_schema=schema)
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["text"]["format"]["name"] == "MyAnswer"
 
 
@@ -606,7 +606,7 @@ def test_default_valued_property_downgrades_tool_to_non_strict():
     model = _model([_response([_message_item(_output_text_content("ok"))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")], tools=[spec])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["tools"][0]["strict"] is False
     # The schema itself is never mutated to "fix" it -- sent verbatim.
     assert call["tools"][0]["parameters"] == schema
@@ -623,7 +623,7 @@ def test_schema_valued_additional_properties_downgrades_tool_to_non_strict():
     model = _model([_response([_message_item(_output_text_content("ok"))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")], tools=[spec])
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["tools"][0]["strict"] is False
     assert call["tools"][0]["parameters"] == schema
 
@@ -641,7 +641,7 @@ def test_default_valued_property_downgrades_output_schema_to_non_strict():
     model = _model([_response([_message_item(_output_text_content('{"answer": "x"}'))])])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")], output_schema=schema)
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["text"]["format"]["strict"] is False
     assert call["text"]["format"]["schema"] == schema
 
@@ -918,7 +918,7 @@ def test_reasoning_part_echoed_verbatim_when_same_model():
         ],
     )
     model.complete(request2)
-    call2 = model._client.responses.calls[1]  # type: ignore[attr-defined]
+    call2 = model._client.responses.calls[1]  # pyright: ignore[reportAttributeAccessIssue]
     # The reasoning item is a top-level input item, not message content.
     top_level_reasoning = [i for i in call2["input"] if i.get("type") == "reasoning"]
     assert len(top_level_reasoning) == 1
@@ -945,7 +945,7 @@ def test_reasoning_part_dropped_when_different_model():
         ],
     )
     consumer.complete(request2)
-    call = consumer._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = consumer._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert all(i.get("type") != "reasoning" for i in call["input"])
 
 
@@ -957,7 +957,7 @@ def test_reasoning_part_dropped_when_different_provider():
         messages=[Message.assistant([other_provider_part])],
     )
     model.complete(request)
-    call = model._client.responses.calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     # The assistant message contributed no content and no reasoning item.
     assert call["input"] == []
 
@@ -1135,7 +1135,7 @@ def test_stream_records_request_shape_via_stub_calls():
     model = _model_stream([_StubResponseStream(events, final)])
     request = ModelRequest(model="gpt-5-test", messages=[Message.user("hi")], system="be terse")
     list(model.stream(request))
-    call = model._client.responses.stream_calls[0]  # type: ignore[attr-defined]
+    call = model._client.responses.stream_calls[0]  # pyright: ignore[reportAttributeAccessIssue]
     assert call["instructions"] == "be terse"
     assert call["model"] == "gpt-5-test"
 
@@ -1543,4 +1543,4 @@ def test_injected_sync_client_used_by_async_engine():
 
     assert run.output == "Hello there."
     assert run.status == "completed"
-    assert len(model._client.responses.calls) == 1  # type: ignore[attr-defined]
+    assert len(model._client.responses.calls) == 1

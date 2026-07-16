@@ -192,7 +192,7 @@ def test_register_annotation_types_recurses_into_dataclass_field_types_under_fut
     # Confirms the actual root cause: an unresolved string, not a class.
     assert dataclasses.fields(FutureOuter)[0].type == "FutureInner"
 
-    def fn(o: FutureOuter) -> None:  # type: ignore[valid-type]
+    def fn(o: FutureOuter) -> None:  # pyright: ignore[reportInvalidTypeForm]
         raise NotImplementedError
 
     _unregister(FutureOuter)

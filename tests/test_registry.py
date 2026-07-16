@@ -83,7 +83,7 @@ def test_resolve_passes_through_existing_model_instance():
 
 def test_resolve_rejects_non_string_non_model():
     with pytest.raises(ConfigError):
-        registry.resolve(12345)  # type: ignore[arg-type]
+        registry.resolve(12345)  # pyright: ignore[reportArgumentType]
 
 
 # --- resolve: caching ---
