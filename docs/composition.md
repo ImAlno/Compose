@@ -91,6 +91,10 @@ research_and_summarize = compose.pipe(
 
 Every nested `Pipeline`/`Aggregate` exposes the same `.input_type`/`.output_type` a plain `@agent` does, so build-time type checking applies uniformly no matter how deep the nesting goes.
 
+## Async: `.arun()`/`.astream()`, `amap()`
+
+Every `pipe()`/`aggregate()` result also exposes `.arun()`/`.astream()` alongside `.run()`/`.stream()`, running natively on your own event loop instead of composeai's background runtime thread. `compose.map()` has its own async twin, `amap()` — identical contract (`max_workers`, `timeout_per_item`, `on_error`), just awaited directly instead of bridged through that thread. See [async](async.md) for the full async surface.
+
 ## See also
 
 [agents](agents.md) covers the `@agent` idiom these stages are usually built from; [flows](flows.md) makes a sequence of combinator calls durable and resumable; [budgets](budgets.md) covers `budget=` on a top-level `pipe`/`aggregate` `.run()` call.

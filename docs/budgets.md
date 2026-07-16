@@ -127,6 +127,8 @@ resume(run.id, answers={"continue": True}, budget=Budget(usd=5.0))
 
 Prior attempts' real spend still counts against the new cap — raising the limit doesn't erase what was already spent, it only moves the ceiling. Omitting `budget=` (the default, `None`) keeps whatever budget was already stored; there's no way to *clear* a budget via `resume()` once one is set.
 
+`aresume(run_id, budget=...)` is `resume()`'s async twin and works identically — same override (last-write-wins) and same cumulative-spend accounting — see [async](async.md).
+
 ## `BudgetExceededError` handling
 
 `BudgetExceededError` is a `ComposeError`, raised by the budget check immediately after the LLM call that crossed the line — the call itself already happened (and was already billed/journaled); the error just stops the run from making another one. Its message names the span that tripped it, plus the configured cap and the usage that exceeded it:

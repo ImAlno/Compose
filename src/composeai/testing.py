@@ -686,6 +686,13 @@ class CachingModel:
 
         Shadowed off (set to ``None`` in :meth:`__init__`) when the inner
         model has no ``acomplete`` -- see the class docstring.
+
+        The cache file I/O itself (``path.exists()``/``path.read_text()`` on
+        a hit, :meth:`_write_cache_file` on a miss) runs synchronously on
+        the CALLER's own loop -- unlike the rest of the async engine, which
+        routes blocking work off-loop (e.g. ``composeai._storeasync``'s
+        writer thread). Fine for a testing-only tool exercised by tests, but
+        not something to reach for in a latency-sensitive production loop.
         """
         key = compute_full_hash(request)
         path = self._cache_dir / f"{key}.json"

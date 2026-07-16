@@ -755,7 +755,7 @@ async def _aexecute_flow(
                 run_id,
                 status="failed",
                 updated_at=now,
-                error_json=json.dumps({"type": type(exc).__name__, "message": str(exc)}),
+                error_json=json.dumps(runs._error_payload(exc)),
             )
             if root_span is not None:
                 tracing.emit_run_finished(root_span, status="failed", error_type=type(exc).__name__)

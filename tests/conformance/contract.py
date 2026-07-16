@@ -18,9 +18,27 @@ provider-specific and lives in that provider's own test file, not here.
 
 from __future__ import annotations
 
+from typing import Protocol
+
 from composeai.errors import ProviderError
 from composeai.messages import Message, StopReason, ToolCallPart, ToolResultPart
-from composeai.models.base import Model, ModelRequest
+from composeai.models.base import Model, ModelRequest, ModelResponse
+
+
+class AsyncModel(Protocol):
+    """Structural type for the ``acomplete`` half of :class:`Model`.
+
+    ``Model`` (``composeai.models.base``) deliberately declares only
+    ``complete()`` -- ``acomplete``/``astream`` are optional, duck-typed
+    extras the engine discovers with ``getattr(model, "acomplete", None)``
+    rather than protocol members (see that class's docstring). The
+    ``assert_async_*`` twins below need a type that pyright will let them
+    call ``.acomplete()`` on; this narrower protocol exists only for that,
+    scoped to this test-support module -- it is not part of the public
+    ``Model`` contract.
+    """
+
+    async def acomplete(self, request: ModelRequest) -> ModelResponse: ...
 
 
 def assert_text_completion(model: Model, *, model_id: str, expected_text: str) -> None:
@@ -33,10 +51,33 @@ def assert_text_completion(model: Model, *, model_id: str, expected_text: str) -
     assert response.model_id == model_id
 
 
+async def assert_async_text_completion(
+    model: AsyncModel, *, model_id: str, expected_text: str
+) -> None:
+    """(a) Async twin of :func:`assert_text_completion`, via ``model.acomplete()``."""
+    request = ModelRequest(model=model_id, messages=[Message.user("hello")])
+    response = await model.acomplete(request)
+    assert response.message.role == "assistant"
+    assert response.message.text == expected_text
+    assert response.stop_reason == StopReason.END_TURN
+    assert response.model_id == model_id
+
+
 def assert_tool_call(model: Model, *, model_id: str, tool_name: str) -> None:
     """(b) A tool-call response maps to one ``ToolCallPart`` with a real id."""
     request = ModelRequest(model=model_id, messages=[Message.user("call the tool")])
     response = model.complete(request)
+    assert response.stop_reason == StopReason.TOOL_USE
+    calls = [p for p in response.message.parts if isinstance(p, ToolCallPart)]
+    assert len(calls) == 1
+    assert calls[0].name == tool_name
+    assert isinstance(calls[0].id, str) and calls[0].id
+
+
+async def assert_async_tool_call(model: AsyncModel, *, model_id: str, tool_name: str) -> None:
+    """(b) Async twin of :func:`assert_tool_call`, via ``model.acomplete()``."""
+    request = ModelRequest(model=model_id, messages=[Message.user("call the tool")])
+    response = await model.acomplete(request)
     assert response.stop_reason == StopReason.TOOL_USE
     calls = [p for p in response.message.parts if isinstance(p, ToolCallPart)]
     assert len(calls) == 1
@@ -71,6 +112,28 @@ def assert_tool_result_batching_survives_round_trip(
     assert response.message.role == "assistant"
 
 
+async def assert_async_tool_result_batching_survives_round_trip(
+    model: AsyncModel, *, model_id: str, tool_call_id: str
+) -> None:
+    """(c) Async twin of :func:`assert_tool_result_batching_survives_round_trip`,
+    via ``model.acomplete()``.
+    """
+    request = ModelRequest(
+        model=model_id,
+        messages=[
+            Message.assistant([ToolCallPart(id=tool_call_id, name="f", arguments={})]),
+            Message.user(
+                [
+                    ToolResultPart(tool_call_id=tool_call_id, content="result one"),
+                    ToolResultPart(tool_call_id="other-id", content="result two"),
+                ]
+            ),
+        ],
+    )
+    response = await model.acomplete(request)
+    assert response.message.role == "assistant"
+
+
 def assert_structured_output(model: Model, *, model_id: str, expected: dict) -> None:
     """(d) ``output_schema`` set -> ``parsed`` carries the decoded JSON dict."""
     request = ModelRequest(
@@ -79,6 +142,20 @@ def assert_structured_output(model: Model, *, model_id: str, expected: dict) -> 
         output_schema={"type": "object"},
     )
     response = model.complete(request)
+    assert response.parsed == expected
+    assert response.stop_reason == StopReason.END_TURN
+
+
+async def assert_async_structured_output(
+    model: AsyncModel, *, model_id: str, expected: dict
+) -> None:
+    """(d) Async twin of :func:`assert_structured_output`, via ``model.acomplete()``."""
+    request = ModelRequest(
+        model=model_id,
+        messages=[Message.user("give me json")],
+        output_schema={"type": "object"},
+    )
+    response = await model.acomplete(request)
     assert response.parsed == expected
     assert response.stop_reason == StopReason.END_TURN
 
@@ -110,12 +187,39 @@ def assert_tool_use_with_output_schema_does_not_crash(
     assert response.parsed is None
 
 
+async def assert_async_tool_use_with_output_schema_does_not_crash(
+    model: AsyncModel, *, model_id: str, tool_name: str
+) -> None:
+    """(d2) Async twin of :func:`assert_tool_use_with_output_schema_does_not_crash`,
+    via ``model.acomplete()``.
+    """
+    request = ModelRequest(
+        model=model_id,
+        messages=[Message.user("call the tool")],
+        output_schema={"type": "object"},
+    )
+    response = await model.acomplete(request)
+    assert response.stop_reason == StopReason.TOOL_USE
+    assert response.parsed is None
+
+
 def assert_stop_reason_mapping(
     model: Model, *, model_id: str, expected: StopReason, expected_raw: str | None = None
 ) -> None:
     """(e) One entry of a provider's raw-stop-reason -> ``StopReason`` table."""
     request = ModelRequest(model=model_id, messages=[Message.user("hi")])
     response = model.complete(request)
+    assert response.stop_reason == expected
+    if expected_raw is not None:
+        assert response.raw_stop_reason == expected_raw
+
+
+async def assert_async_stop_reason_mapping(
+    model: AsyncModel, *, model_id: str, expected: StopReason, expected_raw: str | None = None
+) -> None:
+    """(e) Async twin of :func:`assert_stop_reason_mapping`, via ``model.acomplete()``."""
+    request = ModelRequest(model=model_id, messages=[Message.user("hi")])
+    response = await model.acomplete(request)
     assert response.stop_reason == expected
     if expected_raw is not None:
         assert response.raw_stop_reason == expected_raw
@@ -131,11 +235,36 @@ def assert_usage_lands(
     assert response.usage.output_tokens == expected_output
 
 
+async def assert_async_usage_lands(
+    model: AsyncModel, *, model_id: str, expected_input: int, expected_output: int
+) -> None:
+    """(f) Async twin of :func:`assert_usage_lands`, via ``model.acomplete()``."""
+    request = ModelRequest(model=model_id, messages=[Message.user("hi")])
+    response = await model.acomplete(request)
+    assert response.usage.input_tokens == expected_input
+    assert response.usage.output_tokens == expected_output
+
+
 def assert_sdk_failure_raises_provider_error(model: Model, *, model_id: str) -> None:
     """(g) A configured-to-fail model raises ``ProviderError`` from ``complete()``."""
     request = ModelRequest(model=model_id, messages=[Message.user("hi")])
     try:
         model.complete(request)
+    except ProviderError:
+        return
+    raise AssertionError("expected ProviderError to be raised")
+
+
+async def assert_async_sdk_failure_raises_provider_error(
+    model: AsyncModel, *, model_id: str
+) -> None:
+    """(g) Async twin of :func:`assert_sdk_failure_raises_provider_error`,
+    via ``model.acomplete()``. Closes the carried minor: no async
+    APIError -> ``ProviderError`` contract test existed before this.
+    """
+    request = ModelRequest(model=model_id, messages=[Message.user("hi")])
+    try:
+        await model.acomplete(request)
     except ProviderError:
         return
     raise AssertionError("expected ProviderError to be raised")

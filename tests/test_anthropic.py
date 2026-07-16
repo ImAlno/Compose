@@ -1168,6 +1168,100 @@ def test_contract_sdk_failure_raises_provider_error():
     contract.assert_sdk_failure_raises_provider_error(model, model_id="claude-sonnet-5")
 
 
+# --- shared conformance contract, async twins (acomplete) --------------------
+
+
+def test_async_contract_text_completion():
+    import asyncio
+
+    model = _amodel([_response([_text_block("hello there")])])
+    asyncio.run(
+        contract.assert_async_text_completion(
+            model, model_id="claude-sonnet-5", expected_text="hello there"
+        )
+    )
+
+
+def test_async_contract_tool_call():
+    import asyncio
+
+    model = _amodel([_response([_tool_use_block("tu1", "search", {})], stop_reason="tool_use")])
+    asyncio.run(
+        contract.assert_async_tool_call(model, model_id="claude-sonnet-5", tool_name="search")
+    )
+
+
+def test_async_contract_tool_result_batching():
+    import asyncio
+
+    model = _amodel([_response([_text_block("ok")])])
+    asyncio.run(
+        contract.assert_async_tool_result_batching_survives_round_trip(
+            model, model_id="claude-sonnet-5", tool_call_id="tc1"
+        )
+    )
+
+
+def test_async_contract_structured_output():
+    import asyncio
+
+    model = _amodel([_response([_text_block('{"answer": 42}')])])
+    asyncio.run(
+        contract.assert_async_structured_output(
+            model, model_id="claude-sonnet-5", expected={"answer": 42}
+        )
+    )
+
+
+def test_async_contract_tool_use_with_output_schema_does_not_crash():
+    import asyncio
+
+    model = _amodel([_response([_tool_use_block("tu1", "search", {})], stop_reason="tool_use")])
+    asyncio.run(
+        contract.assert_async_tool_use_with_output_schema_does_not_crash(
+            model, model_id="claude-sonnet-5", tool_name="search"
+        )
+    )
+
+
+def test_async_contract_stop_reason_mapping():
+    import asyncio
+
+    model = _amodel([_response([_text_block("x")], stop_reason="max_tokens")])
+    asyncio.run(
+        contract.assert_async_stop_reason_mapping(
+            model,
+            model_id="claude-sonnet-5",
+            expected=StopReason.MAX_TOKENS,
+            expected_raw="max_tokens",
+        )
+    )
+
+
+def test_async_contract_usage_lands():
+    import asyncio
+
+    usage = _usage(input_tokens=11, output_tokens=22)
+    model = _amodel([_response([_text_block("x")], usage=usage)])
+    asyncio.run(
+        contract.assert_async_usage_lands(
+            model, model_id="claude-sonnet-5", expected_input=11, expected_output=22
+        )
+    )
+
+
+def test_async_contract_sdk_failure_raises_provider_error():
+    import asyncio
+
+    def raiser(_kwargs):
+        raise anthropic.APIConnectionError(message="boom", request=_httpx_request())
+
+    model = _amodel(raiser)
+    asyncio.run(
+        contract.assert_async_sdk_failure_raises_provider_error(model, model_id="claude-sonnet-5")
+    )
+
+
 def test_anthropic_model_timeout_passed_to_sdk_client(monkeypatch):
     import anthropic
 

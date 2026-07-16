@@ -139,6 +139,36 @@ stream.run.trace.print()   # blocks until settled; the full trace, same events
 
 The full vocabulary an event's `kind` can take (`composeai.events.Event.kind`) is `span_started`, `text_delta`, `thinking_delta`, `tool_call_started`, `tool_args_delta`, `tool_call_finished`, `span_finished`, `paused`, and `run_finished` — the same events tracing is built from, on agents, pipelines, and flows alike, so a live UI and `compose trace` can never disagree about what happened.
 
+## `.arun()` and `.astream()`
+
+Both have asyncio-native twins, awaited directly on your own already-running event loop instead of composeai's background runtime thread:
+
+```python
+import asyncio
+
+
+async def main() -> None:
+    run = await researcher.arun("quantum computing")
+    print(run.output)
+
+
+asyncio.run(main())
+```
+
+```python
+async def main() -> None:
+    stream = researcher.astream("quantum computing")
+    async for event in stream:
+        if event.kind == "text_delta" and event.text:
+            print(event.text, end="", flush=True)
+    run = await stream.run()   # a method here, unlike sync RunStream.run
+
+
+asyncio.run(main())
+```
+
+An `@agent` function's body may itself be `async def` — composeai awaits it natively either way, so a coroutine body works through both the sync facade and `.arun()`/`.astream()`. See [async](async.md) for the full async surface, including async tool bodies and nested async flows.
+
 ## See also
 
 [composition](composition.md) wires agents together into pipelines with build-time type checking; [flows](flows.md) makes a sequence of agent calls durable and resumable; [testing](testing.md) covers `FakeModel` for testing agents with no network.

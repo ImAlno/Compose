@@ -115,7 +115,9 @@ On this second run, `fetch_sources`, `map(summarize)`, and `editor` all replay f
 
 ### Ctrl-C mid-run
 
-A sync `@flow`/`@agent` call is a facade over composeai's own always-running background engine. Pressing Ctrl-C raises `KeyboardInterrupt` in **your** code immediately, but the current attempt isn't cancelled — it keeps executing on composeai's runtime thread, unobserved by you from that point on; in a long-lived process (a notebook, a REPL) it can run all the way to completion. Either way the durable row lands cleanly — `"completed"`, `"failed"`, or still `"running"` if the process exits first — never a corrupt or half-written one, and every outcome is resumable. Don't `resume()` the same run in the *same* process right after a Ctrl-C expecting the prior attempt to already be gone: it may still be finishing, and it's first-write-wins on the journal (not timing) that keeps the two attempts from stepping on each other. True cancellation of the in-flight attempt isn't implemented today — this is the accepted trade-off of a synchronous facade over an async engine, not a bug.
+A sync `@flow`/`@agent` call is a facade over composeai's own always-running background engine. Pressing Ctrl-C raises `KeyboardInterrupt` in **your** code immediately, and cancels the current attempt too: composeai schedules the engine's task for cancellation on its runtime thread before re-raising, throwing a real `CancelledError` into its await chain — the same mechanism a `timeout=` uses, not a signal merely observed after the fact (best-effort: a Ctrl-C landing in the narrow window before the attempt has even started yet just re-raises, with nothing scheduled to cancel). The durable row still lands cleanly either way — `"completed"`, `"failed"` (with error message `"cancelled"` when the attempt really was interrupted), or still `"running"` if the process exits before cancellation finishes unwinding — never a corrupt or half-written one, and every outcome is resumable.
+
+One thing cancellation *can't* stop: a sync `@task`/`@flow` body already running on its own dedicated worker thread keeps running in the background — Python threads can't be force-stopped — but it loses journal write access the instant the attempt above it is cancelled, so nothing it does afterward can land in the journal. Don't `resume()` the same run in the *same* process immediately after a Ctrl-C expecting that thread to already be gone: it may still be unwinding — it's the abandon-guard, not timing, that keeps its now-pointless work harmless. See [async](async.md) for the full cancellation contract, including the async surface's own equivalent.
 
 ## The determinism rule, and `compose.now()`/`compose.random()`
 
@@ -238,6 +240,37 @@ result = outer_flow(5)   # 11
 
 Without this, resuming `outer_flow` would re-execute `sub_flow`'s entire body — and every `@task`/`@agent` call inside it, including paid LLM calls — from scratch on every attempt, even after it had already completed once. On a journal hit, `sub_flow`'s body never runs again at all; on a miss, it runs for real inside its own nested span (same trace, no new `run_id`) and its output is journaled as the outer flow's step value. A pause raised from inside `sub_flow`'s body isn't caught at the call site — it propagates up to whichever flow (outermost or otherwise) is actually running `resume()`/`.run()`, exactly like a pause inside a nested `@task` would.
 
+## Async: `arun()`, `aresume()`, `anow()`/`arandom()`
+
+`@flow` bodies may be `async def`: call other `@task`/`@agent`s through their own `.arun(...)` twin, read the journal-safe clock/random helpers as `anow()`/`arandom()` instead of `now()`/`random()`, and drive the whole flow via `await flow_obj.arun(...)` / `await aresume(run_id, ...)` — both run natively on your own event loop, never composeai's background runtime thread.
+
+```python
+import asyncio
+import composeai as compose
+
+
+@compose.task
+async def fetch_sources(topic: str) -> list[str]:
+    return [f"https://example.com/{topic}"]
+
+
+@compose.flow
+async def research(topic: str) -> str:
+    sources = await fetch_sources.arun(topic)
+    ts = await compose.anow()
+    return f"{len(sources)} sources as of {ts.isoformat()}"
+
+
+async def main() -> None:
+    run = await research.arun("quantum computing")
+    print(run.output)
+
+
+asyncio.run(main())
+```
+
+`anow()`/`arandom()` draw from the exact same per-run key counter as `now()`/`random()` (`now#1`, `now#2`, ... / `random#1`, ...) — a flow body converted from sync to async (or back) still replays whatever the other version already journaled on an earlier attempt. `aresume()` is `resume()`'s async twin: same contract (`answers=`, `budget=` override, `allow_code_change=`), same cross-process pickup by `run_id`, just awaited on your own loop instead of blocking a thread. See [async](async.md) for the full async surface, including async `@task`/`@tool` bodies and nested async flows.
+
 ## See also
 
-[agents](agents.md) covers the `@agent` idiom used for `editor`-style steps inside a flow; [composition](composition.md) covers `pipe`/`aggregate`/`map`, all usable (and journaled) inside a flow body; [budgets](budgets.md) covers `Budget` and cumulative spend across `resume()` attempts; [observability](observability.md) covers `compose trace` on a paused run and the exact `resume(...)` call it prints for you.
+[agents](agents.md) covers the `@agent` idiom used for `editor`-style steps inside a flow; [composition](composition.md) covers `pipe`/`aggregate`/`map`, all usable (and journaled) inside a flow body; [budgets](budgets.md) covers `Budget` and cumulative spend across `resume()` attempts; [observability](observability.md) covers `compose trace` on a paused run and the exact `resume(...)` call it prints for you; [async](async.md) covers `arun()`/`aresume()` and every other asyncio-native twin in composeai.

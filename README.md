@@ -8,6 +8,7 @@ A radically simple, functional framework for multi-agent AI workflows.
 - **Flows are durable.** A `@flow` journals every step; if it crashes — or pauses on a **named interrupt** (`approve("publish")`) waiting for a human — `resume(run_id)` continues it in the same process or a brand-new one, days later, replaying finished steps without re-paying for them.
 - **Every run can carry a spend cap.** `Budget(usd=..., tokens=...)` is enforced after every LLM call in a run's subtree, and stays cumulative across `resume()` — a run can't dodge its budget by crashing and getting resumed.
 - **Streaming and tracing are the same event bus.** `.stream()` yields `text_delta`/`thinking_delta`/`tool_call_started`/`tool_args_delta` interleaved with the very `span_started`/`span_finished`/`run_finished` events the trace is built from — on agents, pipelines, and flows alike, so a live UI and the trace can never disagree.
+- **Sync and async surfaces over one engine.** `.arun()`/`.astream()`, `aresume`, `amap`, `anow`/`arandom`, and async `@tool`/`@task`/`@agent`/`@flow` bodies mirror the sync API exactly — the same engine, driven either from composeai's own background thread or directly on your already-running event loop.
 - **MCP servers plug straight into `tools=`.** `compose.mcp_tools(command=..., ...)` connects to a Model Context Protocol server (stdio or streamable HTTP) and turns its tools into ordinary composeai `Tool` objects — indistinguishable from `@compose.tool` ones, including the same `requires_approval=` pause/resume.
 
 Runtime dependencies: **pydantic + the standard library**. Provider SDKs are optional extras. Python ≥ 3.10.
@@ -75,6 +76,7 @@ No accounts, no exporters, no instrumentation to wire up — the trace (and its 
 | [docs/agents.md](docs/agents.md) | The `@agent` idiom, structured output and repairs, tools, resilience knobs, naming/replacing agents, `.run()`/`.stream()` |
 | [docs/composition.md](docs/composition.md) | `pipe`, `aggregate`, `map`, build-time type checking, nesting combinators |
 | [docs/flows.md](docs/flows.md) | `@task`/`@flow`, the journal, determinism, `resume()`, human-in-the-loop |
+| [docs/async.md](docs/async.md) | `.arun()`/`.astream()`, `aresume`, `amap`, `anow`/`arandom`, async `@tool`/`@task`/`@agent`/`@flow` bodies |
 | [docs/providers.md](docs/providers.md) | Model strings vs `Model` instances, API keys, `openai_compatible`, pricing, reasoning-model gotchas |
 | [docs/observability.md](docs/observability.md) | The local tracing model, every `compose` CLI command, `--import`, `COMPOSE_TRACE_CONTENT` |
 | [docs/budgets.md](docs/budgets.md) | `Budget(usd=, tokens=)`, what counts, cumulative spend across `resume()`, `BudgetExceededError` |
@@ -108,9 +110,10 @@ The contracts composeai holds you to — and the ones it holds itself to:
 ## Roadmap
 
 - OpenTelemetry exporter (the span model already tracks `gen_ai.*` attribute conventions)
-- Async API (`await agent(...)`, async tools)
 - TypeScript sibling package
 - Extended-thinking / reasoning request configuration (Anthropic `thinking` budget, OpenAI `reasoning.summary`/`encrypted_content`) -- today `ThinkingPart` only round-trips whatever a provider returns unprompted by default; there's no `ModelRequest` field to actually ask for it
+- Consolidate the MCP bridge onto the runtime loop (each MCP server currently owns its own dedicated event-loop thread rather than sharing composeai's)
+- Span-persistence queue tuning under streaming storms (the store's single writer thread is a FIFO queue; a very high-rate `.stream()`/`.astream()` workload hasn't been load-tested against it)
 
 ## License
 

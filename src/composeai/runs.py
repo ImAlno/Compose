@@ -146,6 +146,14 @@ class AsyncRunStream:
     ``asyncio.Task`` memoizes its own result, :meth:`run` after iterating
     (or iterating twice) always sees the same, stable outcome -- awaiting
     it re-raises the task's original exception verbatim if it failed.
+
+    GC-warning asymmetry vs. :class:`RunStream`: if a failed run's task is
+    abandoned -- never awaited via :meth:`run` and never fully iterated --
+    asyncio prints "Task exception was never retrieved" when that task is
+    garbage-collected (its exception was never retrieved, exactly as the
+    warning says). :class:`RunStream`'s background *thread* has no such
+    warning: an unjoined thread just silently keeps running. Await
+    :meth:`run` or iterate to completion to avoid it.
     """
 
     def __init__(self, task: asyncio.Task[Run], subscription: AsyncSubscription) -> None:
@@ -1720,6 +1728,23 @@ def use_journal_scope(scope: JournalScope | None) -> Iterator[None]:
         _run_context.reset(token)
 
 
+def _error_payload(exc: BaseException) -> dict[str, str]:
+    """Build the ``error_json`` payload for a failed run row.
+
+    ``str(exc)`` is empty for a plain ``asyncio.CancelledError()`` (the
+    common shape when an in-flight ``arun()``/``astream()`` is cancelled --
+    e.g. via ``Task.cancel()`` or Ctrl-C), which would otherwise persist an
+    empty message with nothing for ``compose runs``/``compose trace`` to
+    render; synthesize ``"cancelled"`` for that case specifically. Every
+    other exception's message passes through unchanged. Shared by
+    :func:`settle_agent_run`, :func:`asettle_agent_run`, and
+    ``composeai.flow._aexecute_flow``'s failed path -- the three sites that
+    persist a run row's terminal failure.
+    """
+    message = str(exc) or ("cancelled" if isinstance(exc, asyncio.CancelledError) else "")
+    return {"type": type(exc).__name__, "message": message}
+
+
 def run_standalone_agent(
     name: str,
     args_json: str | None,
@@ -1828,7 +1853,7 @@ def settle_agent_run(store: RunStore, run_id: str, thunk: Callable[[], Run]) -> 
             "update_run",
             run_id,
             status="failed",
-            error_json=json.dumps({"type": type(exc).__name__, "message": str(exc)}),
+            error_json=json.dumps(_error_payload(exc)),
         )
         raise
     worker_for(store).call_blocking(
@@ -1892,7 +1917,7 @@ async def asettle_agent_run(
             "update_run",
             run_id,
             status="failed",
-            error_json=json.dumps({"type": type(exc).__name__, "message": str(exc)}),
+            error_json=json.dumps(_error_payload(exc)),
         )
         raise
     await worker_for(store).call(

@@ -1076,3 +1076,112 @@ def test_nested_flow_arun_rejects_budget():
 
     with pytest.raises(ConfigError, match="budget"):
         asyncio.run(outer_flow.arun())
+
+
+# --- v0.4.0 Plan C: polish trio ----------------------------------------------
+
+
+def test_sync_sugar_inside_running_loop():
+    """The Jupyter/ASGI case at the public-API level -- see
+    ``test_runtime.test_run_sync_works_with_running_loop_in_caller_thread``
+    for the underlying primitive. Calling the SYNC facade
+    (``agent_fn(...)``/``flow_obj(...)``) from inside a coroutine that is
+    itself running on a loop in the current thread's call stack must not
+    raise ``RuntimeError("... already running")``: ``_runtime.run_sync``
+    bridges onto the runtime thread's OWN loop underneath, never re-entering
+    the caller's. This is a pin, not a regression found RED -- the
+    primitive already has this property; this confirms the public
+    ``@agent``/``@flow`` sync sugar inherits it end-to-end, not just the
+    bare ``_runtime.run_sync`` call.
+    """
+    from composeai.flow import flow
+
+    model = FakeModel(["agent-answer"])
+
+    @agent(model=model, name="asurf_sync_sugar_agent")
+    def agent_fn(q: str) -> str:
+        """Answer."""
+        return prompt(q)
+
+    @flow(name="asurf_sync_sugar_flow")
+    def flow_obj() -> str:
+        return "flow-answer"
+
+    async def caller_side():
+        # Both calls below are plain sync sugar, made from inside a
+        # coroutine already running on a loop in this thread's call stack.
+        return agent_fn("x"), flow_obj()
+
+    agent_out, flow_out = asyncio.run(caller_side())
+    assert agent_out == "agent-answer"
+    assert flow_out == "flow-answer"
+
+
+def test_cancelled_arun_row_message():
+    """Cancelling an in-flight ``arun()`` mid-stage must still leave the
+    durable row with a non-empty failure message: ``str(CancelledError())``
+    is ``""``, so before this fix the persisted ``error_json`` rendered
+    nothing for ``compose runs``/``compose trace`` to show.
+
+    Mirrors the final Plan B review's live-cancellation probe shape: a sync
+    ``@flow`` body runs a slow sync ``@task`` (blocked on a
+    ``threading.Event``) ahead of a ``FakeModel``-backed ``@agent`` call.
+    Driving it via ``.arun()`` puts the flow body on its own dedicated
+    worker thread (``_dispatch._run_sync_on_own_thread``) while the
+    top-level task sits cancellable on the caller's loop -- cancelling that
+    task delivers ``CancelledError`` into the ``await future`` inside
+    ``_run_sync_on_own_thread``, which propagates up through
+    ``_aexecute_flow``'s failed path.
+    """
+    import json
+
+    from composeai.flow import flow, task
+    from composeai.runs import open_default
+
+    started = threading.Event()
+    release = threading.Event()
+
+    @task(name="asurf_cancel_blocker")
+    def blocker() -> str:
+        started.set()
+        release.wait(timeout=5)
+        return "unblocked"
+
+    model = FakeModel(["never-reached"])
+
+    @agent(model=model, name="asurf_cancel_agent")
+    def responder(q: str) -> str:
+        """Answer."""
+        return prompt(q)
+
+    @flow(name="asurf_cancel_flow")
+    def flow_body() -> str:
+        blocker()
+        return responder("go")
+
+    async def drive():
+        running_task = asyncio.ensure_future(flow_body.arun())
+        await asyncio.to_thread(started.wait, 5)
+        running_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await running_task
+
+    asyncio.run(drive())
+    release.set()  # let the abandoned worker thread wind down
+
+    store = open_default()
+    rows = [
+        r for r in store.list_runs(kind="flow", limit=50) if r["name"] == "asurf_cancel_flow"
+    ]
+    run_id = rows[0]["run_id"]
+
+    deadline = time.monotonic() + 5
+    row = store.get_run(run_id)
+    while row is not None and row["status"] == "running" and time.monotonic() < deadline:
+        time.sleep(0.01)
+        row = store.get_run(run_id)
+
+    assert row is not None
+    assert row["status"] == "failed"
+    error = json.loads(row["error_json"])
+    assert error["message"] == "cancelled"

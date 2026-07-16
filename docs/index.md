@@ -70,6 +70,7 @@ No accounts, no exporters, no instrumentation to wire up — the trace (and its 
 | [agents](agents.md) | The `@agent` idiom, structured output and repairs, tools, resilience knobs, naming/replacing agents, `.run()`/`.stream()` |
 | [composition](composition.md) | `pipe`, `aggregate`, `map`, build-time type checking, nesting combinators |
 | [flows](flows.md) | `@task`/`@flow`, the journal, determinism, `resume()`, human-in-the-loop |
+| [async](async.md) | `.arun()`/`.astream()`, `aresume`, `amap`, `anow`/`arandom`, async `@tool`/`@task`/`@agent`/`@flow` bodies |
 | [providers](providers.md) | Model strings vs `Model` instances, API keys, `openai_compatible`, pricing, reasoning-model gotchas |
 | [observability](observability.md) | The local tracing model, every `compose` CLI command, `--import`, `COMPOSE_TRACE_CONTENT` |
 | [budgets](budgets.md) | `Budget(usd=, tokens=)`, what counts, cumulative spend across `resume()`, `BudgetExceededError` |

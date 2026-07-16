@@ -1048,6 +1048,101 @@ def test_contract_sdk_failure_raises_provider_error():
     contract.assert_sdk_failure_raises_provider_error(model, model_id="llama3-test")
 
 
+# --- shared conformance contract, async twins (acomplete) --------------------
+
+
+def test_async_contract_text_completion():
+    import asyncio
+
+    model = _amodel([_response([_choice(_message(content="hello there"))])])
+    asyncio.run(
+        contract.assert_async_text_completion(
+            model, model_id="llama3-test", expected_text="hello there"
+        )
+    )
+
+
+def test_async_contract_tool_call():
+    import asyncio
+
+    tool_calls = [_tool_call("call-1", "search", {})]
+    choice = _choice(_message(tool_calls=tool_calls), finish_reason="tool_calls")
+    model = _amodel([_response([choice])])
+    asyncio.run(contract.assert_async_tool_call(model, model_id="llama3-test", tool_name="search"))
+
+
+def test_async_contract_tool_result_batching():
+    import asyncio
+
+    model = _amodel([_response([_choice(_message(content="ok"))])])
+    asyncio.run(
+        contract.assert_async_tool_result_batching_survives_round_trip(
+            model, model_id="llama3-test", tool_call_id="tc1"
+        )
+    )
+
+
+def test_async_contract_structured_output():
+    import asyncio
+
+    model = _amodel([_response([_choice(_message(content='{"answer": 42}'))])])
+    asyncio.run(
+        contract.assert_async_structured_output(
+            model, model_id="llama3-test", expected={"answer": 42}
+        )
+    )
+
+
+def test_async_contract_tool_use_with_output_schema_does_not_crash():
+    import asyncio
+
+    tool_calls = [_tool_call("call-1", "search", {})]
+    choice = _choice(_message(tool_calls=tool_calls), finish_reason="tool_calls")
+    model = _amodel([_response([choice])])
+    asyncio.run(
+        contract.assert_async_tool_use_with_output_schema_does_not_crash(
+            model, model_id="llama3-test", tool_name="search"
+        )
+    )
+
+
+def test_async_contract_stop_reason_mapping():
+    import asyncio
+
+    model = _amodel([_response([_choice(_message(content="x"), finish_reason="length")])])
+    asyncio.run(
+        contract.assert_async_stop_reason_mapping(
+            model, model_id="llama3-test", expected=StopReason.MAX_TOKENS, expected_raw="length"
+        )
+    )
+
+
+def test_async_contract_usage_lands():
+    import asyncio
+
+    usage = _usage(prompt_tokens=11, completion_tokens=22)
+    model = _amodel([_response([_choice(_message(content="x"))], usage=usage)])
+    asyncio.run(
+        contract.assert_async_usage_lands(
+            model, model_id="llama3-test", expected_input=11, expected_output=22
+        )
+    )
+
+
+def test_async_contract_sdk_failure_raises_provider_error():
+    import asyncio
+
+    def raiser(_kwargs):
+        raise openai.APIConnectionError(
+            message="boom", request=httpx.Request("POST", "http://localhost:11434/v1")
+        )
+
+    model = _amodel(raiser)
+    asyncio.run(
+        contract.assert_async_sdk_failure_raises_provider_error(model, model_id="llama3-test")
+    )
+
+
 def test_timeout_passed_to_sdk_client(monkeypatch):
     import openai
 
