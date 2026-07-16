@@ -1,4 +1,4 @@
-"""composeai: a radically simple, functional framework for multi-agent AI workflows.
+"""composeai: multi-agent workflows as the typed Python functions you already write.
 
 Typed agent functions, pipe/aggregate/map composition with build-time type
 checks, always-on local tracing, and durable, resumable flows.
@@ -16,7 +16,7 @@ from .models.prices import ModelPrice, register_price
 from .runs import Budget, Run
 from .tools import tool
 
-__version__ = "0.4.0"
+__version__ = "0.4.1"
 
 __all__ = [
     "Budget",

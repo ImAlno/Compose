@@ -416,7 +416,10 @@ def cmd_trace(args: argparse.Namespace) -> int:
                 return 1
 
         trace = _rebuild_trace(conn, row["trace_id"])
-        print(tracing.render_trace(trace))
+        if args.format == "mermaid":
+            print(tracing.render_trace_mermaid(trace))
+        else:
+            print(tracing.render_trace(trace))
 
         if row["status"] == "paused":
             pending = conn.execute(
@@ -888,6 +891,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_trace = sub.add_parser("trace", help="Render one run's trace.")
     p_trace.add_argument("run_id", nargs="?")
     p_trace.add_argument("--last", action="store_true")
+    p_trace.add_argument("--format", choices=["tree", "mermaid"], default="tree")
     _add_import_argument(p_trace)
     p_trace.set_defaults(func=cmd_trace)
 

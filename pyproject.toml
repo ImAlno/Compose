@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "composeai"
-version = "0.4.0"
-description = "Radically simple, functional framework for multi-agent AI workflows — typed agent functions, pipe composition, always-on local tracing, durable flows."
+version = "0.4.1"
+description = "Multi-agent workflows as typed Python functions — wiring checked before any API call, always-on local tracing, durable flows, enforced budgets."
 readme = "README.md"
 requires-python = ">=3.10"
 license = "MIT"

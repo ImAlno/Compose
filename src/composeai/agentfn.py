@@ -23,7 +23,7 @@ import threading
 import time
 from collections.abc import Callable, Coroutine, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from pydantic import TypeAdapter, ValidationError
 
@@ -47,6 +47,9 @@ from .models import registry
 from .models.base import Model, ModelRequest, ModelResponse, ToolSpec
 from .runs import AsyncRunStream, Budget, Run, RunStream, budget_scope, check_budgets
 from .tools import Tool
+
+if TYPE_CHECKING:
+    from .combinators import Pipeline
 
 # --- agent registry (Phase 8: resume() routing) ------------------------------
 #
@@ -140,6 +143,19 @@ class AgentFunction:
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         return self.run(*args, **kwargs).output
+
+    def __rshift__(self, other: Any) -> Pipeline:
+        # Local import: composeai.combinators already imports AgentFunction
+        # from this module at module scope, so importing it back at module
+        # scope here would be circular -- deferring to call time avoids it.
+        from .combinators import _rshift_pipe
+
+        return _rshift_pipe(self, other)
+
+    def __rrshift__(self, other: Any) -> Pipeline:
+        from .combinators import _rshift_pipe
+
+        return _rshift_pipe(other, self)
 
     def run(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run:
         return _run_agent(self, args, kwargs, budget=budget)

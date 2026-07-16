@@ -1,6 +1,6 @@
 # composeai
 
-composeai is a radically simple, functional framework for multi-agent AI workflows: agents are typed Python functions, composed with plain combinators, and everything that runs is traced to disk automatically.
+composeai builds multi-agent workflows from the typed Python functions you already write: composition is checked before a single API call is made, agents compose with plain combinators (in parallel where you fan out), and everything that runs is traced to disk automatically.
 
 ## What composeai is
 
@@ -68,7 +68,7 @@ No accounts, no exporters, no instrumentation to wire up — the trace (and its 
 | Page | What's there |
 | :--- | :--- |
 | [agents](agents.md) | The `@agent` idiom, structured output and repairs, tools, resilience knobs, naming/replacing agents, `.run()`/`.stream()` |
-| [composition](composition.md) | `pipe`, `aggregate`, `map`, build-time type checking, nesting combinators |
+| [composition](composition.md) | `pipe` (and `>>` sugar), `aggregate`, `map`, build-time type checking, nesting combinators |
 | [flows](flows.md) | `@task`/`@flow`, the journal, determinism, `resume()`, human-in-the-loop |
 | [async](async.md) | `.arun()`/`.astream()`, `aresume`, `amap`, `anow`/`arandom`, async `@tool`/`@task`/`@agent`/`@flow` bodies |
 | [providers](providers.md) | Model strings vs `Model` instances, API keys, `openai_compatible`, pricing, reasoning-model gotchas |

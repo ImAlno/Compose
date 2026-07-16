@@ -1,11 +1,13 @@
 # composeai — 𝑓(𝑔(𝑥))
 
-A radically simple, functional framework for multi-agent AI workflows.
+Multi-agent workflows as the typed Python functions you already write — wiring checked before a single API call is made.
 
 - **Agents are typed functions.** The docstring is the system prompt, the body returns the user prompt, the return annotation is the structured output type. Calling one returns that type — or raises.
-- **Composition is checked before it runs.** `pipe(researcher, copywriter)` verifies every stage boundary at build time; a wiring bug raises `CompositionTypeError` before a single API call is made.
+- **There's nothing new to learn.** No graph objects, no `Runnable`/`StateGraph` class ecosystem — composeai is functions, a handful of decorators (`@agent`, `@tool`, `@task`, `@flow`), and the pydantic models you already use.
+- **Fan-out is parallel by default.** `aggregate(...)` runs every branch concurrently and `compose.map(fn, items)` processes items in parallel — no futures, no executors, no asyncio unless you want it.
+- **Composition is checked before it runs.** `pipe(researcher, copywriter)` (or `researcher >> copywriter`) verifies every stage boundary at build time; a wiring bug raises `CompositionTypeError` before a single API call is made.
 - **Tracing is always on, and local.** Every run persists spans, token usage, and cost to a SQLite store on your disk (`./.compose`). No SaaS, no instrumentation, no opt-in — the trace is just there.
-- **Flows are durable.** A `@flow` journals every step; if it crashes — or pauses on a **named interrupt** (`approve("publish")`) waiting for a human — `resume(run_id)` continues it in the same process or a brand-new one, days later, replaying finished steps without re-paying for them.
+- **Flows are durable.** A `@flow` journals every step; if it crashes — or pauses on a **named interrupt** (`approve("publish")`, `ask_human("pick a title")`) waiting for a human — `resume(run_id)` continues it in the same process or a brand-new one, days later, replaying finished steps without re-paying for them.
 - **Every run can carry a spend cap.** `Budget(usd=..., tokens=...)` is enforced after every LLM call in a run's subtree, and stays cumulative across `resume()` — a run can't dodge its budget by crashing and getting resumed.
 - **Streaming and tracing are the same event bus.** `.stream()` yields `text_delta`/`thinking_delta`/`tool_call_started`/`tool_args_delta` interleaved with the very `span_started`/`span_finished`/`run_finished` events the trace is built from — on agents, pipelines, and flows alike, so a live UI and the trace can never disagree.
 - **Sync and async surfaces over one engine.** `.arun()`/`.astream()`, `aresume`, `amap`, `anow`/`arandom`, and async `@tool`/`@task`/`@agent`/`@flow` bodies mirror the sync API exactly — the same engine, driven either from composeai's own background thread or directly on your already-running event loop.

@@ -46,6 +46,27 @@ a :class:`Pipeline`, an :class:`Aggregate`, or a plain callable taking one
 positional argument."""
 
 
+# --- >> composition sugar --------------------------------------------------------
+
+
+def _rshift_pipe(left: Any, right: Any) -> Pipeline:
+    """Shared body for ``__rshift__``/``__rrshift__`` on every stage type.
+
+    ``a >> b`` is exactly ``pipe(a, b)`` -- ``pipe()`` remains the single
+    owner of composition-time type checking; this helper never duplicates
+    any of it. Flattening keeps chains flat regardless of associativity: a
+    ``Pipeline`` operand contributes its own ``_stages`` tuple rather than
+    itself, so ``(a >> b) >> c`` and ``a >> (b >> c)`` both build a
+    ``Pipeline`` whose ``_stages`` is ``(a, b, c)``, not a ``Pipeline``
+    nested inside a ``Pipeline``.
+    """
+
+    def _flat(stage: Any) -> tuple[Any, ...]:
+        return stage._stages if isinstance(stage, Pipeline) else (stage,)
+
+    return pipe(*_flat(left), *_flat(right))
+
+
 # --- type introspection --------------------------------------------------------
 
 
@@ -489,6 +510,12 @@ class Pipeline:
     def __call__(self, x: Any) -> Any:
         return self.run(x).output
 
+    def __rshift__(self, other: Any) -> Pipeline:
+        return _rshift_pipe(self, other)
+
+    def __rrshift__(self, other: Any) -> Pipeline:
+        return _rshift_pipe(other, self)
+
     def run(self, x: Any, budget: Budget | None = None) -> Run:
         return _run_top("pipe", self._name, budget, lambda: self._run_stages(x, streaming=False))
 
@@ -591,6 +618,12 @@ class Aggregate:
 
     def __call__(self, x: Any) -> dict[str, Any]:
         return self.run(x).output
+
+    def __rshift__(self, other: Any) -> Pipeline:
+        return _rshift_pipe(self, other)
+
+    def __rrshift__(self, other: Any) -> Pipeline:
+        return _rshift_pipe(other, self)
 
     def run(self, x: Any, budget: Budget | None = None) -> Run:
         return _run_top(

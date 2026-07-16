@@ -631,3 +631,67 @@ def render_trace(trace: Trace, *, color: bool | None = None) -> str:
     for i, root in enumerate(roots):
         _render_node(trace, root, "", i == len(roots) - 1, lines, use_color)
     return "\n".join(lines)
+
+
+# --- Mermaid renderer ---
+
+
+def _mermaid_label(node: Span) -> str:
+    # Mermaid's renderer decodes ANY `#\w+;`-shaped substring in a label as
+    # an HTML entity -- not just the escapes we ourselves emit -- so a
+    # user-settable span name containing e.g. literal text "#65;" would
+    # otherwise round-trip through Mermaid's parser as the character "A".
+    # Escaping "#" to "#35;" FIRST neutralizes any such entity already
+    # present in the name; only then do we escape '"' to Mermaid's own
+    # quote-escape "#quot;". Order matters: doing it the other way around
+    # would leave a user's raw "#65;" as a live entity, and would also let
+    # the "#" our own quote-escape step just introduced get re-escaped by
+    # a later hash pass. Escaping "#" first means "#quot;"/"#35;" are the
+    # only entities present in the final label.
+    name = node.name.replace("#", "#35;").replace('"', "#quot;")
+    return f"{name} [{node.kind}]"
+
+
+def _walk_mermaid(
+    trace: Trace,
+    node: Span,
+    parent_id: str | None,
+    ids: dict[str, str],
+    node_lines: list[str],
+    edge_lines: list[str],
+) -> None:
+    node_id = f"s{len(ids)}"
+    ids[node.span_id] = node_id
+    node_lines.append(f'{node_id}["{_mermaid_label(node)}"]')
+    if parent_id is not None:
+        edge_lines.append(f"{parent_id} --> {node_id}")
+    for child in trace.children_of(node.span_id):
+        _walk_mermaid(trace, child, node_id, ids, node_lines, edge_lines)
+
+
+def render_trace_mermaid(trace: Trace) -> str:
+    """Render ``trace`` as a Mermaid ``flowchart TD`` document.
+
+    Walks the same ``trace.roots()``/``children_of()`` structure
+    :func:`render_trace`/``_render_node`` does -- one depth-first,
+    roots-first pass -- assigning each span a node id ``s0``, ``s1``, ...
+    in that same walk order. Each span becomes one node line
+    (``sN["name [kind]"]``, with any ``#`` in ``name`` escaped to ``#35;``
+    *before* any ``"`` is escaped to Mermaid's own ``#quot;`` -- see
+    :func:`_mermaid_label` for why the order matters: Mermaid decodes any
+    ``#\\w+;``-shaped substring as an HTML entity, so escaping ``#`` first
+    is what keeps ``#quot;``/``#35;`` the only entities present in the
+    label) followed, after all node lines, by one ``parent --> child`` edge
+    line per parent/child pair, in the order children were discovered.
+
+    Purely a renderer over the in-memory :class:`Trace` tree: reads only
+    ``Span.kind``/``name``/parent-child links already loaded (by the CLI,
+    from persisted rows) -- never imports or executes anything from the
+    run's own payloads.
+    """
+    ids: dict[str, str] = {}
+    node_lines: list[str] = []
+    edge_lines: list[str] = []
+    for root in trace.roots():
+        _walk_mermaid(trace, root, None, ids, node_lines, edge_lines)
+    return "\n".join(["flowchart TD", *node_lines, *edge_lines])

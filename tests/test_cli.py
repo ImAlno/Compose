@@ -587,6 +587,74 @@ def test_cmd_trace_paused_run_prints_banner_with_pending_interrupt(capsys):
     assert run.id in out
 
 
+def test_cmd_trace_format_mermaid_prints_flowchart(capsys):
+    """`--format mermaid` renders the persisted trace as a Mermaid
+    ``flowchart TD`` document instead of the default tree -- built from a
+    real FakeModel-backed `@flow`/`@agent`/tool run so the trace has a
+    flow root, an agent child, and llm/tool grandchildren, same as any
+    other persisted run."""
+    from composeai import flow, tracing
+
+    @tool
+    def lookup(query: str) -> str:
+        """Look something up."""
+        return "answer"
+
+    fake = FakeModel(
+        [
+            {"tool_calls": [{"name": "lookup", "arguments": {"query": "q"}, "id": "c1"}]},
+            "done",
+        ]
+    )
+
+    @agent(model=fake, tools=[lookup])
+    def researcher() -> str:
+        """Researcher."""
+        return "go"
+
+    @flow
+    def research() -> str:
+        return researcher()
+
+    run = research.run()
+
+    rc = main(["trace", run.id, "--format", "mermaid"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out == tracing.render_trace_mermaid(run.trace) + "\n"
+    assert out.startswith("flowchart TD\n")
+    assert "s0[" in out
+    assert "-->" in out
+
+
+def test_cmd_trace_default_format_output_is_byte_identical_to_before(capsys):
+    """Regression guard: adding `--format` must not change `compose trace`'s
+    default (tree) output one bit -- no `--format` given, and `--format
+    tree` given explicitly, both still print exactly `render_trace`'s
+    output, with no `flowchart`/mermaid content anywhere."""
+    from composeai import tracing
+
+    def a(x: str) -> str:
+        return x.upper()
+
+    def b(x: str) -> str:
+        return x + "!"
+
+    run = pipe(a, b).run("hi")
+    expected = tracing.render_trace(run.trace, color=False) + "\n"
+
+    rc = main(["trace", run.id])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out == expected
+    assert "flowchart" not in out
+
+    rc = main(["trace", run.id, "--format", "tree"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert out == expected
+
+
 # =====================================================================
 # id-prefix resolution (trace/diff/export) -- decision #2
 # =====================================================================

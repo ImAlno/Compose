@@ -1,7 +1,7 @@
 import sys
 
 from composeai.messages import Usage
-from composeai.tracing import ErrorInfo, Span, Trace, render_trace
+from composeai.tracing import ErrorInfo, Span, Trace, render_trace, render_trace_mermaid
 
 
 def _build_trace() -> tuple[Trace, Span]:
@@ -287,3 +287,122 @@ def test_cost_segment_omitted_when_cost_usd_none():
     trace.add(s)
     out = render_trace(trace, color=False)
     assert "$" not in out
+
+
+# --- render_trace_mermaid ---
+
+
+def _build_mermaid_trace() -> Trace:
+    trace = Trace(trace_id="TRACE01")
+    root = Span(
+        trace_id="TRACE01",
+        span_id="ROOT0001",
+        kind="flow",
+        name="research",
+        started_at=0.0,
+        ended_at=2.5,
+        status="ok",
+    )
+    agent = Span(
+        trace_id="TRACE01",
+        span_id="AGENT001",
+        parent_span_id="ROOT0001",
+        kind="agent",
+        name="researcher",
+        started_at=0.0,
+        ended_at=2.3,
+        status="ok",
+    )
+    llm = Span(
+        trace_id="TRACE01",
+        span_id="LLM00001",
+        parent_span_id="AGENT001",
+        kind="llm",
+        name='gpt-4 "turbo"',
+        started_at=0.0,
+        ended_at=0.6,
+        status="ok",
+    )
+    tool = Span(
+        trace_id="TRACE01",
+        span_id="TOOL0001",
+        parent_span_id="AGENT001",
+        kind="tool",
+        name="web_search",
+        started_at=0.6,
+        ended_at=0.9,
+        status="ok",
+    )
+    for s in [root, agent, llm, tool]:
+        trace.add(s)
+    return trace
+
+
+EXPECTED_MERMAID = (
+    "flowchart TD\n"
+    's0["research [flow]"]\n'
+    's1["researcher [agent]"]\n'
+    's2["gpt-4 #quot;turbo#quot; [llm]"]\n'
+    's3["web_search [tool]"]\n'
+    "s0 --> s1\n"
+    "s1 --> s2\n"
+    "s1 --> s3"
+)
+
+
+def test_render_trace_mermaid_matches_expected_snapshot():
+    trace = _build_mermaid_trace()
+    output = render_trace_mermaid(trace)
+    assert output == EXPECTED_MERMAID
+
+
+def test_render_trace_mermaid_starts_with_flowchart_header():
+    trace = _build_mermaid_trace()
+    assert render_trace_mermaid(trace).startswith("flowchart TD")
+
+
+def test_render_trace_mermaid_escapes_double_quotes_in_labels():
+    trace = _build_mermaid_trace()
+    output = render_trace_mermaid(trace)
+    assert '"gpt-4 "turbo""' not in output
+    assert "gpt-4 #quot;turbo#quot;" in output
+
+
+def test_render_trace_mermaid_escapes_hash_entity_sequence():
+    """Mermaid's renderer decodes ANY `#\\w+;` substring in a label as an
+    HTML entity, not just the `#quot;`/`#35;` sequences we ourselves emit.
+    A user-settable span name containing something that looks like an
+    entity (`#65;`) must not survive as a live entity: `#` must be escaped
+    to `#35;` FIRST, turning `#65;` into the inert `#35;65;`, which
+    Mermaid's own parser round-trips back to the literal `#65;`."""
+    trace = Trace(trace_id="T1")
+    root = Span(
+        trace_id="T1", span_id="R1", kind="agent", name="agent #65; test", started_at=0.0
+    )
+    trace.add(root)
+    output = render_trace_mermaid(trace)
+    assert 's0["agent #35;65; test [agent]"]' in output
+
+
+def test_render_trace_mermaid_escapes_plain_hash():
+    trace = Trace(trace_id="T1")
+    root = Span(trace_id="T1", span_id="R1", kind="agent", name="c# expert", started_at=0.0)
+    trace.add(root)
+    output = render_trace_mermaid(trace)
+    assert 's0["c#35; expert [agent]"]' in output
+
+
+def test_render_trace_mermaid_escapes_hash_and_quote_together():
+    """Strongest case: a name with BOTH `#` and `"`. Order matters -- `#`
+    must be escaped before `"`. Escaping `"` first would emit `#quot;`
+    sequences that a subsequent hash-escape pass would then mangle (the
+    `#` inside our own `#quot;` getting turned into `#35;quot;`), so `#`
+    must go first, making `#quot;`/`#35;` the *only* entities present in
+    the final label."""
+    trace = Trace(trace_id="T1")
+    root = Span(
+        trace_id="T1", span_id="R1", kind="agent", name='agent #65; "prod"', started_at=0.0
+    )
+    trace.add(root)
+    output = render_trace_mermaid(trace)
+    assert 's0["agent #35;65; #quot;prod#quot; [agent]"]' in output

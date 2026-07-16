@@ -31,6 +31,15 @@ except CompositionTypeError as exc:
 
 `pipe()` requires at least 2 stages, or it raises `CompositionTypeError` immediately.
 
+### Operator sugar
+
+`a >> b` is exactly `pipe(a, b)` — same build-time type check, same `CompositionTypeError` on a mismatch, no separate code path. It works for any mix of `@agent` functions, plain callables, and `pipe`/`aggregate` results, as long as at least one operand is a composeai stage type; chaining stays flat, so `researcher >> copywriter >> editor` builds one 3-stage `Pipeline`, not a `Pipeline` nested inside a `Pipeline`:
+
+```python
+write_post = researcher >> copywriter   # exactly pipe(researcher, copywriter), types checked HERE
+post = write_post("quantum computing")
+```
+
 ## `aggregate`
 
 `aggregate(**branches)` runs every named branch in parallel threads and gathers a `{name: output}` dict, in declaration order:

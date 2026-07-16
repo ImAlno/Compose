@@ -770,3 +770,105 @@ def test_aggregate_rejects_non_numeric_timeout():
 
     with pytest.raises(ConfigError):
         compose.aggregate(timeout_per_branch=lambda x: x, a=lambda x: x)  # type: ignore[arg-type]
+
+
+# --- >> composition sugar -------------------------------------------------------
+
+
+def test_rshift_returns_pipeline_equivalent_to_pipe():
+    @agent(model=FakeModel(["a out", "a out"]))
+    def a(x: str) -> str:
+        """A."""
+        return x
+
+    @agent(model=FakeModel(["b out", "b out"]))
+    def b(x: str) -> str:
+        """B."""
+        return x
+
+    from composeai.combinators import Pipeline
+
+    piped = pipe(a, b)
+    shifted = a >> b
+    assert isinstance(shifted, Pipeline)
+    assert shifted("go") == piped("go")
+
+
+def test_rshift_flattens_both_associativities_into_three_flat_stages():
+    def a(x: str) -> str:
+        return x
+
+    @agent(model=FakeModel(["never used"]))
+    def b(x: str) -> str:
+        """B."""
+        return x
+
+    def c(x: str) -> str:
+        return x
+
+    left_assoc = (a >> b) >> c
+    right_assoc = a >> (b >> c)
+    assert left_assoc._stages == (a, b, c)
+    assert right_assoc._stages == (a, b, c)
+
+
+def test_rshift_mismatched_types_raises_composition_type_error():
+    @agent(model=FakeModel(["never used"]))
+    def researcher(topic: str) -> FactSheet:
+        """Research."""
+        return topic  # type: ignore[return-value]
+
+    @agent(model=FakeModel(["never used"]))
+    def copywriter(summary: Summary) -> str:
+        """Write."""
+        return "go"
+
+    with pytest.raises(CompositionTypeError):
+        _ = researcher >> copywriter
+
+
+def test_rshift_plain_function_on_left_hits_agent_rrshift():
+    @agent(model=FakeModel(["agent out", "agent out"]))
+    def agent_fn(x: str) -> str:
+        """Agent."""
+        return x
+
+    def plain_fn(x: str) -> str:
+        return x
+
+    shifted = plain_fn >> agent_fn
+    assert shifted("go") == pipe(plain_fn, agent_fn)("go")
+
+
+def test_rshift_plain_function_on_right_of_agent():
+    @agent(model=FakeModel(["agent out", "agent out"]))
+    def agent_fn(x: str) -> str:
+        """Agent."""
+        return x
+
+    def plain_fn(x: str) -> str:
+        return x
+
+    shifted = agent_fn >> plain_fn
+    assert shifted("go") == pipe(agent_fn, plain_fn)("go")
+
+
+def test_rshift_aggregate_operand_composes():
+    @agent(model=FakeModel(["sec out", "sec out"]))
+    def security(code: str) -> str:
+        """Sec."""
+        return code
+
+    @agent(model=FakeModel(["perf out", "perf out"]))
+    def performance(code: str) -> str:
+        """Perf."""
+        return code
+
+    @agent(model=FakeModel(["summarized", "summarized"]))
+    def summarize(results: dict) -> str:
+        """Summarize."""
+        return str(results)
+
+    agg = aggregate(sec=security, perf=performance)
+    shifted = agg >> summarize
+    assert shifted("some code") == pipe(agg, summarize)("some code")

@@ -61,6 +61,28 @@ To resume:
     resume('01K3F8G6QF1M9X3B7K2P4R8T5Y', answers={'publish': True})
 ```
 
+`--format mermaid` renders the same trace as a Mermaid `flowchart TD` document instead of the tree above — one node per span (`s0`, `s1`, ... in the same top-to-bottom walk order) with a `parent --> child` edge per child, ready to paste into any Mermaid-aware viewer (GitHub renders it inline in Markdown). Like the tree view, this only reads spans already persisted in `runs.db`; it never imports your code:
+
+```text
+$ compose trace 01K3F8G7QZR3XJ8N4V0T5W2Y1B --format mermaid
+flowchart TD
+s0["research [flow]"]
+s1["fetch_sources [task]"]
+s2["map(summarize) [aggregate]"]
+s3["summarize [task]"]
+s4["summarize [task]"]
+s5["editor [agent]"]
+s6["anthropic/claude-sonnet-5 [llm]"]
+s7["publish [task]"]
+s0 --> s1
+s0 --> s2
+s2 --> s3
+s2 --> s4
+s0 --> s5
+s5 --> s6
+s0 --> s7
+```
+
 ### `compose diff` — structurally diff two traces
 
 ```console
