@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "composeai"
-version = "0.4.1"
+version = "0.5.0"
 description = "Multi-agent workflows as typed Python functions — wiring checked before any API call, always-on local tracing, durable flows, enforced budgets."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -19,7 +19,7 @@ anthropic = ["anthropic>=0.40"]
 openai = ["openai>=1.60"]
 mcp = ["mcp>=1.27,<2"]
 all = ["composeai[anthropic,openai,mcp]"]
-dev = ["pytest>=8", "ruff>=0.5", "pyright>=1.1.380", "anthropic>=0.40", "openai>=1.60", "mcp>=1.27,<2", "build", "twine"]
+dev = ["pytest>=8", "ruff>=0.5", "pyright>=1.1.380", "mypy>=1.11", "anthropic>=0.40", "openai>=1.60", "mcp>=1.27,<2", "build", "twine"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/composeai"]
@@ -37,6 +37,18 @@ typeCheckingMode = "standard"
 reportUnnecessaryTypeIgnoreComment = true
 venvPath = "."
 venv = ".venv"
+
+# mypy runs best-effort / non-blocking over ONLY the static-typing surface file
+# (see scripts/release.sh and tests/typing_surface.py's docstring). pyright is
+# the gated contract; mypy is a smoke check for cross-checker parity. Scoped to
+# the one file with follow_imports = "silent" so it type-checks the surface
+# against composeai's REAL exported types without demanding the whole repo be
+# mypy-clean. Known, documented divergences (Stage-protocol variance) are
+# expected; they never fail the release.
+[tool.mypy]
+files = "tests/typing_surface.py"
+follow_imports = "silent"
+python_version = "3.10"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

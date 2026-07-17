@@ -37,6 +37,8 @@ Every `@task` call (and `@agent` call, and `compose.map` item, and nested `@flow
 
 `flow_obj(topic)` is sugar for `flow_obj.run(topic).output`; `.run()` always starts a **new** durable run and returns the full `Run` (`.output`, `.usage`, `.trace`, `.status`, `.pending`). A flow also has `.stream(...)`, same shape as an agent's.
 
+`@compose.flow` infers a `Flow[P, R]` that preserves the function's signature, so `.run(...)` returns a `Run[R]` (here `Run[str]`) whose `.output` is typed. That `.output` type describes a **completed** run — a paused or failed one has no output of that type, so discriminate on `.status`/`.pending` (never guard on `.output`; a checker narrows it to `Never`). See [typing](typing.md#paused-runs-and-runr) for the paused-run typing contract in full.
+
 ### Crash-resume across processes
 
 Journaled steps replay instantly on `resume()` — only the unfinished tail actually executes. Here's the flow from above, saved to a module so it can be imported fresh in a second process:
@@ -275,4 +277,4 @@ asyncio.run(main())
 
 ## See also
 
-[agents](agents.md) covers the `@agent` idiom used for `editor`-style steps inside a flow; [composition](composition.md) covers `pipe`/`aggregate`/`map`, all usable (and journaled) inside a flow body; [budgets](budgets.md) covers `Budget` and cumulative spend across `resume()` attempts; [observability](observability.md) covers `compose trace` on a paused run and the exact `resume(...)` call it prints for you; [async](async.md) covers `arun()`/`aresume()` and every other asyncio-native twin in composeai.
+[agents](agents.md) covers the `@agent` idiom used for `editor`-style steps inside a flow; [composition](composition.md) covers `pipe`/`aggregate`/`map`, all usable (and journaled) inside a flow body; [budgets](budgets.md) covers `Budget` and cumulative spend across `resume()` attempts; [observability](observability.md) covers `compose trace` on a paused run and the exact `resume(...)` call it prints for you; [async](async.md) covers `arun()`/`aresume()` and every other asyncio-native twin in composeai; [typing](typing.md) covers the `Flow[P, R]`/`Run[R]` static-typing contract and how to discriminate paused runs.

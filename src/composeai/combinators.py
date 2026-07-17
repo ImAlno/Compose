@@ -21,6 +21,7 @@ default to ``Any``).
 from __future__ import annotations
 
 import asyncio
+import functools
 import inspect
 import time
 import types
@@ -29,16 +30,18 @@ from collections.abc import Awaitable, Callable, Coroutine, Sequence
 from dataclasses import dataclass
 from typing import Any, Generic, Literal, Protocol, overload
 
+from pydantic import PydanticSchemaGenerationError, PydanticUserError, ValidationError
+from pydantic_core import SchemaError
 from typing_extensions import TypeVar
 
 from . import _runtime, agentfn, runs, tracing
 from ._dispatch import gather_settled, run_stage
 from ._encoding import register_serializable
 from ._ids import new_ulid
-from ._schema import resolve_annotations
+from ._schema import _adapter_for, resolve_annotations
 from ._storeasync import worker_for
 from .agentfn import AgentFunction
-from .errors import CompositionTypeError, ConfigError
+from .errors import CompositionTypeError, ConfigError, StageTypeError
 from .runs import AsyncRunStream, Budget, Run, RunStream, budget_scope
 from .tools import Tool
 
@@ -160,14 +163,7 @@ def _rshift_pipe(left: Any, right: Any) -> Pipeline:
 # would raise immediately -- never write the latter.
 
 
-def _plain_callable_types(fn: Callable[..., Any]) -> tuple[Any, Any]:
-    """``(input_type, output_type)`` for a plain callable stage.
-
-    The first positional parameter's annotation and the return annotation,
-    resolved via :func:`~composeai._schema.resolve_annotations`; either
-    missing (or the callable's signature can't be introspected at all)
-    defaults to ``Any``.
-    """
+def _introspect_callable_types(fn: Callable[..., Any]) -> tuple[Any, Any]:
     try:
         hints = resolve_annotations(fn, include_extras=True)
         sig = inspect.signature(fn)
@@ -182,6 +178,36 @@ def _plain_callable_types(fn: Callable[..., Any]) -> tuple[Any, Any]:
     input_type: Any = hints.get(positional[0].name, Any) if positional else Any
     output_type: Any = hints.get("return", Any)
     return input_type, output_type
+
+
+_plain_callable_types_cached = functools.cache(_introspect_callable_types)
+
+
+def _plain_callable_types(fn: Callable[..., Any]) -> tuple[Any, Any]:
+    """``(input_type, output_type)`` for a plain callable stage.
+
+    The first positional parameter's annotation and the return annotation,
+    resolved via :func:`~composeai._schema.resolve_annotations`; either
+    missing (or the callable's signature can't be introspected at all)
+    defaults to ``Any``.
+
+    Cached by the callable object -- a function's signature is stable, and
+    v0.5.0 Plan C made this a hot path: runtime entry validation resolves a
+    stage's input type on *every* boundary crossing (via
+    :func:`_stage_input_type`), not just once at ``pipe()`` build time, so
+    re-running ``inspect.signature``/``get_type_hints`` per call dominated the
+    per-boundary cost (~4us) next to the sub-microsecond validation itself.
+    An unhashable callable object (an instance defining ``__eq__`` without
+    ``__hash__``; ``functools.partial`` is hashable and caches fine) can't be a
+    cache key -- the ``TypeError`` the cache raises while hashing it is caught
+    and it's introspected uncached (rare; a distinct TypeError from the
+    introspection body itself is already swallowed to ``(Any, Any)`` inside
+    the cached function, so it never reaches this ``except``).
+    """
+    try:
+        return _plain_callable_types_cached(fn)
+    except TypeError:
+        return _introspect_callable_types(fn)
 
 
 def _stage_input_type(stage: Stage) -> Any:
@@ -224,15 +250,36 @@ def _union_members(t: Any) -> tuple[Any, ...] | None:
     return None
 
 
+def _bare_origin(t: Any) -> Any:
+    """The unsubscripted origin class of a parameterized generic, else ``None``.
+
+    ``dict[str, Any]`` -> ``dict``; a bare ``dict`` (no subscription) ->
+    ``None`` (``typing.get_origin`` returns ``None``); ``str | int`` ->
+    ``None`` (its origin is ``types.UnionType``, not a plain class -- unions
+    are handled separately, so they must never register as a generic twin).
+    """
+    origin = typing.get_origin(t)
+    return origin if isinstance(origin, type) else None
+
+
 def _types_compatible(out_t: Any, in_t: Any) -> bool:
     """Whether a stage returning ``out_t`` may feed a stage expecting ``in_t``.
 
     - Passes when either side is ``Any`` (including a missing annotation,
       already normalized to ``Any`` by the callers of this function) or
       ``object``.
-    - Passes on equality -- the *only* check applied to typing generics
-      such as ``list[str]``: they are compared structurally with ``==``,
-      never by subclassing.
+    - Passes on equality -- the *only* check applied to two fully-parameterized
+      typing generics such as ``list[str]``: they are compared structurally
+      with ``==``, never by subclassing.
+    - Passes when one side is a bare, unparameterized origin (``dict``) and the
+      other is a parameterized generic of that same origin (``dict[str, Any]``),
+      in either direction: the bare form carries no element constraints, so it
+      neither promises less than nor demands more than the parameterized twin.
+      This closes the ``aggregate() >> def reduce(d: dict[str, Any])`` trap
+      (``Aggregate.output_type`` is bare ``dict``); runtime entry validation
+      backstops any genuinely wrong element shape at call time. Two *distinct*
+      full parameterizations (``list[str]`` vs ``list[int]``) are unaffected --
+      neither side is bare, so only the ``==`` rule applies and they still fail.
     - A ``Union``/``X | Y`` (including ``Optional``) on the *output* side
       passes only if *every* member is individually compatible with
       ``in_t`` (an agent returning ``str | int`` can't safely feed a stage
@@ -246,6 +293,8 @@ def _types_compatible(out_t: Any, in_t: Any) -> bool:
     if out_t is Any or in_t is Any or out_t is object or in_t is object:
         return True
     if out_t == in_t:
+        return True
+    if _bare_origin(in_t) is out_t or _bare_origin(out_t) is in_t:
         return True
     out_union = _union_members(out_t)
     if out_union is not None:
@@ -369,11 +418,89 @@ async def _arun_aggregate_nested_run(
     )
 
 
+def _warm_input_adapter(stage: Stage) -> None:
+    """Eagerly build (and cache) the runtime validator for ``stage``'s input type.
+
+    Called at ``Pipeline``/``Aggregate`` construction for every boundary type,
+    mirroring ``AgentFunction.__init__``'s eager ``_build_output_schema`` call:
+    it amortizes adapter construction before the first ``.run()`` AND turns a
+    type no adapter can ever be built for (bare build fails and the
+    ``arbitrary_types_allowed`` fallback is illegal -- e.g. a stdlib dataclass
+    with an arbitrary-typed field) into an immediate build-time
+    :class:`~composeai.errors.ConfigError`, consistent with ``pipe()``'s
+    "no wasted API spend on a wiring bug" ethos -- rather than a raw pydantic
+    error surfacing on the first item at run time.
+
+    The catch net spans every exception ``TypeAdapter`` construction (bare, then
+    the ``arbitrary_types_allowed`` fallback inside :func:`~composeai._schema._cached_adapter`)
+    can raise: ``PydanticSchemaGenerationError`` (a subclass of
+    ``PydanticUserError``, kept explicit), ``PydanticUserError`` itself, and --
+    crucially -- ``pydantic_core.SchemaError``, a SIBLING class raised when the
+    core validator can't be built from an otherwise-valid schema. The last one
+    is exactly what a non-``@runtime_checkable`` :class:`~typing.Protocol` input
+    trips: bare build raises ``PydanticSchemaGenerationError``, the
+    ``arbitrary_types_allowed`` fallback then tries to build an ``isinstance``
+    validator against it and ``SchemaError``s because such a Protocol is not a
+    valid ``isinstance`` second argument. Without ``SchemaError`` in the net it
+    used to escape raw, defeating the "unbuildable boundary -> build-time
+    ``ConfigError``" promise. (``PydanticUndefinedAnnotation`` -- a ``NameError``
+    subclass -- is handled upstream in :func:`~composeai._schema.resolve_annotations`'s
+    own ``NameError`` fallback, and an unresolved *string* annotation degrades to
+    ``None`` in ``_adapter_for`` before we ever build, so neither reaches here.)
+    """
+    t = _stage_input_type(stage)
+    try:
+        _adapter_for(t)
+    except (PydanticSchemaGenerationError, PydanticUserError, SchemaError) as exc:
+        hint = ""
+        if getattr(t, "_is_protocol", False):
+            # A Protocol validates by isinstance, which requires the
+            # @runtime_checkable decorator; name the exact fix (or the Any
+            # opt-out) rather than leaking pydantic's raw isinstance complaint.
+            hint = (
+                " -- a Protocol boundary must be decorated @runtime_checkable "
+                "(so it can be validated by isinstance); add "
+                "typing.runtime_checkable, or annotate the parameter Any to opt "
+                "out of runtime validation"
+            )
+        raise ConfigError(
+            f"stage {_stage_name(stage)!r} declares input type {_type_name(t)}, which "
+            f"composeai cannot build a runtime validator for: {exc}{hint}"
+        ) from exc
+
+
+def _validate_stage_input(stage: Stage, x: Any, boundary: str) -> Any:
+    """Validate ``x`` against ``stage``'s declared input type; return the coerced value.
+
+    Strict-mode entry validation at the single dispatch chokepoint. ``Any``/
+    missing annotations are a hard no-op (``_adapter_for`` returns ``None`` --
+    pydantic is never touched, object identity preserved). Otherwise strict
+    validation coerces where safe (dict->model, int->float, identity-preserving
+    passthrough for already-correct/subclass values) and the coerced value is
+    what flows onward; a genuine mismatch (a lossy scalar coercion or a real
+    shape error) raises :class:`~composeai.errors.StageTypeError` naming the
+    stage, the ``boundary`` it failed at, the expected type, and pydantic's own
+    field-level detail.
+    """
+    adapter = _adapter_for(_stage_input_type(stage))
+    if adapter is None:
+        return x
+    try:
+        return adapter.validate_python(x, strict=True)
+    except ValidationError as exc:
+        expected = _stage_input_type(stage)
+        raise StageTypeError(
+            f"{boundary}: stage {_stage_name(stage)!r} expected {_type_name(expected)} "
+            f"but got an incompatible value -- {exc}"
+        ) from exc
+
+
 async def _ainvoke_stage(
     stage: Stage,
     x: Any,
     *,
     streaming: bool,
+    boundary: str = "stage input",
     task_name: str | None = None,
     timeout: float | None = None,
     timeout_name: str | None = None,
@@ -433,6 +560,11 @@ async def _ainvoke_stage(
     """
     stage_name = task_name if task_name is not None else _stage_name(stage)
     tname = timeout_name if timeout_name is not None else stage_name
+
+    # ENTRY-only validation: coerce `x` against the stage's declared input type
+    # once, here at the single chokepoint, then dispatch the coerced value
+    # onward. `Any`/missing annotations are a hard no-op (identity preserved).
+    x = _validate_stage_input(stage, x, boundary)
 
     if isinstance(stage, AgentFunction):
 
@@ -774,6 +906,11 @@ class Pipeline(Generic[In, Out]):
         self.input_type: Any = _stage_input_type(stages[0])
         self.output_type: Any = _stage_output_type(stages[-1])
         self._name = "pipe(" + " → ".join(_stage_name(s) for s in stages) + ")"
+        # Eager warm: every stage's input type is validated at run time
+        # (ENTRY-only), so build each adapter now -- amortizing construction and
+        # turning an unbuildable boundary type into a build-time ConfigError.
+        for stage in stages:
+            _warm_input_adapter(stage)
 
     def __call__(self, x: In) -> Out:
         """Sugar for :meth:`run`'s output -- UNLESS a span or run context is
@@ -865,8 +1002,9 @@ class Pipeline(Generic[In, Out]):
         """Async core: run every stage in sequence, assuming an enclosing
         'pipe' span is already open."""
         current = x
-        for stage in self._stages:
-            current = await _ainvoke_stage(stage, current, streaming=streaming)
+        for i, stage in enumerate(self._stages):
+            boundary = "pipeline input" if i == 0 else "stage handoff"
+            current = await _ainvoke_stage(stage, current, streaming=streaming, boundary=boundary)
         return current
 
 
@@ -999,6 +1137,10 @@ class Aggregate(Generic[In]):
         self.input_type: Any = first if all(t == first for t in input_types) else Any
         self.output_type: Any = dict
         self._name = "aggregate(" + ", ".join(self._branches.keys()) + ")"
+        # Eager warm: each branch's input type is validated at run time
+        # (ENTRY-only) -- build each adapter now (see Pipeline.__init__).
+        for stage in self._branches.values():
+            _warm_input_adapter(stage)
 
     def __call__(self, x: In) -> dict[str, Any]:
         """Sugar for :meth:`run`'s output -- UNLESS a span or run context is
@@ -1135,6 +1277,7 @@ class Aggregate(Generic[In]):
                     stage,
                     x,
                     streaming=streaming,
+                    boundary=f"aggregate branch {name!r}",
                     timeout=self._timeout_per_branch,
                     timeout_name=name,
                     timeout_kind="aggregate branch",
@@ -1366,6 +1509,14 @@ def map(
         raise ConfigError(f"map(): on_error must be 'raise' or 'collect', got {on_error!r}")
     if max_workers is not None and max_workers < 1:
         raise ValueError("max_workers must be greater than 0")
+    # Warm `fn`'s input adapter once, here at entry -- map()/amap() have no
+    # construction step (unlike pipe()/aggregate()), so an unbuildable input
+    # annotation (e.g. a non-@runtime_checkable Protocol) would otherwise
+    # surface as a raw pydantic error per item at dispatch -- and
+    # `on_error="collect"` would mask it as a failure on EVERY item. Warming up
+    # front fails ONCE, before any item runs, with the same ConfigError + hint
+    # pipe()/aggregate() give. Cheap on the cached path (lru-cached adapter).
+    _warm_input_adapter(fn)
 
     return _runtime.run_sync(
         _amap(
@@ -1437,6 +1588,10 @@ async def amap(
         raise ConfigError(f"amap(): on_error must be 'raise' or 'collect', got {on_error!r}")
     if max_workers is not None and max_workers < 1:
         raise ValueError("max_workers must be greater than 0")
+    # Warm `fn`'s input adapter once, up front -- see map()'s body for the full
+    # rationale (an unbuildable annotation must fail once as a ConfigError here,
+    # not per-item at dispatch, where collect mode would mask it).
+    _warm_input_adapter(fn)
 
     return await _amap(
         fn,
@@ -1502,6 +1657,7 @@ async def _amap(
                 fn,
                 item,
                 streaming=False,
+                boundary=f"map item {i}",
                 task_name=name,
                 timeout=timeout_per_item,
                 timeout_kind="@task",

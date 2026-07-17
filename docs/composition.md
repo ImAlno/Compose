@@ -31,6 +31,20 @@ except CompositionTypeError as exc:
 
 `pipe()` requires at least 2 stages, or it raises `CompositionTypeError` immediately.
 
+That build-time check has a runtime twin. As each stage runs, the concrete value handed to it is validated against the stage's declared input type (pydantic strict mode) at the single dispatch chokepoint, and the coerced value flows onward — a `dict` is instantiated into a model, an `int` widens to a `float`, an already-correct instance passes through untouched, but a lossy or shape-wrong value raises `StageTypeError`:
+
+```python
+from composeai.errors import StageTypeError
+
+try:
+    write_post({"not": "a topic"})   # wrong shape for researcher's input
+except StageTypeError as exc:
+    print(exc)
+    # pipeline input: stage 'researcher' expected ... but got an incompatible value -- ...
+```
+
+`StageTypeError` is `CompositionTypeError`'s runtime counterpart (both subclass `ComposeError` and `TypeError`, kept distinct so a wiring bug and a bad-data bug can be caught separately). A boundary annotated `Any` (or unannotated) opts out — it's never validated. See [typing](typing.md) for the full coercion table and the static-typing contract these checks mirror.
+
 ### Operator sugar
 
 `a >> b` is exactly `pipe(a, b)` — same build-time type check, same `CompositionTypeError` on a mismatch, no separate code path. It works for any mix of `@agent` functions, plain callables, and `pipe`/`aggregate` results, as long as at least one operand is a composeai stage type; chaining stays flat, so `researcher >> copywriter >> editor` builds one 3-stage `Pipeline`, not a `Pipeline` nested inside a `Pipeline`:
@@ -39,6 +53,8 @@ except CompositionTypeError as exc:
 write_post = researcher >> copywriter   # exactly pipe(researcher, copywriter), types checked HERE
 post = write_post("quantum computing")
 ```
+
+Both forms are also statically typed: `pipe()`/`>>` infer a `Pipeline[In, Out]` a type checker can see, so a mismatch is flagged in your editor, not just at build time. `pipe()`'s overload ladder covers 2–9 stages (a longer `pipe()` call is a static no-match by design — chain with `>>`, which has no arity cap). See [typing](typing.md).
 
 ## `aggregate`
 
@@ -123,4 +139,4 @@ One caveat: inside an `async def` `@flow`/`@task` body being driven through the 
 
 ## See also
 
-[agents](agents.md) covers the `@agent` idiom these stages are usually built from; [flows](flows.md) makes a sequence of combinator calls durable and resumable; [budgets](budgets.md) covers `budget=` on a top-level `pipe`/`aggregate` `.run()` call.
+[agents](agents.md) covers the `@agent` idiom these stages are usually built from; [flows](flows.md) makes a sequence of combinator calls durable and resumable; [budgets](budgets.md) covers `budget=` on a top-level `pipe`/`aggregate` `.run()` call; [typing](typing.md) covers the static-typing contract (`Pipeline[In, Out]`, the pipe ladder) and the `StageTypeError` runtime validation these boundaries perform.

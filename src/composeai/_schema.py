@@ -11,13 +11,75 @@ from __future__ import annotations
 
 import dataclasses
 import enum
+import functools
 import inspect
 from collections.abc import Callable
 from typing import Any, get_args, get_type_hints
 
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, PydanticSchemaGenerationError, TypeAdapter
 
 from ._encoding import register_serializable
+
+
+@functools.cache
+def _cached_adapter(t: Any) -> TypeAdapter[Any]:
+    """Build (and process-wide cache) a ``TypeAdapter`` for annotation ``t``.
+
+    Bare ``TypeAdapter(t)`` first; only on ``PydanticSchemaGenerationError``
+    (an arbitrary non-pydantic class) retry with ``arbitrary_types_allowed=True``,
+    which degrades that class to pure ``isinstance`` semantics. Any other build
+    failure -- including the ``PydanticUserError`` pydantic raises when that
+    same fallback config is illegally passed to a type that is itself a
+    BaseModel/dataclass/TypedDict -- propagates to the caller unchanged.
+    """
+    try:
+        return TypeAdapter(t)
+    except PydanticSchemaGenerationError:
+        return TypeAdapter(t, config=ConfigDict(arbitrary_types_allowed=True))
+
+
+def _adapter_for(t: Any) -> TypeAdapter[Any] | None:
+    """A cached, strict-capable ``TypeAdapter`` for annotation ``t`` -- or ``None``.
+
+    ``None`` for ``t is Any``: a deliberately-unconstrained boundary, so callers
+    skip validation entirely and pydantic is never even constructed (both a
+    perf fast-path and the runtime mirror of ``_types_compatible`` treating
+    ``Any`` as a universal pass). Otherwise the process-wide cached adapter
+    from :func:`_cached_adapter`.
+
+    ``None`` too for a ``str`` annotation -- an UNRESOLVED string that survived
+    :func:`resolve_annotations` (e.g. ``from __future__ import annotations`` plus
+    a closure-local model name ``get_type_hints`` can't see in an enclosing
+    function's scope, so it falls back to the raw string). Such an annotation is
+    statically useless, and building ``TypeAdapter("X")`` from it yields a *lazy*
+    adapter that is never rebuilt -- so the first value crossing the boundary,
+    even a perfectly valid instance, would detonate with a raw
+    ``PydanticUserError: 'TypeAdapter[X]' is not fully defined``. 0.4.1 ran these
+    pipelines fine on valid input; crashing a valid run over an unresolvable
+    annotation is the worst outcome, so the boundary degrades to unvalidated
+    pass-through, exactly like ``Any`` (no lazy ``TypeAdapter("X")`` is ever
+    constructed, and the eager warm never chokes on it).
+
+    Cached with ``functools.cache`` keyed on the annotation object itself --
+    models, builtins, ``Union``/``list[...]``/``None`` are all hashable. A
+    hypothetical unhashable annotation can't be a cache key (the cache raises
+    ``TypeError`` while hashing it), so it's built uncached instead. A
+    genuinely unadaptable type (e.g. a stdlib dataclass with an arbitrary-typed
+    field: bare build fails, and the ``arbitrary_types_allowed`` fallback is
+    illegal on a dataclass) lets the underlying pydantic error escape -- eager
+    warm at construction turns that into a build-time ``ConfigError``.
+    """
+    if t is Any or isinstance(t, str):
+        return None
+    try:
+        return _cached_adapter(t)
+    except TypeError:
+        # Unhashable annotation -> not usable as an lru_cache key; build
+        # uncached with the identical bare-then-fallback strategy.
+        try:
+            return TypeAdapter(t)
+        except PydanticSchemaGenerationError:
+            return TypeAdapter(t, config=ConfigDict(arbitrary_types_allowed=True))
 
 
 def resolve_annotations(fn: Callable[..., Any], *, include_extras: bool = True) -> dict[str, Any]:

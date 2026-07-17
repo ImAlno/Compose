@@ -62,6 +62,28 @@ class CompositionTypeError(ComposeError, TypeError):
     """
 
 
+class StageTypeError(ComposeError, TypeError):
+    """A concrete value crossing a stage boundary failed its declared type.
+
+    The *runtime* twin of :class:`CompositionTypeError`: where that one is
+    raised by ``pipe()`` at build time for a mismatched *annotation* pair
+    (before anything runs, before any API spend), this one is raised while a
+    ``pipe()``/``aggregate()``/``map()`` is actually *running*, when one
+    concrete value handed to a stage doesn't validate against that stage's
+    declared input type (pydantic strict mode -- dict->model and int->float
+    are permitted, lossy scalar coercions like str->int are not). The message
+    names the stage, the boundary it failed at (pipeline input / stage
+    handoff / aggregate branch / map item), the expected type, and embeds
+    pydantic's own field-level detail.
+
+    Kept a distinct type -- never reuse ``CompositionTypeError`` -- precisely
+    so callers can handle the two differently: a wiring bug fails identically
+    on every retry, whereas a bad-data bug may not. Also a :class:`TypeError`,
+    so it's catchable either as a composeai error or as a plain Python type
+    error.
+    """
+
+
 class MaxTurnsExceededError(ComposeError):
     """An ``@agent`` run used more LLM turns than its configured ``max_turns``."""
 

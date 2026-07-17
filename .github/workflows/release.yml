@@ -24,6 +24,9 @@ jobs:
       - run: pytest
       - run: ruff check src tests examples
       - run: pyright
+      # mypy: best-effort cross-checker smoke over the typing surface only,
+      # NEVER blocking (divergences documented in tests/typing_surface.py).
+      - run: 'mypy tests/typing_surface.py || echo "mypy (best-effort, non-blocking) -- divergences above are documented in tests/typing_surface.py"'
 
   publish:
     needs: test

@@ -5,7 +5,8 @@ Multi-agent workflows as the typed Python functions you already write — wiring
 - **Agents are typed functions.** The docstring is the system prompt, the body returns the user prompt, the return annotation is the structured output type. Calling one returns that type — or raises.
 - **There's nothing new to learn.** No graph objects, no `Runnable`/`StateGraph` class ecosystem — composeai is functions, a handful of decorators (`@agent`, `@tool`, `@task`, `@flow`), and the pydantic models you already use.
 - **Fan-out is parallel by default.** `aggregate(...)` runs every branch concurrently and `compose.map(fn, items)` processes items in parallel — no futures, no executors, no asyncio unless you want it.
-- **Composition is checked before it runs.** `pipe(researcher, copywriter)` (or `researcher >> copywriter`) verifies every stage boundary at build time; a wiring bug raises `CompositionTypeError` before a single API call is made.
+- **Composition is checked before it runs.** `pipe(researcher, copywriter)` (or `researcher >> copywriter`) verifies every stage boundary at build time; a wiring bug raises `CompositionTypeError` before a single API call is made — and your type checker sees the same contract (`pipe(researcher, copywriter)` infers `Pipeline[Topic, Article]`), so the mismatch is flagged in your editor too.
+- **Type boundaries are enforced at runtime, too.** Every value crossing a `pipe`/`aggregate`/`map` stage is validated against the stage's declared input type (pydantic strict mode): a `dict` is coerced into your model, an `int` widens to a `float`, but a lossy or shape-wrong value raises `StageTypeError` — the runtime twin of the build-time `CompositionTypeError`. Annotate a boundary `Any` to opt out.
 - **Tracing is always on, and local.** Every run persists spans, token usage, and cost to a SQLite store on your disk (`./.compose`). No SaaS, no instrumentation, no opt-in — the trace is just there.
 - **Flows are durable.** A `@flow` journals every step; if it crashes — or pauses on a **named interrupt** (`approve("publish")`, `ask_human("pick a title")`) waiting for a human — `resume(run_id)` continues it in the same process or a brand-new one, days later, replaying finished steps without re-paying for them.
 - **Every run can carry a spend cap.** `Budget(usd=..., tokens=...)` is enforced after every LLM call in a run's subtree, and stays cumulative across `resume()` — a run can't dodge its budget by crashing and getting resumed.
@@ -77,6 +78,7 @@ No accounts, no exporters, no instrumentation to wire up — the trace (and its 
 | [docs/index.md](docs/index.md) | Project overview, the 90-second tour, and where to go next |
 | [docs/agents.md](docs/agents.md) | The `@agent` idiom, structured output and repairs, tools, resilience knobs, naming/replacing agents, `.run()`/`.stream()` |
 | [docs/composition.md](docs/composition.md) | `pipe`, `aggregate`, `map`, build-time type checking, nesting combinators |
+| [docs/typing.md](docs/typing.md) | The static-typing contract (`AgentFunction[P, R]`, `Pipeline[In, Out]`, `Run[R]`), the pipe ladder, `StageTypeError` runtime validation |
 | [docs/flows.md](docs/flows.md) | `@task`/`@flow`, the journal, determinism, `resume()`, human-in-the-loop |
 | [docs/async.md](docs/async.md) | `.arun()`/`.astream()`, `aresume`, `amap`, `anow`/`arandom`, async `@tool`/`@task`/`@agent`/`@flow` bodies |
 | [docs/providers.md](docs/providers.md) | Model strings vs `Model` instances, API keys, `openai_compatible`, pricing, reasoning-model gotchas |
@@ -116,6 +118,7 @@ The contracts composeai holds you to — and the ones it holds itself to:
 - Extended-thinking / reasoning request configuration (Anthropic `thinking` budget, OpenAI `reasoning.summary`/`encrypted_content`) -- today `ThinkingPart` only round-trips whatever a provider returns unprompted by default; there's no `ModelRequest` field to actually ask for it
 - Consolidate the MCP bridge onto the runtime loop (each MCP server currently owns its own dedicated event-loop thread rather than sharing composeai's)
 - Span-persistence queue tuning under streaming storms (the store's single writer thread is a FIFO queue; a very high-rate `.stream()`/`.astream()` workload hasn't been load-tested against it)
+- Typed `aggregate()` branch values -- infer a per-branch `TypedDict` output (`{"a": <A's return>, "b": <B's return>}`) instead of today's uniform `dict[str, Any]`, so a downstream stage sees each branch's real result type
 
 ## License
 

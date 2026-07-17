@@ -110,6 +110,8 @@ Note that `@agent(timeout=...)` is unrelated to a model constructor's own `timeo
 
 ## `.run()` vs calling vs `.stream()`
 
+`@compose.agent` infers an `AgentFunction[P, R]` that preserves the decorated function's whole signature — `P` its parameter list (names included), `R` its return type — so `researcher` type-checks as `(topic: str) -> FactSheet` and `researcher.run(...)` returns a `Run[FactSheet]` whose `.output` is a `FactSheet` a checker can see. See [typing](typing.md) for the full static-typing contract.
+
 Calling the agent directly (`researcher("quantum computing")`) is sugar for `researcher.run("quantum computing").output`. Need more than the output? `.run()` returns the whole `Run`:
 
 ```python
@@ -171,4 +173,4 @@ An `@agent` function's body may itself be `async def` — composeai awaits it na
 
 ## See also
 
-[composition](composition.md) wires agents together into pipelines with build-time type checking; [flows](flows.md) makes a sequence of agent calls durable and resumable; [testing](testing.md) covers `FakeModel` for testing agents with no network.
+[composition](composition.md) wires agents together into pipelines with build-time type checking; [flows](flows.md) makes a sequence of agent calls durable and resumable; [testing](testing.md) covers `FakeModel` for testing agents with no network; [typing](typing.md) covers the `AgentFunction[P, R]`/`Run[R]` static-typing contract.

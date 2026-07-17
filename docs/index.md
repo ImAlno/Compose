@@ -69,6 +69,7 @@ No accounts, no exporters, no instrumentation to wire up — the trace (and its 
 | :--- | :--- |
 | [agents](agents.md) | The `@agent` idiom, structured output and repairs, tools, resilience knobs, naming/replacing agents, `.run()`/`.stream()` |
 | [composition](composition.md) | `pipe` (and `>>` sugar), `aggregate`, `map`, build-time type checking, nesting combinators |
+| [typing](typing.md) | The static-typing contract (`AgentFunction[P, R]`, `Pipeline[In, Out]`, `Run[R]`), the pipe ladder, `StageTypeError` runtime validation |
 | [flows](flows.md) | `@task`/`@flow`, the journal, determinism, `resume()`, human-in-the-loop |
 | [async](async.md) | `.arun()`/`.astream()`, `aresume`, `amap`, `anow`/`arandom`, async `@tool`/`@task`/`@agent`/`@flow` bodies |
 | [providers](providers.md) | Model strings vs `Model` instances, API keys, `openai_compatible`, pricing, reasoning-model gotchas |

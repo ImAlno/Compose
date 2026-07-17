@@ -55,8 +55,49 @@ prototype exploring an arm the design then rejected -- are:
   agent is a hard ``reportOperatorIssue`` -- chosen over the prototype's B/C/D/E
   arms, which silently mis-typed multi-arg composition.
 
+Known mypy divergences (best-effort, non-blocking smoke)
+--------------------------------------------------------
+
 A best-effort, non-blocking mypy pass over just this file is a Plan C release
-gate (``|| true`` with visible output); pyright is the contract here.
+gate (``scripts/release.sh`` runs ``mypy tests/typing_surface.py || echo ...``
+with visible output; ``[tool.mypy]`` in pyproject.toml scopes it to this file
+with ``follow_imports = "silent"`` so it checks the surface against composeai's
+REAL types without demanding the whole repo be mypy-clean). **pyright is the
+contract; mypy is a cross-checker smoke test only.**
+
+As of mypy 2.3.0 this file reports **25 errors** (``mypy`` from the repo root).
+All 25 are EXPECTED and fall into four classes -- none is a defect in this file
+or in ``src``, and none is fixable without either weakening a pyright
+``assert_type`` pin or hand-annotating away the very inference this file exists
+to showcase (the Plan B final review predicted the Stage-protocol variance
+complaints; the directive is to document, not contort). No line was changed to
+appease mypy.
+
+====================  =====  ==========================================================  ========
+mypy error class      count  why it diverges from pyright                                verdict
+====================  =====  ==========================================================  ========
+``[assert-type]``     9      mypy solves the contravariant ``Stage.In`` to ``Any``       expected
+                             across ``>>`` / ``pipe()`` composition, inferring
+                             ``Pipeline[Any, Out]`` / ``Aggregate[Any]`` where pyright
+                             propagates the left operand's concrete input type -- the
+                             Stage-protocol variance the Plan B review predicted.
+``[var-annotated]``   8      Downstream of the row above: mypy will not *infer* a var    expected
+                             whose solved type is a partial-``Any`` generic (or a
+                             rejected ``>>`` result) and demands an explicit
+                             annotation. Adding one would turn this inference showcase
+                             into a hand-annotated file.
+``[operator]``        1      ``plain-fn >> agent``: mypy does not resolve the reflected  expected
+                             ``>>`` into ``AgentFunction.__rrshift__`` (it reports
+                             ``Stage[Never, Never]``) -- a known mypy limit with
+                             reflected operators vs protocol self-types; pyright gives
+                             ``Pipeline[int, Facts]``.
+negative cases        7      The ``# pyright: ignore``-marked negatives: ``[arg-type]``  expected
+                             x3, ``[misc]`` x3, ``[call-overload]`` x1
+                             (``pipeline(42)``, wrong wiring, 10-stage ``pipe()``,
+                             2-/0-param agent ``>>``, wrong-arg ``@tool``). mypy
+                             honours no scoped-ignore so they count -- but it REJECTS
+                             every one, the same verdict as pyright.
+====================  =====  ==========================================================  ========
 """
 
 from __future__ import annotations

@@ -69,6 +69,10 @@ R = TypeVar("R", default=Any)
 class Run(Generic[R]):
     """The outcome of one ``@agent`` invocation.
 
+    ``output`` is typed ``R`` -- the *completed*-run output type; a paused or
+    failed run has none, so discriminate those via ``status``/``pending``
+    rather than guarding on ``output`` (see docs/typing.md).
+
     ``pending`` is set (to the :class:`~composeai.hitl.Interrupt` that
     caused it) exactly when ``status == "paused"`` -- ``None`` otherwise.
     Pausing is produced by ``@flow.run()``/``resume()`` and by ``@agent``

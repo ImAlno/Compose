@@ -158,6 +158,26 @@ Both exist to avoid the "duplicate name" `ConfigError`, for different situations
 
 For a whole test suite that redefines many agents/flows/tasks across many modules, `reset_registries()` (above) as an autouse fixture is usually simpler than threading `name=`/`replace=True` through every definition — pick whichever matches how much of the suite needs it. One caveat specific to `@agent(replace=True)`: standalone-agent resume has no fingerprint/staleness check (unlike `@flow`, which hashes its source at decoration time), so a paused run resumed after a `replace=True` rebind continues silently against the *new* definition.
 
+## Pinning inferred types with `assert_type`
+
+composeai's own typed surface is checked, not just asserted in prose: `tests/typing_surface.py` exercises the whole public API and pins each inferred type with `typing_extensions.assert_type` — a symmetric, hard equality on the checker's inference that fails the pyright gate the moment a type stops inferring what it should. `assert_type` is a runtime no-op (it returns its first argument unchanged), so the same pattern is a cheap way to lock down the types your *own* agents and pipelines expose:
+
+```python
+from typing_extensions import assert_type
+
+import composeai as compose
+from composeai.runs import Run
+
+
+def test_pipeline_types() -> None:
+    write_post = researcher >> copywriter
+    # A build-only check (no engine, no network): a wiring change that alters
+    # the inferred type fails your type checker, not just at runtime.
+    assert_type(write_post.run("ai"), Run[str])
+```
+
+See [typing](typing.md) for the full static-typing contract these pins cover.
+
 ## See also
 
 [agents](agents.md) covers `@agent(model=...)` accepting a `FakeModel` (or any `Model`) directly, and `name=`/`replace=` in depth; [flows](flows.md) covers the fingerprint check `@flow` has and `@task`/`@flow`'s own `name=`/`replace=`; [observability](observability.md) covers `compose export`, the CLI command that builds a cassette from an already-persisted run; [budgets](budgets.md) covers `Usage`/`Budget` interaction with a scripted `FakeModel`'s `usage=`.

@@ -36,6 +36,10 @@ echo "running gates..."
 .venv/bin/pytest -q
 .venv/bin/ruff check src tests examples
 .venv/bin/pyright
+# mypy is a best-effort cross-checker smoke over the typing surface only and is
+# NEVER release-blocking (known divergences are documented in that file's
+# docstring); pyright above is the gated contract.
+.venv/bin/mypy tests/typing_surface.py || echo "mypy (best-effort, non-blocking): divergences above are documented in tests/typing_surface.py"
 
 echo "building..."
 rm -rf dist
