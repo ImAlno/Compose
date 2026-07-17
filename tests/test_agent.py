@@ -23,7 +23,7 @@ from composeai.errors import (
     ProviderError,
 )
 from composeai.messages import Message, StopReason, ToolCallPart, ToolResultPart, Usage
-from composeai.models.base import ModelResponse
+from composeai.models.base import ModelRequest, ModelResponse
 from composeai.testing import FakeModel
 from composeai.tools import tool
 
@@ -876,3 +876,74 @@ def test_tool_timeout_surfaces_as_error_result():
     assert isinstance(result_part, ToolResultPart)
     assert result_part.is_error is True
     assert "TaskTimeoutError" in result_part.content
+
+
+# --- 0.6.0 request-config threading --------------------------------------
+
+
+class _CaptureModel:
+    """Records every ModelRequest; replies with a plain text end_turn."""
+
+    def __init__(self) -> None:
+        self.requests: list[ModelRequest] = []
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        self.requests.append(request)
+        return ModelResponse(
+            message=Message.assistant("ok"),
+            stop_reason=StopReason.END_TURN,
+            raw_stop_reason="end_turn",
+            usage=Usage(),
+            model_id="capture",
+        )
+
+
+def test_agent_defaults_flow_into_request():
+    capture = _CaptureModel()
+
+    @agent(model=capture, name="cfg_defaults")
+    def a(q: str) -> str:
+        """sys"""
+        return prompt(q)
+
+    a("hi")
+    req = capture.requests[0]
+    assert req.prompt_cache is True  # decorator default is ON
+    assert req.thinking is None  # send-nothing default
+    assert req.effort is None
+
+
+def test_agent_explicit_config_flows_into_request():
+    capture = _CaptureModel()
+
+    @agent(
+        model=capture,
+        name="cfg_explicit",
+        prompt_cache=False,
+        thinking=True,
+        effort="xhigh",
+    )
+    def a(q: str) -> str:
+        """sys"""
+        return prompt(q)
+
+    a("hi")
+    req = capture.requests[0]
+    assert req.prompt_cache is False
+    assert req.thinking is True
+    assert req.effort == "xhigh"
+
+
+def test_max_turns_none_is_unbounded():
+    # Mirror test_max_turns_exceeded_raises's stub (12 tool turns + 1 final),
+    # but with max_turns=None: the run must complete instead of raising.
+    tool_turns = [{"tool_calls": [{"name": "noop", "arguments": {}}]}] * 12
+    model = FakeModel([*tool_turns, "done after twelve tool turns"])
+
+    @agent(model=model, tools=[noop], max_turns=None)
+    def runner() -> str:
+        """Runner."""
+        return "go"
+
+    result = runner()
+    assert result == "done after twelve tool turns"

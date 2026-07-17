@@ -9,22 +9,17 @@ unless it's actually used.
 Wire shapes were verified against the installed ``openai`` SDK (2.45.0) --
 ``openai/types/responses/*.py`` -- rather than assumed from memory.
 
-**Reasoning round-trip is limited to what the API returns by default.**
-``_build_kwargs`` never sets the request-side ``reasoning`` parameter (no
-``summary``/``generate_summary``), and never sets ``include:
-["reasoning.encrypted_content"]`` -- both are opt-in per the installed SDK's
-``types/shared_params/reasoning.py`` / ``types/responses/
-response_create_params.py`` docstrings. Practically: a real reasoning-model
-response's ``reasoning`` output item comes back with an empty ``summary``
-list (no readable ``ThinkingPart.text``) and no ``encrypted_content``
-(so :func:`_echo_reasoning_item`'s cross-turn round trip carries no actual
-chain-of-thought payload back to the model -- it still correctly echoes
-whatever *is* present, e.g. the item ``id``, just with an empty ``summary``).
-Requesting a reasoning summary / encrypted content is a v1 roadmap item, not
-implemented here -- see docs/design.md's "Out of scope v1" list -- since it
-needs a new request-side configuration surface (this module's ``ModelRequest``
-has no ``reasoning``-shaped field to plumb through yet, same gap as
-Anthropic's extended-thinking ``thinking`` config -- see models/anthropic.py).
+`_build_kwargs` sets ``reasoning={"effort": ...}`` when
+``ModelRequest.effort`` is set (0.6.0) and still never sends
+``summary``/``generate_summary``. ``ModelRequest.thinking`` and
+``.prompt_cache`` are deliberate no-ops here: OpenAI's reasoning models
+have no thinking on/off toggle, and OpenAI prompt caching is automatic
+server-side (usage is already read back via ``input_tokens_details``).
+
+On the response side, ``include: ["reasoning.encrypted_content"]`` is never
+requested, and ``_echo_reasoning_item``'s cross-turn round trip echoes the
+reasoning item's ``id`` with an empty ``summary`` -- no chain-of-thought
+payload is ever sent back.
 """
 
 from __future__ import annotations
@@ -442,6 +437,8 @@ class OpenAIModel:
                     "strict": _is_strict_compatible(request.output_schema),
                 }
             }
+        if request.effort is not None:
+            kwargs["reasoning"] = {"effort": request.effort}
         return kwargs
 
     def _finalize(self, response: Any, request: ModelRequest) -> ModelResponse:

@@ -4,7 +4,7 @@ from composeai.testing import FakeModel
 
 
 def test_version():
-    assert composeai.__version__ == "0.5.0"
+    assert composeai.__version__ == "0.6.0"
 
 
 def test_openai_compatible_is_exported():

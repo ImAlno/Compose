@@ -21,6 +21,7 @@ never reaches it.
 from __future__ import annotations
 
 import json
+from typing import TypedDict
 
 import pytest
 
@@ -418,3 +419,46 @@ def test_cassette_context_reusable_sequentially_after_nesting_attempt_failed(tmp
     with replay_cassette(path):
         run = greeter.run("x")
     assert run.output == "ok"
+
+
+# --- 0.6.0 request-config fields vs hashing ------------------------------
+
+_GOLDEN_050_HASH = "ae33af6a7ee6f8ddc4462301410e89375f6937d61714ac46ad7c6a18302548fc"
+
+
+class _ReqKwargs(TypedDict):
+    model: str
+    messages: list[Message]
+    system: str
+    provider: str
+
+
+def _req_kwargs() -> _ReqKwargs:
+    return {
+        "model": "claude-sonnet-5",
+        "messages": [Message.user("hi")],
+        "system": "be terse",
+        "provider": "anthropic",
+    }
+
+
+def test_full_hash_unchanged_from_050_at_default_fields():
+    assert compute_full_hash(ModelRequest(**_req_kwargs())) == _GOLDEN_050_HASH
+
+
+def test_prompt_cache_never_affects_hash():
+    base = ModelRequest(**_req_kwargs())
+    cached = ModelRequest(**_req_kwargs(), prompt_cache=True)
+    assert compute_full_hash(base) == compute_full_hash(cached)
+
+
+def test_thinking_and_effort_change_hash_only_when_set():
+    base = compute_full_hash(ModelRequest(**_req_kwargs()))
+    thinking = compute_full_hash(ModelRequest(**_req_kwargs(), thinking=True))
+    thinking_off = compute_full_hash(ModelRequest(**_req_kwargs(), thinking=False))
+    effort = compute_full_hash(ModelRequest(**_req_kwargs(), effort="high"))
+    assert thinking != base
+    assert thinking_off != base
+    assert thinking_off != thinking
+    assert effort != base
+    assert effort != thinking

@@ -114,8 +114,8 @@ The contracts composeai holds you to — and the ones it holds itself to:
 ## Roadmap
 
 - OpenTelemetry exporter (the span model already tracks `gen_ai.*` attribute conventions)
+- OpenAI request-side reasoning niceties (`reasoning.summary`, `encrypted_content` round-trip) -- 0.6.0 shipped `effort` passthrough; these remain unshipped
 - TypeScript sibling package
-- Extended-thinking / reasoning request configuration (Anthropic `thinking` budget, OpenAI `reasoning.summary`/`encrypted_content`) -- today `ThinkingPart` only round-trips whatever a provider returns unprompted by default; there's no `ModelRequest` field to actually ask for it
 - Consolidate the MCP bridge onto the runtime loop (each MCP server currently owns its own dedicated event-loop thread rather than sharing composeai's)
 - Span-persistence queue tuning under streaming storms (the store's single writer thread is a FIFO queue; a very high-rate `.stream()`/`.astream()` workload hasn't been load-tested against it)
 - Typed `aggregate()` branch values -- infer a per-branch `TypedDict` output (`{"a": <A's return>, "b": <B's return>}`) instead of today's uniform `dict[str, Any]`, so a downstream stage sees each branch's real result type

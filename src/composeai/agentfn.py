@@ -112,10 +112,13 @@ class AgentFunction(Generic[P, R]):
         tools: Sequence[Tool],
         temperature: float | None,
         max_tokens: int,
-        max_turns: int,
+        max_turns: int | None,
         retries: int,
         max_repairs: int,
         timeout: float | None,
+        prompt_cache: bool,
+        thinking: bool | None,
+        effort: str | None,
         fallback: str | Model | None,
         cache: bool,
         name: str | None,
@@ -158,6 +161,9 @@ class AgentFunction(Generic[P, R]):
         self._retries = retries
         self._max_repairs = max_repairs
         self._timeout = timeout
+        self._prompt_cache = prompt_cache
+        self._thinking = thinking
+        self._effort = effort
         self._fallback = fallback
         self._cache = cache
         self._output_schema, self._wrap_result = _build_output_schema(self.output_type)
@@ -230,10 +236,13 @@ def agent(
     tools: Sequence[Tool] = (),
     temperature: float | None = None,
     max_tokens: int = 16000,
-    max_turns: int = 10,
+    max_turns: int | None = 10,
     retries: int = 0,
     max_repairs: int = 0,
     timeout: float | None = None,
+    prompt_cache: bool = True,
+    thinking: bool | None = None,
+    effort: str | None = None,
     fallback: str | Model | None = None,
     cache: bool = False,
     name: str | None = None,
@@ -246,10 +255,13 @@ def agent(
     tools: Sequence[Tool] = (),
     temperature: float | None = None,
     max_tokens: int = 16000,
-    max_turns: int = 10,
+    max_turns: int | None = 10,
     retries: int = 0,
     max_repairs: int = 0,
     timeout: float | None = None,
+    prompt_cache: bool = True,
+    thinking: bool | None = None,
+    effort: str | None = None,
     fallback: str | Model | None = None,
     cache: bool = False,
     name: str | None = None,
@@ -299,6 +311,29 @@ def agent(
     prefer a cassette (``composeai.testing.record_cassette``/
     ``replay_cassette``/the ``cassette`` pytest fixture) instead.
 
+    ``prompt_cache=True`` (the default) marks cacheable prefix spans on
+    providers with explicit cache control (Anthropic: a breakpoint on the
+    system prompt plus one on the conversation tail once multi-turn) --
+    up to ~90% cheaper cached reads in tool loops and fan-outs, at a
+    ~1.25x write premium on the first send of a span. A no-op elsewhere
+    (OpenAI caches automatically server-side). Set ``prompt_cache=False``
+    to send byte-identical requests to 0.5.x. Distinct from ``cache=``
+    (the local response cache above): ``prompt_cache`` is provider-side
+    billing config and never affects response content or request hashes.
+
+    ``thinking``/``effort`` opt into reasoning config; ``None`` (default)
+    sends nothing so each model's own default applies. ``thinking=True``
+    requests adaptive thinking (with summarized display so
+    ``thinking_delta`` events carry text); ``False`` explicitly disables
+    it. ``effort`` is a provider-defined string passed through verbatim
+    (Anthropic: ``"low"|"medium"|"high"|"xhigh"|"max"``; OpenAI:
+    ``"minimal"|"low"|"medium"|"high"``). Invalid combinations surface as
+    ``ProviderError`` from the provider, by design (composeai keeps no
+    per-model capability table).
+
+    ``max_turns=None`` removes the turn ceiling entirely -- pair it with
+    ``timeout=`` or a run ``Budget`` so something else bounds the loop.
+
     ``max_repairs`` (structured-output agents only): when the model's final
     reply fails JSON parsing or schema validation, instead of raising
     immediately, append the error as a corrective user message and re-ask --
@@ -331,6 +366,9 @@ def agent(
             retries=retries,
             max_repairs=max_repairs,
             timeout=timeout,
+            prompt_cache=prompt_cache,
+            thinking=thinking,
+            effort=effort,
             fallback=fallback,
             cache=cache,
             name=name,
@@ -651,6 +689,9 @@ async def _acall_llm(
     output_schema: dict[str, Any] | None,
     max_tokens: int,
     temperature: float | None,
+    prompt_cache: bool,
+    thinking: bool | None,
+    effort: str | None,
     retries: int,
     streaming: bool = False,
 ) -> ModelResponse:
@@ -674,6 +715,9 @@ async def _acall_llm(
         max_tokens=max_tokens,
         temperature=temperature,
         provider=slot.provider,
+        prompt_cache=prompt_cache,
+        thinking=thinking,
+        effort=effort,
     )
     attributes: dict[str, Any] = {"model": slot.bare_id}
     if slot.provider is not None:
@@ -752,6 +796,9 @@ async def _aperform_turn(
             output_schema,
             agent_fn._max_tokens,
             agent_fn._temperature,
+            agent_fn._prompt_cache,
+            agent_fn._thinking,
+            agent_fn._effort,
             agent_fn._retries,
             streaming,
         )
@@ -771,6 +818,9 @@ async def _aperform_turn(
             output_schema,
             agent_fn._max_tokens,
             agent_fn._temperature,
+            agent_fn._prompt_cache,
+            agent_fn._thinking,
+            agent_fn._effort,
             agent_fn._retries,
             streaming,
         )
@@ -1691,7 +1741,7 @@ async def _arun_agent_uncached(
 
             while True:
                 turn += 1
-                if turn > agent_fn._max_turns:
+                if agent_fn._max_turns is not None and turn > agent_fn._max_turns:
                     raise MaxTurnsExceededError(
                         f"@agent {agent_fn.name!r} exceeded max_turns={agent_fn._max_turns} "
                         "(it kept calling tools/turns without finishing; raise max_turns "

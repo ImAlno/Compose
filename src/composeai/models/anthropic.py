@@ -123,19 +123,42 @@ class AnthropicModel:
         self._async_client = anthropic.AsyncAnthropic(**client_kwargs)
         return self._async_client
 
-    def complete(self, request: ModelRequest) -> ModelResponse:
-        import anthropic
+    def _build_kwargs(self, request: ModelRequest) -> dict[str, Any]:
+        """Build the ``messages.create``/``messages.stream`` kwargs for one request.
 
-        client = self._get_client()
+        Shared by all four call paths (complete/acomplete/stream/astream),
+        which previously duplicated this block byte-for-byte. Returns a
+        fresh dict each call -- the pause_turn continuation loops mutate
+        ``kwargs["messages"]`` in place.
+        """
         api_messages = _build_messages(request.messages, self.model_id)
-
         kwargs: dict[str, Any] = {
             "model": self.model_id,
             "max_tokens": request.max_tokens,
             "messages": api_messages,
         }
         if request.system is not None:
-            kwargs["system"] = request.system
+            if request.prompt_cache:
+                # Breakpoint 1: caches tools+system (tools render before
+                # system server-side), reused across runs of the same agent.
+                kwargs["system"] = [
+                    {
+                        "type": "text",
+                        "text": request.system,
+                        "cache_control": {"type": "ephemeral"},
+                    }
+                ]
+            else:
+                kwargs["system"] = request.system
+        if request.prompt_cache and len(api_messages) > 1:
+            # Breakpoint 2: the conversation tail -- each tool-loop turn
+            # re-reads the whole prior conversation from cache. Multi-turn
+            # only: marking a lone first message would pay a write premium
+            # with nothing to re-read it. Anthropic silently ignores
+            # markers on prefixes below the model's cacheable minimum.
+            last_content = api_messages[-1]["content"]
+            if last_content:
+                last_content[-1]["cache_control"] = {"type": "ephemeral"}
         if request.temperature is not None:
             kwargs["temperature"] = request.temperature
         if request.tools:
@@ -144,6 +167,24 @@ class AnthropicModel:
             kwargs["output_config"] = {
                 "format": {"type": "json_schema", "schema": request.output_schema}
             }
+        if request.effort is not None:
+            kwargs.setdefault("output_config", {})["effort"] = request.effort
+        if request.thinking is not None:
+            # display=summarized so thinking blocks/deltas carry text -- the
+            # API default ("omitted") streams empty thinking strings, which
+            # would make composeai's thinking_delta events vacuous.
+            kwargs["thinking"] = (
+                {"type": "adaptive", "display": "summarized"}
+                if request.thinking
+                else {"type": "disabled"}
+            )
+        return kwargs
+
+    def complete(self, request: ModelRequest) -> ModelResponse:
+        import anthropic
+
+        client = self._get_client()
+        kwargs = self._build_kwargs(request)
 
         accumulated_parts: list[ContentPart] = []
         total_usage = Usage()
@@ -189,23 +230,7 @@ class AnthropicModel:
         import anthropic
 
         client = self._get_async_client()
-        api_messages = _build_messages(request.messages, self.model_id)
-
-        kwargs: dict[str, Any] = {
-            "model": self.model_id,
-            "max_tokens": request.max_tokens,
-            "messages": api_messages,
-        }
-        if request.system is not None:
-            kwargs["system"] = request.system
-        if request.temperature is not None:
-            kwargs["temperature"] = request.temperature
-        if request.tools:
-            kwargs["tools"] = [_tool_to_param(spec) for spec in request.tools]
-        if request.output_schema is not None:
-            kwargs["output_config"] = {
-                "format": {"type": "json_schema", "schema": request.output_schema}
-            }
+        kwargs = self._build_kwargs(request)
 
         accumulated_parts: list[ContentPart] = []
         total_usage = Usage()
@@ -261,23 +286,7 @@ class AnthropicModel:
         import anthropic
 
         client = self._get_client()
-        api_messages = _build_messages(request.messages, self.model_id)
-
-        kwargs: dict[str, Any] = {
-            "model": self.model_id,
-            "max_tokens": request.max_tokens,
-            "messages": api_messages,
-        }
-        if request.system is not None:
-            kwargs["system"] = request.system
-        if request.temperature is not None:
-            kwargs["temperature"] = request.temperature
-        if request.tools:
-            kwargs["tools"] = [_tool_to_param(spec) for spec in request.tools]
-        if request.output_schema is not None:
-            kwargs["output_config"] = {
-                "format": {"type": "json_schema", "schema": request.output_schema}
-            }
+        kwargs = self._build_kwargs(request)
 
         accumulated_parts: list[ContentPart] = []
         total_usage = Usage()
@@ -375,23 +384,7 @@ class AnthropicModel:
         import anthropic
 
         client = self._get_async_client()
-        api_messages = _build_messages(request.messages, self.model_id)
-
-        kwargs: dict[str, Any] = {
-            "model": self.model_id,
-            "max_tokens": request.max_tokens,
-            "messages": api_messages,
-        }
-        if request.system is not None:
-            kwargs["system"] = request.system
-        if request.temperature is not None:
-            kwargs["temperature"] = request.temperature
-        if request.tools:
-            kwargs["tools"] = [_tool_to_param(spec) for spec in request.tools]
-        if request.output_schema is not None:
-            kwargs["output_config"] = {
-                "format": {"type": "json_schema", "schema": request.output_schema}
-            }
+        kwargs = self._build_kwargs(request)
 
         accumulated_parts: list[ContentPart] = []
         total_usage = Usage()
@@ -681,22 +674,17 @@ def _map_usage(usage: Any, model_id: str) -> Usage:
         )
         cost_complete = True
 
-    # reasoning_tokens is left at its Usage() default of 0 here. The real
-    # API does report a `usage.output_tokens_details.thinking_tokens` field
-    # (verified against the installed SDK's `types/output_tokens_details.py`
-    # -- it exists), so this isn't a wire-format gap the way it might sound;
-    # rather, extended thinking itself can't be turned on through
-    # composeai's public API yet (there's no `thinking`/budget_tokens field
-    # on ModelRequest -- see docs/design.md's "Out of scope v1" list), so a
-    # real response never populates `output_tokens_details` in the first
-    # place and mapping it here would be dead code serving an unreachable
-    # feature. Revisit alongside adding the request-side `thinking` config
-    # surface, not before.
+    # thinking is requestable as of 0.6.0 (ModelRequest.thinking); the SDK
+    # reports the raw thinking spend in output_tokens_details.thinking_tokens
+    # (a subset of output_tokens -- same billing, split out for visibility).
+    details = getattr(usage, "output_tokens_details", None)
+    reasoning_tokens = getattr(details, "thinking_tokens", 0) or 0
     return Usage(
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         cache_read_tokens=cache_read_tokens,
         cache_creation_tokens=cache_creation_tokens,
+        reasoning_tokens=reasoning_tokens,
         cost_usd=cost_usd,
         cost_complete=cost_complete,
     )

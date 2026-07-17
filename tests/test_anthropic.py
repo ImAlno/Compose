@@ -697,6 +697,29 @@ def test_cache_read_tokens_are_billed_additively_not_subtracted_from_input():
     assert expected == pytest.approx(7.8)
 
 
+def test_reasoning_tokens_read_from_output_tokens_details():
+    # The SDK reports raw thinking spend in
+    # usage.output_tokens_details.thinking_tokens (a subset of output_tokens);
+    # map it onto Usage.reasoning_tokens now that thinking is requestable.
+    usage = _usage(output_tokens=45)
+    usage.output_tokens_details = SimpleNamespace(thinking_tokens=7)
+    model = _model([_response([_text_block("x")], usage=usage)])
+    request = ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")])
+    resp = model.complete(request)
+    assert resp.usage.reasoning_tokens == 7
+
+
+def test_reasoning_tokens_default_zero_without_output_tokens_details():
+    # Regression guard: older usage payloads omit output_tokens_details
+    # entirely -- reasoning_tokens must default to 0 rather than raise.
+    usage = _usage(output_tokens=45)
+    assert not hasattr(usage, "output_tokens_details")
+    model = _model([_response([_text_block("x")], usage=usage)])
+    request = ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")])
+    resp = model.complete(request)
+    assert resp.usage.reasoning_tokens == 0
+
+
 # --- thinking-token echo ------------------------------------------------------
 
 
@@ -1401,3 +1424,163 @@ def test_injected_sync_client_used_by_async_engine():
     assert run.output == "Hello there."
     assert run.status == "completed"
     assert len(model._client.messages.calls) == 1
+
+
+# --- 0.6.0 prompt_cache / thinking / effort ------------------------------
+
+
+def _call_kwargs(model: AnthropicModel):
+    return model._client.messages.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
+
+
+def test_prompt_cache_marks_system_block_single_turn():
+    model = _model([_response([_text_block("ok")])])
+    request = ModelRequest(
+        model="claude-sonnet-5",
+        messages=[Message.user("hi")],
+        system="be terse",
+        prompt_cache=True,
+    )
+    model.complete(request)
+    call = _call_kwargs(model)
+    assert call["system"] == [
+        {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}}
+    ]
+    # single-turn: no tail marker on the (only) message
+    for block in call["messages"][-1]["content"]:
+        assert "cache_control" not in block
+
+
+def test_prompt_cache_marks_conversation_tail_when_multiturn():
+    model = _model([_response([_text_block("ok")])])
+    request = ModelRequest(
+        model="claude-sonnet-5",
+        messages=[Message.user("q1"), Message.assistant("a1"), Message.user("q2")],
+        system="be terse",
+        prompt_cache=True,
+    )
+    model.complete(request)
+    call = _call_kwargs(model)
+    last_blocks = call["messages"][-1]["content"]
+    assert last_blocks[-1]["cache_control"] == {"type": "ephemeral"}
+    # only the LAST block of the LAST message is marked
+    for msg in call["messages"][:-1]:
+        for block in msg["content"]:
+            assert "cache_control" not in block
+    for block in last_blocks[:-1]:
+        assert "cache_control" not in block
+
+
+def test_prompt_cache_without_system_still_marks_tail():
+    model = _model([_response([_text_block("ok")])])
+    request = ModelRequest(
+        model="claude-sonnet-5",
+        messages=[Message.user("q1"), Message.assistant("a1"), Message.user("q2")],
+        prompt_cache=True,
+    )
+    model.complete(request)
+    call = _call_kwargs(model)
+    assert "system" not in call
+    assert call["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+
+
+def test_prompt_cache_off_is_byte_identical_to_050():
+    model = _model([_response([_text_block("ok")])])
+    request = ModelRequest(
+        model="claude-sonnet-5",
+        messages=[Message.user("hi")],
+        system="be terse",
+        prompt_cache=False,
+    )
+    model.complete(request)
+    call = _call_kwargs(model)
+    assert call["system"] == "be terse"  # plain string, as today
+    assert "thinking" not in call
+    for msg in call["messages"]:
+        for block in msg["content"]:
+            assert "cache_control" not in block
+
+
+def test_thinking_true_maps_to_adaptive_summarized():
+    model = _model([_response([_text_block("ok")])])
+    model.complete(
+        ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")], thinking=True)
+    )
+    assert _call_kwargs(model)["thinking"] == {
+        "type": "adaptive",
+        "display": "summarized",
+    }
+
+
+def test_thinking_false_maps_to_disabled():
+    model = _model([_response([_text_block("ok")])])
+    model.complete(
+        ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")], thinking=False)
+    )
+    assert _call_kwargs(model)["thinking"] == {"type": "disabled"}
+
+
+def test_thinking_none_sends_nothing():
+    model = _model([_response([_text_block("ok")])])
+    model.complete(ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")]))
+    assert "thinking" not in _call_kwargs(model)
+
+
+def test_effort_lands_in_output_config():
+    model = _model([_response([_text_block("ok")])])
+    model.complete(
+        ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")], effort="high")
+    )
+    assert _call_kwargs(model)["output_config"] == {"effort": "high"}
+
+
+def test_effort_merges_with_structured_output_format():
+    model = _model([_response([_text_block('{"x": 1}')])])
+    schema = {
+        "type": "object",
+        "properties": {"x": {"type": "integer"}},
+        "required": ["x"],
+        "additionalProperties": False,
+    }
+    model.complete(
+        ModelRequest(
+            model="claude-sonnet-5",
+            messages=[Message.user("hi")],
+            output_schema=schema,
+            effort="max",
+        )
+    )
+    cfg = _call_kwargs(model)["output_config"]
+    assert cfg["effort"] == "max"
+    assert cfg["format"] == {"type": "json_schema", "schema": schema}
+
+
+def test_stream_gets_same_new_kwargs():
+    # Drive AnthropicModel.stream with the file's stream-stub helpers and
+    # prompt_cache=True + thinking=True + effort="high", then assert the
+    # captured stream kwargs carry the same "system" block list, tail
+    # cache_control marker, "thinking", and "output_config" shapes the
+    # complete() tests above pin.
+    events = [
+        _cb_start(0, _text_block("")),
+        _cb_delta(0, _text_delta("ok")),
+        _cb_stop(0),
+    ]
+    final = _response([_text_block("ok")])
+    model = _model_stream([_StubMessageStream(events, final)])
+    request = ModelRequest(
+        model="claude-sonnet-5",
+        messages=[Message.user("q1"), Message.assistant("a1"), Message.user("q2")],
+        system="be terse",
+        prompt_cache=True,
+        thinking=True,
+        effort="high",
+    )
+    list(model.stream(request))
+    call = model._client.messages.stream_calls[0]  # pyright: ignore[reportAttributeAccessIssue]
+    assert call["system"] == [
+        {"type": "text", "text": "be terse", "cache_control": {"type": "ephemeral"}}
+    ]
+    assert call["messages"][-1]["content"][-1]["cache_control"] == {"type": "ephemeral"}
+    assert call["thinking"] == {"type": "adaptive", "display": "summarized"}
+    assert call["output_config"] == {"effort": "high"}

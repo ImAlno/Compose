@@ -44,6 +44,19 @@ class ModelRequest:
     ``Model`` instance rather than a ``"provider/model-id"`` string (see
     ``composeai.agentfn._make_slot``), since there's no provider label to
     carry in that case.
+
+    ``prompt_cache`` asks the adapter to mark cacheable prefix spans
+    (Anthropic ``cache_control`` breakpoints; a no-op on providers that
+    cache automatically or not at all). It never changes response
+    *content*, only billing -- so it is deliberately excluded from
+    request hashing (cassettes / ``CachingModel``). It defaults to False
+    here so hand-built requests stay wire-identical to 0.5.x; the
+    ``@agent`` decorator defaults it to True. ``thinking`` and
+    ``effort`` are opt-in reasoning config: ``None`` sends nothing (the
+    model's own default applies); ``thinking=True`` requests adaptive
+    thinking with summarized display, ``False`` explicitly disables it.
+    ``effort`` is passed through verbatim (values are provider-defined,
+    e.g. Anthropic ``"low"``..``"max"``, OpenAI ``"minimal"``..``"high"``).
     """
 
     model: str
@@ -54,6 +67,9 @@ class ModelRequest:
     max_tokens: int = 16000
     temperature: float | None = None
     provider: str | None = None
+    prompt_cache: bool = False
+    thinking: bool | None = None
+    effort: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

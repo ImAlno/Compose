@@ -118,6 +118,32 @@ Reasoning models can burn thousands of hidden tokens *before* producing any visi
   1. *"Model returned only reasoning tokens with empty content for a structured-output request..."* — the reply's text was empty (or whitespace) **and** `usage.reasoning_tokens` was nonzero. This means the model spent its entire token budget thinking and produced nothing after — the fix is to raise `max_tokens`, or switch to `schema_mode="prompt"` if the server doesn't enforce constrained decoding for this model at all. This diagnostic never demotes `schema_mode="auto"` and raises the same way in every mode.
   2. A generic *"Server returned non-JSON content for a structured-output request..."* — there *is* text, but it doesn't parse as JSON. In `"native"` mode this is a hard `ProviderError` (not repairable — `retries=` territory only). In `"auto"` mode, this exact condition is what triggers the one-time, permanent demotion to prompt mode described above. In `"prompt"` mode, a parse failure never reaches this error at all — it falls through to the repairable-`ComposeError`/`max_repairs=` path instead.
 
+## Request config: prompt caching, thinking, effort
+
+Three `@agent` knobs (also fields on `ModelRequest` for hand-built
+requests) map per provider:
+
+| Knob | Anthropic | OpenAI (Responses) | openai_compatible |
+|---|---|---|---|
+| `prompt_cache=True` (default) | `cache_control` breakpoints: one on the system block (caches tools+system across runs), one on the conversation tail once multi-turn (caches the growing tool-loop conversation) | no-op — OpenAI caches automatically server-side; cached tokens already show up in `Usage.cache_read_tokens` | no-op |
+| `thinking=True` / `False` | `{"type": "adaptive", "display": "summarized"}` / `{"type": "disabled"}` | no-op (reasoning models have no toggle) | no-op |
+| `effort="..."` | `output_config.effort` (`"low"`…`"max"`) | `reasoning.effort` (`"minimal"`…`"high"`) | no-op |
+
+Notes:
+
+- Defaults send **nothing** for `thinking`/`effort` — each model's own
+  default applies, and composeai keeps no per-model capability table.
+  A shape the model rejects (e.g. `thinking=False` on a model with
+  always-on thinking) surfaces as a `ProviderError`.
+- Thinking spend is reported in `Usage.reasoning_tokens` (a subset of
+  `output_tokens`, split out for visibility).
+- Cache billing: reads ~0.1× input price, 5-minute-TTL writes ~1.25×
+  (already reflected in `compose costs` via the `ModelPrice` cache
+  fields documented above). Prompts below a model's minimum cacheable
+  length are silently not cached — no error, no write premium.
+- `prompt_cache` never enters request hashes, so cassettes and
+  `@agent(cache=True)` entries recorded on 0.5.x keep replaying.
+
 ## See also
 
 [agents](agents.md) covers `@agent(model=..., timeout=..., fallback=...)` and the rest of the resilience knobs; [budgets](budgets.md) covers `Budget(usd=...)` and why unpriced spend can't be capped by it; [observability](observability.md) covers `compose costs --by model` for seeing what a run actually spent.

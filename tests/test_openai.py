@@ -1544,3 +1544,29 @@ def test_injected_sync_client_used_by_async_engine():
     assert run.output == "Hello there."
     assert run.status == "completed"
     assert len(model._client.responses.calls) == 1
+
+
+# --- 0.6.0 effort / no-op fields -----------------------------------------
+
+
+def test_effort_maps_to_reasoning_param():
+    model = _model([_response([_message_item(_output_text_content("ok"))])])
+    model.complete(ModelRequest(model="gpt-5.2", messages=[Message.user("hi")], effort="low"))
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
+    assert call["reasoning"] == {"effort": "low"}
+
+
+def test_thinking_and_prompt_cache_are_noops_on_openai():
+    model = _model([_response([_message_item(_output_text_content("ok"))])])
+    model.complete(
+        ModelRequest(
+            model="gpt-5.2",
+            messages=[Message.user("hi")],
+            thinking=True,
+            prompt_cache=True,
+        )
+    )
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
+    assert "reasoning" not in call
+    assert "thinking" not in call
+    assert not any("cache" in k for k in call)

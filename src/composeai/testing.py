@@ -296,6 +296,19 @@ def compute_full_hash(request: ModelRequest) -> str:
         "max_tokens": request.max_tokens,
         "temperature": request.temperature,
     }
+    # 0.6.0 request-config fields enter the hash ONLY when set, so every
+    # request that doesn't use them keeps its exact 0.5.x hash and old
+    # cassettes/caches keep replaying (no _CASSETTE_VERSION bump needed).
+    # prompt_cache is deliberately NEVER hashed: it changes billing, not
+    # response content, so a cached/cassette response stays valid across
+    # prompt_cache settings. Note that thinking/effort inherit the same
+    # replay semantics as temperature: they change full_hash, but an old
+    # cassette can still serve such a request through ReplayModel's
+    # coarser message_hash (system+messages) fallback.
+    if request.thinking is not None:
+        payload["thinking"] = request.thinking
+    if request.effort is not None:
+        payload["effort"] = request.effort
     return _sha256_text(_canonical_json(payload))
 
 
