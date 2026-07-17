@@ -37,9 +37,19 @@ echo "running gates..."
 .venv/bin/ruff check src tests examples
 .venv/bin/pyright
 # mypy is a best-effort cross-checker smoke over the typing surface only and is
-# NEVER release-blocking (known divergences are documented in that file's
-# docstring); pyright above is the gated contract.
-.venv/bin/mypy tests/typing_surface.py || echo "mypy (best-effort, non-blocking): divergences above are documented in tests/typing_surface.py"
+# NEVER release-blocking; pyright above is the gated contract. The expected
+# divergences are documented in tests/typing_surface.py's docstring — keep
+# MYPY_EXPECTED in sync with that table. Quiet on the expected count; on any
+# drift the full output is printed (still non-blocking).
+MYPY_EXPECTED=25
+MYPY_OUT="$(.venv/bin/mypy tests/typing_surface.py 2>&1 || true)"
+MYPY_COUNT="$(printf '%s\n' "$MYPY_OUT" | grep -c ' error: ' || true)"
+if [[ "$MYPY_COUNT" -eq "$MYPY_EXPECTED" ]]; then
+    echo "mypy smoke: $MYPY_COUNT divergences (expected $MYPY_EXPECTED, documented in tests/typing_surface.py) — OK"
+else
+    echo "mypy smoke: $MYPY_COUNT divergences (expected $MYPY_EXPECTED) — DRIFT, full output below (non-blocking):"
+    printf '%s\n' "$MYPY_OUT"
+fi
 
 echo "building..."
 rm -rf dist
