@@ -462,3 +462,20 @@ def test_thinking_and_effort_change_hash_only_when_set():
     assert thinking_off != thinking
     assert effort != base
     assert effort != thinking
+
+
+def test_thinking_budget_changes_hash_only_when_set():
+    base = compute_full_hash(ModelRequest(**_req_kwargs()))
+    with_budget = compute_full_hash(ModelRequest(**_req_kwargs(), thinking_budget=2048))
+    other_budget = compute_full_hash(ModelRequest(**_req_kwargs(), thinking_budget=4096))
+    # default (None) hashes identically to a request that never mentions the field
+    assert compute_full_hash(ModelRequest(**_req_kwargs())) == base
+    # a set budget changes the hash, and distinct budgets differ
+    assert with_budget != base
+    assert with_budget != other_budget
+
+
+def test_thinking_budget_default_does_not_shift_golden_hash():
+    # A request with NO thinking_budget must hash the same as it did in 0.5.0/0.7.0:
+    # adding the field with value None must never enter the payload.
+    assert compute_full_hash(ModelRequest(**_req_kwargs())) == _GOLDEN_050_HASH

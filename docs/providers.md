@@ -120,7 +120,7 @@ Reasoning models can burn thousands of hidden tokens *before* producing any visi
 
 ## Request config: prompt caching, thinking, effort
 
-Three `@agent` knobs (also fields on `ModelRequest` for hand-built
+Four `@agent` knobs (also fields on `ModelRequest` for hand-built
 requests) map per provider:
 
 | Knob | Anthropic | OpenAI (Responses) | openai_compatible |
@@ -128,13 +128,21 @@ requests) map per provider:
 | `prompt_cache=True` (default) | `cache_control` breakpoints: one on the system block (caches tools+system across runs), one on the conversation tail once multi-turn (caches the growing tool-loop conversation) | no-op — OpenAI caches automatically server-side; cached tokens already show up in `Usage.cache_read_tokens` | no-op |
 | `thinking=True` / `False` | `{"type": "adaptive", "display": "summarized"}` / `{"type": "disabled"}` | no-op (reasoning models have no toggle) | no-op |
 | `effort="..."` | `output_config.effort` (`"low"`…`"max"`) | `reasoning.effort` (`"minimal"`…`"high"`) | no-op |
+| `thinking_budget=N` | `{"type": "enabled", "budget_tokens": N, "display": "summarized"}` — a distinct shape from plain `thinking=True`'s `"adaptive"` type, since `budget_tokens` is only valid on `"enabled"`. `temperature` is dropped from the request when this fires (enabled thinking with a budget requires `temperature` unset). | no-op | no-op |
 
 Notes:
 
-- Defaults send **nothing** for `thinking`/`effort` — each model's own
-  default applies, and composeai keeps no per-model capability table.
-  A shape the model rejects (e.g. `thinking=False` on a model with
-  always-on thinking) surfaces as a `ProviderError`.
+- Defaults send **nothing** for `thinking`/`effort`/`thinking_budget` —
+  each model's own default applies, and composeai keeps no per-model
+  capability table. A shape the model rejects (e.g. `thinking=False`
+  on a model with always-on thinking) surfaces as a `ProviderError`.
+- `thinking_budget` requests a specific extended-thinking token budget
+  on Anthropic: the API requires `1024 ≤ budget_tokens < max_tokens`,
+  so `thinking_budget=` values outside that range surface as a
+  `ProviderError`. Explicit `thinking=False` still wins over a
+  `thinking_budget` set alongside it (thinking is disabled outright,
+  and the budget is dropped). `thinking_budget` is a no-op on OpenAI
+  and `openai_compatible`.
 - Thinking spend is reported in `Usage.reasoning_tokens` (a subset of
   `output_tokens`, split out for visibility).
 - Cache billing: reads ~0.1× input price, 5-minute-TTL writes ~1.25×

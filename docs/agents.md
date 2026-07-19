@@ -100,6 +100,7 @@ All of these are keyword-only arguments to `@compose.agent(...)`:
 | `prompt_cache` | `True` | Mark cacheable prefix spans on providers with explicit cache control (Anthropic: system-prompt breakpoint + conversation-tail breakpoint once multi-turn). Cached reads bill ~0.1×, writes ~1.25× — a large net win for tool loops and fan-outs. `False` sends byte-identical requests to 0.5.x. No-op on OpenAI (automatic server-side). Never affects request hashes (cassettes/`cache=` keys are unchanged). |
 | `thinking` | `None` | `None` sends nothing (each model's own default applies). `True` requests adaptive thinking with summarized display (so `thinking_delta` events carry text); `False` explicitly disables thinking. Anthropic only; no-op on OpenAI. |
 | `effort` | `None` | Provider-defined reasoning-effort string passed through verbatim (Anthropic: `"low"`/`"medium"`/`"high"`/`"xhigh"`/`"max"` → `output_config.effort`; OpenAI: `"minimal"`/`"low"`/`"medium"`/`"high"` → `reasoning.effort`). Invalid values surface as `ProviderError`. |
+| `thinking_budget` | `None` | Request a specific extended-thinking token budget on Anthropic (`int`, `1024 ≤ budget_tokens < max_tokens`); `None` lets the provider decide. Ignored on OpenAI and other providers. |
 | `max_tokens` | `16000` | Passed to the model on every call; hitting it before the response finishes raises `ComposeError`. |
 | `temperature` | `None` | Passthrough-only — composeai never sets one for you. Modern Claude models reject sampling parameters outright, so leave it unset for Claude. |
 

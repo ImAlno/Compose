@@ -1570,3 +1570,28 @@ def test_thinking_and_prompt_cache_are_noops_on_openai():
     assert "reasoning" not in call
     assert "thinking" not in call
     assert not any("cache" in k for k in call)
+
+
+def test_thinking_budget_is_a_noop_on_openai():
+    """0.8.0 regression guard: ``@agent(thinking_budget=...)`` must not leak
+    into the OpenAI wire payload -- the adapter has no thinking support (see
+    ``test_thinking_and_prompt_cache_are_noops_on_openai`` above for the
+    plain ``thinking=True`` no-op this mirrors). Routed through the real
+    ``@agent`` decorator (rather than a direct ``model.complete()`` call) so
+    this also locks in the 0.8.0 ``thinking_budget`` agent-level plumbing
+    from Tasks 1-3 landing here as a no-op end to end.
+    """
+    from composeai import prompt
+    from composeai.agentfn import agent
+
+    model = _model([_response([_message_item(_output_text_content("hi"))])])
+
+    @agent(model=model, name="oai_tb", thinking_budget=2048)
+    def a(q: str) -> str:
+        """x."""
+        return prompt(q)
+
+    a("hi")
+    call = model._client.responses.calls[0]  # pyright: ignore[reportAttributeAccessIssue]
+    assert "thinking" not in call
+    assert not any("budget" in str(k).lower() for k in call)

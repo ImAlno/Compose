@@ -57,6 +57,9 @@ class ModelRequest:
     thinking with summarized display, ``False`` explicitly disables it.
     ``effort`` is passed through verbatim (values are provider-defined,
     e.g. Anthropic ``"low"``..``"max"``, OpenAI ``"minimal"``..``"high"``).
+    ``thinking_budget`` requests a specific extended-thinking token budget
+    (Anthropic); ``None`` leaves the budget to the provider. Ignored by
+    adapters without a budget knob.
     """
 
     model: str
@@ -70,6 +73,7 @@ class ModelRequest:
     prompt_cache: bool = False
     thinking: bool | None = None
     effort: str | None = None
+    thinking_budget: int | None = None
 
 
 @dataclass(frozen=True, slots=True)

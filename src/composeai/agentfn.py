@@ -119,6 +119,7 @@ class AgentFunction(Generic[P, R]):
         prompt_cache: bool,
         thinking: bool | None,
         effort: str | None,
+        thinking_budget: int | None,
         fallback: str | Model | None,
         cache: bool,
         name: str | None,
@@ -164,6 +165,7 @@ class AgentFunction(Generic[P, R]):
         self._prompt_cache = prompt_cache
         self._thinking = thinking
         self._effort = effort
+        self._thinking_budget = thinking_budget
         self._fallback = fallback
         self._cache = cache
         self._output_schema, self._wrap_result = _build_output_schema(self.output_type)
@@ -315,6 +317,7 @@ def agent(
     prompt_cache: bool = True,
     thinking: bool | None = None,
     effort: str | None = None,
+    thinking_budget: int | None = None,
     fallback: str | Model | None = None,
     cache: bool = False,
     name: str | None = None,
@@ -334,6 +337,7 @@ def agent(
     prompt_cache: bool = True,
     thinking: bool | None = None,
     effort: str | None = None,
+    thinking_budget: int | None = None,
     fallback: str | Model | None = None,
     cache: bool = False,
     name: str | None = None,
@@ -441,6 +445,7 @@ def agent(
             prompt_cache=prompt_cache,
             thinking=thinking,
             effort=effort,
+            thinking_budget=thinking_budget,
             fallback=fallback,
             cache=cache,
             name=name,
@@ -764,6 +769,7 @@ async def _acall_llm(
     prompt_cache: bool,
     thinking: bool | None,
     effort: str | None,
+    thinking_budget: int | None,
     retries: int,
     streaming: bool = False,
 ) -> ModelResponse:
@@ -790,6 +796,7 @@ async def _acall_llm(
         prompt_cache=prompt_cache,
         thinking=thinking,
         effort=effort,
+        thinking_budget=thinking_budget,
     )
     attributes: dict[str, Any] = {"model": slot.bare_id}
     if slot.provider is not None:
@@ -871,6 +878,7 @@ async def _aperform_turn(
             agent_fn._prompt_cache,
             agent_fn._thinking,
             agent_fn._effort,
+            agent_fn._thinking_budget,
             agent_fn._retries,
             streaming,
         )
@@ -893,6 +901,7 @@ async def _aperform_turn(
             agent_fn._prompt_cache,
             agent_fn._thinking,
             agent_fn._effort,
+            agent_fn._thinking_budget,
             agent_fn._retries,
             streaming,
         )

@@ -309,6 +309,8 @@ def compute_full_hash(request: ModelRequest) -> str:
         payload["thinking"] = request.thinking
     if request.effort is not None:
         payload["effort"] = request.effort
+    if request.thinking_budget is not None:
+        payload["thinking_budget"] = request.thinking_budget
     return _sha256_text(_canonical_json(payload))
 
 

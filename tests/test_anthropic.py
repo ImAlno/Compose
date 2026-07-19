@@ -1526,6 +1526,99 @@ def test_thinking_none_sends_nothing():
     assert "thinking" not in _call_kwargs(model)
 
 
+def test_thinking_budget_lands_in_thinking_payload():
+    # anthropic 0.116: budget_tokens is only valid on the "enabled" thinking
+    # type (the adaptive param has no budget field), so a set budget maps to
+    # {"type": "enabled", "budget_tokens": N, "display": "summarized"}.
+    model = _model([_response([_text_block("ok")])])
+    model.complete(
+        ModelRequest(
+            model="claude-sonnet-5", messages=[Message.user("hi")], thinking_budget=2048
+        )
+    )
+    thinking = _call_kwargs(model)["thinking"]
+    assert thinking == {
+        "type": "enabled",
+        "budget_tokens": 2048,
+        "display": "summarized",
+    }
+    assert thinking.get("budget_tokens") == 2048
+    assert thinking["type"] in ("adaptive", "enabled")
+
+
+def test_thinking_budget_implies_thinking_on_when_thinking_none():
+    # thinking is None but a budget is set -> a budget implies thinking on.
+    model = _model([_response([_text_block("ok")])])
+    model.complete(
+        ModelRequest(
+            model="claude-sonnet-5", messages=[Message.user("hi")], thinking_budget=2048
+        )
+    )
+    assert _call_kwargs(model)["thinking"]["budget_tokens"] == 2048
+
+
+def test_thinking_budget_none_sends_no_budget():
+    # thinking on, no explicit budget -> unchanged adaptive behavior.
+    model = _model([_response([_text_block("ok")])])
+    model.complete(
+        ModelRequest(model="claude-sonnet-5", messages=[Message.user("hi")], thinking=True)
+    )
+    thinking = _call_kwargs(model)["thinking"]
+    assert "budget_tokens" not in thinking
+    assert thinking == {"type": "adaptive", "display": "summarized"}
+
+
+def test_thinking_false_wins_over_budget():
+    # explicit thinking=False disables even if a budget was set.
+    model = _model([_response([_text_block("ok")])])
+    model.complete(
+        ModelRequest(
+            model="claude-sonnet-5",
+            messages=[Message.user("hi")],
+            thinking=False,
+            thinking_budget=2048,
+        )
+    )
+    assert _call_kwargs(model)["thinking"] == {"type": "disabled"}
+
+
+def test_thinking_budget_drops_temperature():
+    # enabled+budget requires temperature unset; a set temperature must be
+    # dropped when a budget is emitted.
+    model = _model([_response([_text_block("ok")])])
+    model.complete(
+        ModelRequest(
+            model="claude-sonnet-5",
+            messages=[Message.user("hi")],
+            temperature=0.7,
+            thinking_budget=2048,
+        )
+    )
+    call = _call_kwargs(model)
+    assert "temperature" not in call
+    assert call["thinking"]["budget_tokens"] == 2048
+
+
+def test_thinking_budget_reaches_streaming_path():
+    # Mirror test_stream_gets_same_new_kwargs: drive stream() with the file's
+    # stream-stub helpers and assert the captured stream kwargs carry the
+    # budget-bearing thinking payload.
+    events = [
+        _cb_start(0, _text_block("")),
+        _cb_delta(0, _text_delta("ok")),
+        _cb_stop(0),
+    ]
+    final = _response([_text_block("ok")])
+    model = _model_stream([_StubMessageStream(events, final)])
+    request = ModelRequest(
+        model="claude-sonnet-5", messages=[Message.user("hi")], thinking_budget=2048
+    )
+    list(model.stream(request))
+    call = model._client.messages.stream_calls[0]  # pyright: ignore[reportAttributeAccessIssue]
+    assert call["thinking"].get("budget_tokens") == 2048
+    assert call["thinking"]["type"] == "enabled"
+
+
 def test_effort_lands_in_output_config():
     model = _model([_response([_text_block("ok")])])
     model.complete(

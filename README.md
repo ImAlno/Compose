@@ -117,6 +117,7 @@ The contracts composeai holds you to — and the ones it holds itself to:
 
 - OpenTelemetry exporter (the span model already tracks `gen_ai.*` attribute conventions)
 - OpenAI request-side reasoning niceties (`reasoning.summary`, `encrypted_content` round-trip) -- 0.6.0 shipped `effort` passthrough; these remain unshipped
+- Anthropic extended-thinking token budgets -- 0.8.0 shipped `thinking_budget` passthrough (`1024 ≤ budget_tokens < max_tokens`); no-op on OpenAI and other providers
 - TypeScript sibling package
 - Consolidate the MCP bridge onto the runtime loop (each MCP server currently owns its own dedicated event-loop thread rather than sharing composeai's)
 - Span-persistence queue tuning under streaming storms (the store's single writer thread is a FIFO queue; a very high-rate `.stream()`/`.astream()` workload hasn't been load-tested against it)

@@ -169,15 +169,24 @@ class AnthropicModel:
             }
         if request.effort is not None:
             kwargs.setdefault("output_config", {})["effort"] = request.effort
-        if request.thinking is not None:
+        if request.thinking is not None or request.thinking_budget is not None:
             # display=summarized so thinking blocks/deltas carry text -- the
-            # API default ("omitted") streams empty thinking strings, which
-            # would make composeai's thinking_delta events vacuous.
-            kwargs["thinking"] = (
-                {"type": "adaptive", "display": "summarized"}
-                if request.thinking
-                else {"type": "disabled"}
-            )
+            # API default ("omitted") streams empty thinking strings.
+            if request.thinking is False:
+                # explicit thinking=False wins even if a budget was set
+                kwargs["thinking"] = {"type": "disabled"}
+            elif request.thinking_budget is not None:
+                # anthropic 0.116: budget_tokens is only valid on the
+                # "enabled" thinking type (adaptive has no budget field).
+                # enabled+budget requires temperature unset, so drop it.
+                kwargs["thinking"] = {
+                    "type": "enabled",
+                    "budget_tokens": request.thinking_budget,
+                    "display": "summarized",
+                }
+                kwargs.pop("temperature", None)
+            else:
+                kwargs["thinking"] = {"type": "adaptive", "display": "summarized"}
         return kwargs
 
     def complete(self, request: ModelRequest) -> ModelResponse:

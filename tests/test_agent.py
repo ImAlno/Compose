@@ -947,3 +947,27 @@ def test_max_turns_none_is_unbounded():
 
     result = runner()
     assert result == "done after twelve tool turns"
+
+
+def test_agent_thinking_budget_defaults_to_none_in_request():
+    capture = _CaptureModel()
+
+    @agent(model=capture, name="tb_default")
+    def a(q: str) -> str:
+        """x."""
+        return prompt(q)
+
+    a("hi")
+    assert capture.requests[0].thinking_budget is None
+
+
+def test_agent_thinking_budget_flows_into_request():
+    capture = _CaptureModel()
+
+    @agent(model=capture, name="tb_set", thinking_budget=2048)
+    def a(q: str) -> str:
+        """x."""
+        return prompt(q)
+
+    a("hi")
+    assert capture.requests[0].thinking_budget == 2048
