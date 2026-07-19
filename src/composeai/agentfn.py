@@ -192,17 +192,89 @@ class AgentFunction(Generic[P, R]):
 
         return _rshift_pipe(other, self)
 
-    def run(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run[R]:
-        return _run_agent(self, args, kwargs, budget=budget)
+    def run(
+        self,
+        *args: Any,
+        budget: Budget | None = None,
+        system: str | None = None,
+        model: str | Model | None = None,
+        approver: Callable[[Interrupt], bool] | None = None,
+        context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+        **kwargs: Any,
+    ) -> Run[R]:
+        return _run_agent(
+            self,
+            args,
+            kwargs,
+            budget=budget,
+            system_override=system,
+            model_override=model,
+            approver=approver,
+            context_manager=context_manager,
+        )
 
-    async def arun(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> Run[R]:
-        return await _arun_agent_on_callers_loop(self, args, kwargs, budget=budget)
+    async def arun(
+        self,
+        *args: Any,
+        budget: Budget | None = None,
+        system: str | None = None,
+        model: str | Model | None = None,
+        approver: Callable[[Interrupt], bool] | None = None,
+        context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+        **kwargs: Any,
+    ) -> Run[R]:
+        return await _arun_agent_on_callers_loop(
+            self,
+            args,
+            kwargs,
+            budget=budget,
+            system_override=system,
+            model_override=model,
+            approver=approver,
+            context_manager=context_manager,
+        )
 
-    def stream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> RunStream[R]:
-        return _stream_agent(self, args, kwargs, budget=budget)
+    def stream(
+        self,
+        *args: Any,
+        budget: Budget | None = None,
+        system: str | None = None,
+        model: str | Model | None = None,
+        approver: Callable[[Interrupt], bool] | None = None,
+        context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+        **kwargs: Any,
+    ) -> RunStream[R]:
+        return _stream_agent(
+            self,
+            args,
+            kwargs,
+            budget=budget,
+            system_override=system,
+            model_override=model,
+            approver=approver,
+            context_manager=context_manager,
+        )
 
-    def astream(self, *args: Any, budget: Budget | None = None, **kwargs: Any) -> AsyncRunStream[R]:
-        return _astream_agent(self, args, kwargs, budget=budget)
+    def astream(
+        self,
+        *args: Any,
+        budget: Budget | None = None,
+        system: str | None = None,
+        model: str | Model | None = None,
+        approver: Callable[[Interrupt], bool] | None = None,
+        context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+        **kwargs: Any,
+    ) -> AsyncRunStream[R]:
+        return _astream_agent(
+            self,
+            args,
+            kwargs,
+            budget=budget,
+            system_override=system,
+            model_override=model,
+            approver=approver,
+            context_manager=context_manager,
+        )
 
 
 def prompt(text_or_messages: str | Sequence[Message]) -> Any:
@@ -940,6 +1012,8 @@ async def _aprocess_tool_use(
     run_id: str | None,
     scope_key: str,
     seed_results: dict[str, ToolResultPart] | None = None,
+    *,
+    approver: Callable[[Interrupt], bool] | None = None,
 ) -> Message:
     """Execute one tool-call batch, pausing if an approval-gated call is
     unanswered or any tool body raises ``_Pause`` (``ask_human``).
@@ -1028,6 +1102,21 @@ async def _aprocess_tool_use(
             continue
         interrupt_id = _approval_interrupt_id(call)
         hit, value = runs.interrupt_lookup(f"__interrupt__:{interrupt_id}")
+        if not hit and approver is not None:
+            interrupt = Interrupt(
+                id=interrupt_id,
+                kind="approval",
+                payload={"tool": call.name, "arguments": call.arguments},
+            )
+            decision = bool(await asyncio.to_thread(approver, interrupt))
+            if run_id is not None:
+                await worker_for(runs.open_default()).call(
+                    "journal_put",
+                    run_id=run_id,
+                    step_key=f"__interrupt__:{interrupt_id}",
+                    value_json=json.dumps(to_jsonable(decision)),
+                )
+            hit, value = True, decision
         if not hit:
             candidate = _pause_for_unanswered_approval(call)
             pending_interrupts.append(candidate.interrupt)
@@ -1144,13 +1233,31 @@ async def _asnapshot_agent_state(
 # --- standalone agent call args (Phase 8: resumable before any snapshot exists) --
 
 
-def _encode_agent_call(args: tuple[Any, ...], kwargs: dict[str, Any]) -> str:
-    return json.dumps(to_jsonable({"args": list(args), "kwargs": kwargs}))
+def _encode_agent_call(
+    args: tuple[Any, ...],
+    kwargs: dict[str, Any],
+    *,
+    system: str | None = None,
+    model: str | Model | None = None,
+) -> str:
+    payload: dict[str, Any] = {"args": list(args), "kwargs": kwargs}
+    if system is not None:
+        payload["system"] = system
+    if isinstance(model, str):
+        payload["model"] = model
+    return json.dumps(to_jsonable(payload))
 
 
-def _decode_agent_call(args_json: str) -> tuple[tuple[Any, ...], dict[str, Any]]:
+def _decode_agent_call(
+    args_json: str,
+) -> tuple[tuple[Any, ...], dict[str, Any], str | None, str | None]:
     payload = from_jsonable(json.loads(args_json))
-    return tuple(payload["args"]), payload["kwargs"]
+    return (
+        tuple(payload["args"]),
+        payload["kwargs"],
+        payload.get("system"),
+        payload.get("model"),
+    )
 
 
 # --- the loop ------------------------------------------------------------
@@ -1163,6 +1270,11 @@ def _run_agent(
     *,
     streaming: bool = False,
     budget: Budget | None = None,
+    system_override: str | None = None,
+    model_override: str | Model | None = None,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+    seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
     # --- Phase 7 (durable flows): minimal, well-marked touch -----------------
     # Inside an active @flow body, the whole agent run auto-journals as one
@@ -1177,20 +1289,52 @@ def _run_agent(
     ctx = runs.current_run_context()
     if ctx is not None:
         return _run_agent_journaled(
-            agent_fn, call_args, call_kwargs, ctx, streaming=streaming, budget=budget
+            agent_fn,
+            call_args,
+            call_kwargs,
+            ctx,
+            streaming=streaming,
+            budget=budget,
+            system_override=system_override,
+            model_override=model_override,
+            approver=approver,
+            context_manager=context_manager,
+            seed_conversation=seed_conversation,
         )
     if tracing.current_span() is None:
-        args_json = _encode_agent_call(call_args, call_kwargs)
+        args_json = _encode_agent_call(
+            call_args, call_kwargs, system=system_override, model=model_override
+        )
         return runs.run_standalone_agent(
             agent_fn.name,
             args_json,
             lambda: _run_agent_uncached(
-                agent_fn, call_args, call_kwargs, streaming=streaming, budget=budget, scope_key=""
+                agent_fn,
+                call_args,
+                call_kwargs,
+                streaming=streaming,
+                budget=budget,
+                scope_key="",
+                system_override=system_override,
+                model_override=model_override,
+                approver=approver,
+                context_manager=context_manager,
+                seed_conversation=seed_conversation,
             ),
             budget=budget,
         )
     return _run_agent_uncached(
-        agent_fn, call_args, call_kwargs, streaming=streaming, budget=budget, scope_key=""
+        agent_fn,
+        call_args,
+        call_kwargs,
+        streaming=streaming,
+        budget=budget,
+        scope_key="",
+        system_override=system_override,
+        model_override=model_override,
+        approver=approver,
+        context_manager=context_manager,
+        seed_conversation=seed_conversation,
     )
 
 
@@ -1201,6 +1345,11 @@ async def _arun_agent(
     *,
     streaming: bool = False,
     budget: Budget | None = None,
+    system_override: str | None = None,
+    model_override: str | Model | None = None,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+    seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
     """Async twin of :func:`_run_agent` (v0.4.0 Plan A, Task 8).
 
@@ -1227,20 +1376,52 @@ async def _arun_agent(
     ctx = runs.current_run_context()
     if ctx is not None:
         return await _arun_agent_journaled(
-            agent_fn, call_args, call_kwargs, ctx, streaming=streaming, budget=budget
+            agent_fn,
+            call_args,
+            call_kwargs,
+            ctx,
+            streaming=streaming,
+            budget=budget,
+            system_override=system_override,
+            model_override=model_override,
+            approver=approver,
+            context_manager=context_manager,
+            seed_conversation=seed_conversation,
         )
     if tracing.current_span() is None:
-        args_json = _encode_agent_call(call_args, call_kwargs)
+        args_json = _encode_agent_call(
+            call_args, call_kwargs, system=system_override, model=model_override
+        )
         return runs.run_standalone_agent(
             agent_fn.name,
             args_json,
             lambda: _run_agent_uncached(
-                agent_fn, call_args, call_kwargs, streaming=streaming, budget=budget, scope_key=""
+                agent_fn,
+                call_args,
+                call_kwargs,
+                streaming=streaming,
+                budget=budget,
+                scope_key="",
+                system_override=system_override,
+                model_override=model_override,
+                approver=approver,
+                context_manager=context_manager,
+                seed_conversation=seed_conversation,
             ),
             budget=budget,
         )
     return await _arun_agent_uncached(
-        agent_fn, call_args, call_kwargs, streaming=streaming, budget=budget, scope_key=""
+        agent_fn,
+        call_args,
+        call_kwargs,
+        streaming=streaming,
+        budget=budget,
+        scope_key="",
+        system_override=system_override,
+        model_override=model_override,
+        approver=approver,
+        context_manager=context_manager,
+        seed_conversation=seed_conversation,
     )
 
 
@@ -1251,6 +1432,11 @@ async def _arun_agent_on_callers_loop(
     *,
     streaming: bool = False,
     budget: Budget | None = None,
+    system_override: str | None = None,
+    model_override: str | Model | None = None,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+    seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
     """The async engine behind ``AgentFunction.arun``/``.astream`` (v0.4.0 Plan B, Task 4).
 
@@ -1274,20 +1460,52 @@ async def _arun_agent_on_callers_loop(
     ctx = runs.current_run_context()
     if ctx is not None:
         return await _arun_agent_journaled(
-            agent_fn, call_args, call_kwargs, ctx, streaming=streaming, budget=budget
+            agent_fn,
+            call_args,
+            call_kwargs,
+            ctx,
+            streaming=streaming,
+            budget=budget,
+            system_override=system_override,
+            model_override=model_override,
+            approver=approver,
+            context_manager=context_manager,
+            seed_conversation=seed_conversation,
         )
     if tracing.current_span() is None:
-        args_json = _encode_agent_call(call_args, call_kwargs)
+        args_json = _encode_agent_call(
+            call_args, call_kwargs, system=system_override, model=model_override
+        )
         return await runs.arun_standalone_agent(
             agent_fn.name,
             args_json,
             lambda: _arun_agent_uncached(
-                agent_fn, call_args, call_kwargs, streaming=streaming, budget=budget, scope_key=""
+                agent_fn,
+                call_args,
+                call_kwargs,
+                streaming=streaming,
+                budget=budget,
+                scope_key="",
+                system_override=system_override,
+                model_override=model_override,
+                approver=approver,
+                context_manager=context_manager,
+                seed_conversation=seed_conversation,
             ),
             budget=budget,
         )
     return await _arun_agent_uncached(
-        agent_fn, call_args, call_kwargs, streaming=streaming, budget=budget, scope_key=""
+        agent_fn,
+        call_args,
+        call_kwargs,
+        streaming=streaming,
+        budget=budget,
+        scope_key="",
+        system_override=system_override,
+        model_override=model_override,
+        approver=approver,
+        context_manager=context_manager,
+        seed_conversation=seed_conversation,
     )
 
 
@@ -1299,6 +1517,11 @@ def _run_agent_journaled(
     *,
     streaming: bool,
     budget: Budget | None,
+    system_override: str | None = None,
+    model_override: str | Model | None = None,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+    seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
     """Treat one whole agent run as a single journaled flow step.
 
@@ -1345,6 +1568,11 @@ def _run_agent_journaled(
         budget_baseline=budget_baseline,
         scope_key=key,
         step_key=key,
+        system_override=system_override,
+        model_override=model_override,
+        approver=approver,
+        context_manager=context_manager,
+        seed_conversation=seed_conversation,
     )
     recorded = ctx.journal_record(key, run.output)
     run.output = recorded
@@ -1359,6 +1587,11 @@ async def _arun_agent_journaled(
     *,
     streaming: bool,
     budget: Budget | None,
+    system_override: str | None = None,
+    model_override: str | Model | None = None,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+    seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
     """Async twin of :func:`_run_agent_journaled` (v0.4.0 Plan A, Task 8) --
     see its docstring for the replay/miss contract, byte-identical here.
@@ -1423,6 +1656,11 @@ async def _arun_agent_journaled(
         budget_baseline=budget_baseline,
         scope_key=key,
         step_key=key,
+        system_override=system_override,
+        model_override=model_override,
+        approver=approver,
+        context_manager=context_manager,
+        seed_conversation=seed_conversation,
     )
     recorded = await ctx.ajournal_record(key, run.output)
     run.output = recorded
@@ -1434,6 +1672,9 @@ def resume_standalone_agent(
     row: dict[str, Any],
     answers: dict[str, Any] | None = None,
     budget: Budget | None = None,
+    *,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Resume a paused (or crashed) standalone ``@agent`` run.
 
@@ -1505,8 +1746,8 @@ def resume_standalone_agent(
             run_id, budget_json=runs.encode_budget(budget), updated_at=time.time()
         )
     runs.apply_resume_answers(store, run_id, answers)
-    call_args, call_kwargs = (
-        _decode_agent_call(row["args_json"]) if row["args_json"] else ((), {})
+    call_args, call_kwargs, saved_system, saved_model = (
+        _decode_agent_call(row["args_json"]) if row["args_json"] else ((), {}, None, None)
     )
     if budget is None:
         budget = runs.decode_budget(row.get("budget_json"))
@@ -1523,6 +1764,10 @@ def resume_standalone_agent(
                 budget=budget,
                 budget_baseline=budget_baseline,
                 scope_key="",
+                system_override=saved_system,
+                model_override=saved_model,
+                approver=approver,
+                context_manager=context_manager,
             ),
         )
 
@@ -1532,6 +1777,9 @@ async def aresume_standalone_agent(
     row: dict[str, Any],
     answers: dict[str, Any] | None = None,
     budget: Budget | None = None,
+    *,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Async twin of :func:`resume_standalone_agent` (v0.4.0 Plan B, Task 7)
     -- called by ``composeai.flow.aresume()`` when the run row's ``kind`` is
@@ -1581,8 +1829,8 @@ async def aresume_standalone_agent(
             "update_run", run_id, budget_json=runs.encode_budget(budget), updated_at=time.time()
         )
     await runs.aapply_resume_answers(store, run_id, answers)
-    call_args, call_kwargs = (
-        _decode_agent_call(row["args_json"]) if row["args_json"] else ((), {})
+    call_args, call_kwargs, saved_system, saved_model = (
+        _decode_agent_call(row["args_json"]) if row["args_json"] else ((), {}, None, None)
     )
     if budget is None:
         budget = runs.decode_budget(row.get("budget_json"))
@@ -1601,6 +1849,10 @@ async def aresume_standalone_agent(
                 budget=budget,
                 budget_baseline=budget_baseline,
                 scope_key="",
+                system_override=saved_system,
+                model_override=saved_model,
+                approver=approver,
+                context_manager=context_manager,
             ),
         )
 
@@ -1615,6 +1867,11 @@ def _run_agent_uncached(
     budget_baseline: Usage | None = None,
     scope_key: str = "",
     step_key: str | None = None,
+    system_override: str | None = None,
+    model_override: str | Model | None = None,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+    seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
     """Sync facade over the async engine (:func:`_arun_agent_uncached`) --
     see its docstring for the full loop contract.
@@ -1642,6 +1899,11 @@ def _run_agent_uncached(
             budget_baseline=budget_baseline,
             scope_key=scope_key,
             step_key=step_key,
+            system_override=system_override,
+            model_override=model_override,
+            approver=approver,
+            context_manager=context_manager,
+            seed_conversation=seed_conversation,
         )
     )
 
@@ -1656,6 +1918,11 @@ async def _arun_agent_uncached(
     budget_baseline: Usage | None = None,
     scope_key: str = "",
     step_key: str | None = None,
+    system_override: str | None = None,
+    model_override: str | Model | None = None,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+    seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
     """The actual agent loop -- shared by standalone runs, resumed standalone
     runs, and agents nested in a flow (see the three callers of the sync
@@ -1688,6 +1955,7 @@ async def _arun_agent_uncached(
     attribute its replay path already carries -- parity between the two, for
     anything (e.g. ``compose trace``) that reads it off the span.
     """
+    effective_system = system_override if system_override is not None else agent_fn._system
     run_id = runs.current_run_id()
     restored = await _aload_agent_state(run_id, scope_key)
 
@@ -1697,7 +1965,12 @@ async def _arun_agent_uncached(
         with tracing.span(
             "agent", agent_fn.name, attributes=span_attributes
         ) as agent_span, budget_scope(budget, agent_span, baseline=budget_baseline):
-            state = _RunState(_make_slot(agent_fn._model, cache=agent_fn._cache))
+            state = _RunState(
+                _make_slot(
+                    model_override if model_override is not None else agent_fn._model,
+                    cache=agent_fn._cache,
+                )
+            )
             tool_specs = [t.spec for t in agent_fn._tools] or None
             # `start_time` is *this call's* clock, not the run's -- there is
             # no persisted/restored elapsed-time field anywhere (not in
@@ -1730,14 +2003,19 @@ async def _arun_agent_uncached(
                         run_id,
                         scope_key,
                         seed_results=restored.partial_results,
+                        approver=approver,
                     )
                     conversation.append(tool_message)
                     await _asnapshot_agent_state(run_id, scope_key, conversation, turn, {})
+            elif seed_conversation is not None:
+                conversation = list(seed_conversation)
+                turn = 0
             else:
                 conversation = await _abuild_conversation(agent_fn, call_args, call_kwargs)
                 turn = 0
 
             repairs_used = 0
+            last_input_tokens = 0
 
             while True:
                 turn += 1
@@ -1755,16 +2033,27 @@ async def _arun_agent_uncached(
                         "never interrupted)"
                     )
 
+                if context_manager is not None:
+                    managed = await asyncio.to_thread(
+                        context_manager, list(conversation), last_input_tokens
+                    )
+                    if not isinstance(managed, list) or not all(
+                        isinstance(m, Message) for m in managed
+                    ):
+                        raise ConfigError("context_manager must return list[Message]")
+                    conversation[:] = managed
+
                 response = await _aperform_turn(
                     agent_fn,
                     agent_span,
                     state,
-                    agent_fn._system,
+                    effective_system,
                     conversation,
                     tool_specs,
                     agent_fn._output_schema,
                     streaming,
                 )
+                last_input_tokens = response.usage.input_tokens
                 conversation.append(response.message)
 
                 if response.stop_reason == StopReason.TOOL_USE:
@@ -1779,7 +2068,7 @@ async def _arun_agent_uncached(
                             "to append an empty tool-results message"
                         )
                     tool_message = await _aprocess_tool_use(
-                        agent_fn, calls, conversation, turn, run_id, scope_key
+                        agent_fn, calls, conversation, turn, run_id, scope_key, approver=approver
                     )
                     conversation.append(tool_message)
                     await _asnapshot_agent_state(run_id, scope_key, conversation, turn, {})
@@ -1919,9 +2208,25 @@ def _stream_agent(
     call_kwargs: dict[str, Any],
     *,
     budget: Budget | None = None,
+    system_override: str | None = None,
+    model_override: str | Model | None = None,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+    seed_conversation: list[Message] | None = None,
 ) -> RunStream:
     return _stream_run(
-        lambda: _run_agent(agent_fn, call_args, call_kwargs, streaming=True, budget=budget)
+        lambda: _run_agent(
+            agent_fn,
+            call_args,
+            call_kwargs,
+            streaming=True,
+            budget=budget,
+            system_override=system_override,
+            model_override=model_override,
+            approver=approver,
+            context_manager=context_manager,
+            seed_conversation=seed_conversation,
+        )
     )
 
 
@@ -1981,9 +2286,23 @@ def _astream_agent(
     call_kwargs: dict[str, Any],
     *,
     budget: Budget | None = None,
+    system_override: str | None = None,
+    model_override: str | Model | None = None,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
+    seed_conversation: list[Message] | None = None,
 ) -> AsyncRunStream:
     return _astream_run(
         lambda: _arun_agent_on_callers_loop(
-            agent_fn, call_args, call_kwargs, streaming=True, budget=budget
+            agent_fn,
+            call_args,
+            call_kwargs,
+            streaming=True,
+            budget=budget,
+            system_override=system_override,
+            model_override=model_override,
+            approver=approver,
+            context_manager=context_manager,
+            seed_conversation=seed_conversation,
         )
     )

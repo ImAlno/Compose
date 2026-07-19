@@ -7,6 +7,7 @@ checks, always-on local tracing, and durable, resumable flows.
 from ._encoding import register_serializable
 from ._schema import register_module_types
 from .agentfn import agent, prompt
+from .chat import Chat, chat, load_chat
 from .combinators import MapResult, aggregate, amap, map, pipe
 from .flow import anow, arandom, aresume, flow, now, random, resume, task
 from .hitl import Interrupt, approve, ask_human
@@ -16,10 +17,11 @@ from .models.prices import ModelPrice, register_price
 from .runs import Budget, Run
 from .tools import tool
 
-__version__ = "0.6.0"
+__version__ = "0.7.0"
 
 __all__ = [
     "Budget",
+    "Chat",
     "Interrupt",
     "MapResult",
     "ModelPrice",
@@ -32,7 +34,9 @@ __all__ = [
     "arandom",
     "aresume",
     "ask_human",
+    "chat",
     "flow",
+    "load_chat",
     "map",
     "mcp_tools",
     "now",

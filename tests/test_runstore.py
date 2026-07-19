@@ -758,3 +758,44 @@ def test_resolve_answer_key_bare_id_not_yet_pending_passes_through():
 
 def test_resolve_answer_key_no_pending_at_all_passes_through_as_bare_id():
     assert runs.resolve_answer_key(set(), "anything") == "anything"
+
+
+# --- chats table: chat_put / chat_get --------------------------------------
+
+
+def test_chat_put_get_roundtrip():
+    store = runs.open_default()
+    store.chat_put(
+        chat_id="chat_1",
+        agent_name="buddy",
+        system="S.",
+        model="anthropic/claude-x",
+        messages_json='[{"role": "user"}]',
+        created_at=1.0,
+        updated_at=2.0,
+    )
+    row = store.chat_get("chat_1")
+    assert row is not None
+    assert row["agent_name"] == "buddy"
+    assert row["system"] == "S."
+    assert row["model"] == "anthropic/claude-x"
+    assert row["messages_json"] == '[{"role": "user"}]'
+
+    store.chat_put(
+        chat_id="chat_1",
+        agent_name="buddy",
+        system="S.",
+        model="anthropic/claude-x",
+        messages_json='[{"role": "user"}, {"role": "assistant"}]',
+        created_at=1.0,
+        updated_at=3.0,
+    )
+    row2 = store.chat_get("chat_1")
+    assert row2 is not None
+    assert row2["updated_at"] == 3.0
+    assert "assistant" in row2["messages_json"]
+
+
+def test_chat_get_missing_returns_none():
+    store = runs.open_default()
+    assert store.chat_get("no-such-chat") is None

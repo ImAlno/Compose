@@ -534,6 +534,15 @@ class RunStore:
                 updated_at REAL,
                 PRIMARY KEY (run_id, scope_key)
             );
+            CREATE TABLE IF NOT EXISTS chats (
+                chat_id TEXT PRIMARY KEY,
+                agent_name TEXT,
+                system TEXT,
+                model TEXT,
+                messages_json TEXT,
+                created_at REAL,
+                updated_at REAL
+            );
             """
         )
         try:
@@ -945,6 +954,33 @@ class RunStore:
             "SELECT * FROM agent_state WHERE run_id = ? AND scope_key = ?",
             (run_id, scope_key),
         ).fetchone()
+        return dict(row) if row is not None else None
+
+    # --- chats (Phase 0.7.0: interactive chat sessions) -------------------
+
+    def chat_put(
+        self,
+        *,
+        chat_id: str,
+        agent_name: str,
+        system: str | None,
+        model: str | None,
+        messages_json: str,
+        created_at: float,
+        updated_at: float,
+    ) -> None:
+        conn = self._connect()
+        conn.execute(
+            "INSERT OR REPLACE INTO chats "
+            "(chat_id, agent_name, system, model, messages_json, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (chat_id, agent_name, system, model, messages_json, created_at, updated_at),
+        )
+        conn.commit()
+
+    def chat_get(self, chat_id: str) -> dict[str, Any] | None:
+        conn = self._connect()
+        row = conn.execute("SELECT * FROM chats WHERE chat_id = ?", (chat_id,)).fetchone()
         return dict(row) if row is not None else None
 
     # --- atomic pause: snapshot + every pending interrupt + status, one commit --

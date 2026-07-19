@@ -34,7 +34,7 @@ import random as _stdlib_random
 import textwrap
 import time
 from collections.abc import Callable, Coroutine
-from typing import Any, Generic, Protocol, overload
+from typing import TYPE_CHECKING, Any, Generic, Protocol, overload
 
 from typing_extensions import ParamSpec, TypeVar
 
@@ -61,6 +61,10 @@ from .runs import (
     use_run_context,
 )
 from .runs import open_default as _open_default_store
+
+if TYPE_CHECKING:
+    from .hitl import Interrupt
+    from .messages import Message
 
 # --- typing: `Task[P, R]` / `Flow[P, R]` generics (v0.5.0 Plan B, Task 5) -----
 #
@@ -1018,6 +1022,8 @@ def resume(
     *,
     budget: Budget | None = None,
     allow_code_change: bool = False,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Resume a durable run (``@flow`` or standalone ``@agent``) by ``run_id``.
 
@@ -1067,7 +1073,19 @@ def resume(
         raise ConfigError(f"no run found with run_id {run_id!r}")
 
     if row["kind"] == "agent":
-        return agentfn.resume_standalone_agent(run_id, row, answers, budget=budget)
+        return agentfn.resume_standalone_agent(
+            run_id,
+            row,
+            answers,
+            budget=budget,
+            approver=approver,
+            context_manager=context_manager,
+        )
+
+    if approver is not None or context_manager is not None:
+        raise ConfigError(
+            "approver= and context_manager= apply only to standalone agent runs, not @flow runs"
+        )
 
     flow_obj = _FLOW_REGISTRY.get(row["name"])
     if flow_obj is None:
@@ -1123,6 +1141,8 @@ async def aresume(
     *,
     budget: Budget | None = None,
     allow_code_change: bool = False,
+    approver: Callable[[Interrupt], bool] | None = None,
+    context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Async twin of :func:`resume` (v0.4.0 Plan B, Task 7) -- same
     contract and the same check order (nothing persisted before the
@@ -1151,7 +1171,19 @@ async def aresume(
         raise ConfigError(f"no run found with run_id {run_id!r}")
 
     if row["kind"] == "agent":
-        return await agentfn.aresume_standalone_agent(run_id, row, answers, budget=budget)
+        return await agentfn.aresume_standalone_agent(
+            run_id,
+            row,
+            answers,
+            budget=budget,
+            approver=approver,
+            context_manager=context_manager,
+        )
+
+    if approver is not None or context_manager is not None:
+        raise ConfigError(
+            "approver= and context_manager= apply only to standalone agent runs, not @flow runs"
+        )
 
     flow_obj = _FLOW_REGISTRY.get(row["name"])
     if flow_obj is None:

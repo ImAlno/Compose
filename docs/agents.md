@@ -144,6 +144,17 @@ stream.run.trace.print()   # blocks until settled; the full trace, same events
 
 The full vocabulary an event's `kind` can take (`composeai.events.Event.kind`) is `span_started`, `text_delta`, `thinking_delta`, `tool_call_started`, `tool_args_delta`, `tool_call_finished`, `span_finished`, `paused`, and `run_finished` — the same events tracing is built from, on agents, pipelines, and flows alike, so a live UI and `compose trace` can never disagree about what happened.
 
+## Per-call overrides
+
+`.run()`, `.arun()`, `.stream()`, and `.astream()` all accept four keyword-only overrides, applied to that one call without touching the decoration:
+
+- `system=` replaces the agent's docstring/system prompt for this run.
+- `model=` swaps the model (a `"provider/model-id"` string or a `Model` instance).
+- `approver=` is called synchronously for `requires_approval` tools instead of pausing — return `True`/`False`.
+- `context_manager=` receives `(messages, last_input_tokens)` before every provider call and returns the messages actually sent.
+
+These are the same four knobs `compose.chat` takes; see [chats](chats.md) for the full semantics of `approver=` and `context_manager=`.
+
 ## `.arun()` and `.astream()`
 
 Both have asyncio-native twins, awaited directly on your own already-running event loop instead of composeai's background runtime thread:

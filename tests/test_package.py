@@ -4,7 +4,7 @@ from composeai.testing import FakeModel
 
 
 def test_version():
-    assert composeai.__version__ == "0.6.0"
+    assert composeai.__version__ == "0.7.0"
 
 
 def test_openai_compatible_is_exported():
@@ -48,3 +48,15 @@ def test_decorated_agent_exposes_arun_and_astream():
     assert callable(greeter.arun)
     assert hasattr(greeter, "astream")
     assert callable(greeter.astream)
+
+
+def test_chat_surface_is_exported():
+    import composeai
+
+    assert hasattr(composeai, "Chat")
+    assert hasattr(composeai, "chat")
+    assert hasattr(composeai, "load_chat")
+    assert "Chat" in composeai.__all__
+    assert "chat" in composeai.__all__
+    assert "load_chat" in composeai.__all__
+    assert composeai.__version__ == "0.7.0"

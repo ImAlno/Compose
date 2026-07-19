@@ -344,3 +344,29 @@ def test_flow_level_interrupt_ids_are_used_verbatim_not_tool_shorthand():
     run2 = resume(run.id, {"send_email": True})
     assert run2.status == "completed"
     assert run2.output == "sent"
+
+
+# --- approver=/context_manager= are standalone-agent-only on resume() ----------
+
+
+def test_resume_rejects_callbacks_for_flow_runs():
+    @flow
+    def publish_flow() -> str:
+        if approve("publish"):
+            return "published"
+        return "rejected"
+
+    run = publish_flow.run()
+    assert run.status == "paused"
+
+    with pytest.raises(
+        ConfigError,
+        match="approver= and context_manager= apply only to standalone agent runs",
+    ):
+        resume(run.id, {"publish": True}, context_manager=lambda messages, tokens: messages)
+
+    # The rejected resume must abort BEFORE journaling the answer or touching
+    # state, so the run is still resumable normally afterwards.
+    run2 = resume(run.id, {"publish": True})
+    assert run2.status == "completed"
+    assert run2.output == "published"
