@@ -634,8 +634,29 @@ class _RunState:
 _STREAM_SENTINEL = object()
 
 
+class _Cancelled(BaseException):
+    """Internal terminal control-flow signal for a cooperatively cancelled run.
+
+    Raised by the streaming run loop when its ``cancel`` :class:`threading.Event`
+    is set -- at a turn boundary, before a new tool batch, or between provider
+    stream events. A :class:`BaseException` (not :class:`Exception`), mirroring
+    :class:`composeai.hitl._Pause`, so a user ``except Exception`` inside a tool
+    body can never swallow it. Detected everywhere by the duck-typed
+    ``_compose_cancel`` class attribute (never imported across modules), and
+    turned into a terminal ``Run(status="cancelled")``. Unlike ``_Pause`` it is
+    *terminal*: it carries no interrupt and persists no resume snapshot.
+    """
+
+    _compose_cancel = True
+
+
 async def _ainvoke_model(
-    slot: _ModelSlot, request: ModelRequest, streaming: bool, llm_span: tracing.Span
+    slot: _ModelSlot,
+    request: ModelRequest,
+    streaming: bool,
+    llm_span: tracing.Span,
+    *,
+    cancel: threading.Event | None = None,
 ) -> ModelResponse:
     """Call ``slot.model`` for one request, streaming deltas onto the bus if possible.
 
@@ -731,24 +752,46 @@ async def _ainvoke_model(
 
     response: ModelResponse | None = None
     if astream_fn is not None:
-        async for raw_event in astream_fn(request):
-            result = _forward_raw_event(raw_event)
-            if result is not None:
-                response = result
+        agen = astream_fn(request)
+        try:
+            async for raw_event in agen:
+                if cancel is not None and cancel.is_set():
+                    raise _Cancelled()
+                result = _forward_raw_event(raw_event)
+                if result is not None:
+                    response = result
+        except _Cancelled:
+            # Deterministically finalize the adapter's async generator so its
+            # `async with client.messages.stream()` block exits and the HTTP
+            # request is aborted NOW -- a bare break/exception does not finalize
+            # an async generator (that waits for GC / loop finalization).
+            await agen.aclose()
+            raise
     elif stream_fn is not None:
         iterator = stream_fn(request)
-        while True:
-            # NOT asyncio.to_thread, for the same reason as `_complete_sync`
-            # above: its shared, bounded default executor could starve if a
-            # custom sync Model.stream() re-enters a composeai facade from
-            # inside its iterator. One dedicated thread per hop has no
-            # shared bound to starve.
-            raw_event = await _run_sync_on_own_thread(next, (iterator, _STREAM_SENTINEL), {})
-            if raw_event is _STREAM_SENTINEL:
-                break
-            result = _forward_raw_event(raw_event)
-            if result is not None:
-                response = result
+        try:
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise _Cancelled()
+                # NOT asyncio.to_thread, for the same reason as `_complete_sync`
+                # above: its shared, bounded default executor could starve if a
+                # custom sync Model.stream() re-enters a composeai facade from
+                # inside its iterator. One dedicated thread per hop has no
+                # shared bound to starve.
+                raw_event = await _run_sync_on_own_thread(next, (iterator, _STREAM_SENTINEL), {})
+                if raw_event is _STREAM_SENTINEL:
+                    break
+                result = _forward_raw_event(raw_event)
+                if result is not None:
+                    response = result
+        except _Cancelled:
+            # Sync generator twin: `close()` throws GeneratorExit into it, so
+            # its `with client.messages.stream()` block exits and aborts the
+            # request -- same reason the async branch calls `aclose()`. Called
+            # directly (not via `_run_sync_on_own_thread`), so the generator's
+            # `finally` runs synchronously here on the event-loop thread.
+            iterator.close()
+            raise
     if response is None:
         raise ComposeError(
             f"Model.stream() for {slot.label!r} ended without yielding a "
@@ -772,6 +815,8 @@ async def _acall_llm(
     thinking_budget: int | None,
     retries: int,
     streaming: bool = False,
+    *,
+    cancel: threading.Event | None = None,
 ) -> ModelResponse:
     """Call ``slot.model`` once inside its own ``llm`` span, with retry/fallback bookkeeping.
 
@@ -806,7 +851,7 @@ async def _acall_llm(
         attempt = 0
         while True:
             try:
-                response = await _ainvoke_model(slot, request, streaming, llm_span)
+                response = await _ainvoke_model(slot, request, streaming, llm_span, cancel=cancel)
             except ProviderError as exc:
                 llm_span.attributes.setdefault("retries", []).append(
                     {"type": type(exc).__name__, "message": str(exc)}
@@ -854,6 +899,8 @@ async def _aperform_turn(
     tools: list[ToolSpec] | None,
     output_schema: dict[str, Any] | None,
     streaming: bool = False,
+    *,
+    cancel: threading.Event | None = None,
 ) -> ModelResponse:
     """Run one model turn, retrying against ``agent_fn._fallback`` on a ``ProviderError``.
 
@@ -881,6 +928,7 @@ async def _aperform_turn(
             agent_fn._thinking_budget,
             agent_fn._retries,
             streaming,
+            cancel=cancel,
         )
     except ProviderError:
         if agent_fn._fallback is None or state.fallback_active:
@@ -904,6 +952,7 @@ async def _aperform_turn(
             agent_fn._thinking_budget,
             agent_fn._retries,
             streaming,
+            cancel=cancel,
         )
 
 
@@ -1023,6 +1072,7 @@ async def _aprocess_tool_use(
     seed_results: dict[str, ToolResultPart] | None = None,
     *,
     approver: Callable[[Interrupt], bool] | None = None,
+    cancel: threading.Event | None = None,
 ) -> Message:
     """Execute one tool-call batch, pausing if an approval-gated call is
     unanswered or any tool body raises ``_Pause`` (``ask_human``).
@@ -1067,6 +1117,10 @@ async def _aprocess_tool_use(
     flow's own sync body), and the latter is pure in-memory contextvar
     manipulation, not I/O.
     """
+    if cancel is not None and cancel.is_set():
+        # Cooperative cancel: refuse to start a NEW tool batch. A tool already
+        # executing (from an earlier batch) has run to completion by now.
+        raise _Cancelled()
     results: dict[str, ToolResultPart] = dict(seed_results) if seed_results else {}
     approval_ids = {call.id for call in calls if _tool_requires_approval(agent_fn, call)}
     normal_calls = [c for c in calls if c.id not in approval_ids and c.id not in results]
@@ -1284,6 +1338,7 @@ def _run_agent(
     approver: Callable[[Interrupt], bool] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
+    cancel: threading.Event | None = None,
 ) -> Run[Any]:
     # --- Phase 7 (durable flows): minimal, well-marked touch -----------------
     # Inside an active @flow body, the whole agent run auto-journals as one
@@ -1309,6 +1364,7 @@ def _run_agent(
             approver=approver,
             context_manager=context_manager,
             seed_conversation=seed_conversation,
+            cancel=cancel,
         )
     if tracing.current_span() is None:
         args_json = _encode_agent_call(
@@ -1329,6 +1385,7 @@ def _run_agent(
                 approver=approver,
                 context_manager=context_manager,
                 seed_conversation=seed_conversation,
+                cancel=cancel,
             ),
             budget=budget,
         )
@@ -1344,6 +1401,7 @@ def _run_agent(
         approver=approver,
         context_manager=context_manager,
         seed_conversation=seed_conversation,
+        cancel=cancel,
     )
 
 
@@ -1531,6 +1589,7 @@ def _run_agent_journaled(
     approver: Callable[[Interrupt], bool] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
+    cancel: threading.Event | None = None,
 ) -> Run[Any]:
     """Treat one whole agent run as a single journaled flow step.
 
@@ -1582,6 +1641,7 @@ def _run_agent_journaled(
         approver=approver,
         context_manager=context_manager,
         seed_conversation=seed_conversation,
+        cancel=cancel,
     )
     recorded = ctx.journal_record(key, run.output)
     run.output = recorded
@@ -1881,6 +1941,7 @@ def _run_agent_uncached(
     approver: Callable[[Interrupt], bool] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
+    cancel: threading.Event | None = None,
 ) -> Run[Any]:
     """Sync facade over the async engine (:func:`_arun_agent_uncached`) --
     see its docstring for the full loop contract.
@@ -1913,6 +1974,7 @@ def _run_agent_uncached(
             approver=approver,
             context_manager=context_manager,
             seed_conversation=seed_conversation,
+            cancel=cancel,
         )
     )
 
@@ -1932,6 +1994,7 @@ async def _arun_agent_uncached(
     approver: Callable[[Interrupt], bool] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
+    cancel: threading.Event | None = None,
 ) -> Run[Any]:
     """The actual agent loop -- shared by standalone runs, resumed standalone
     runs, and agents nested in a flow (see the three callers of the sync
@@ -2013,6 +2076,7 @@ async def _arun_agent_uncached(
                         scope_key,
                         seed_results=restored.partial_results,
                         approver=approver,
+                        cancel=cancel,
                     )
                     conversation.append(tool_message)
                     await _asnapshot_agent_state(run_id, scope_key, conversation, turn, {})
@@ -2027,6 +2091,8 @@ async def _arun_agent_uncached(
             last_input_tokens = 0
 
             while True:
+                if cancel is not None and cancel.is_set():
+                    raise _Cancelled()
                 turn += 1
                 if agent_fn._max_turns is not None and turn > agent_fn._max_turns:
                     raise MaxTurnsExceededError(
@@ -2061,6 +2127,7 @@ async def _arun_agent_uncached(
                     tool_specs,
                     agent_fn._output_schema,
                     streaming,
+                    cancel=cancel,
                 )
                 last_input_tokens = response.usage.input_tokens
                 conversation.append(response.message)
@@ -2077,7 +2144,14 @@ async def _arun_agent_uncached(
                             "to append an empty tool-results message"
                         )
                     tool_message = await _aprocess_tool_use(
-                        agent_fn, calls, conversation, turn, run_id, scope_key, approver=approver
+                        agent_fn,
+                        calls,
+                        conversation,
+                        turn,
+                        run_id,
+                        scope_key,
+                        approver=approver,
+                        cancel=cancel,
                     )
                     conversation.append(tool_message)
                     await _asnapshot_agent_state(run_id, scope_key, conversation, turn, {})
@@ -2162,6 +2236,12 @@ async def _arun_agent_uncached(
             # the matching duck-typed check in composeai.runs/composeai.flow.
             if getattr(exc, "_compose_pause", False):
                 tracing.emit_run_finished(agent_span, status="paused")
+            elif getattr(exc, "_compose_cancel", False):
+                # v0.9.0: a cooperative cancel is a clean terminal stop, not a
+                # failure -- emit the terminal run_finished with the cancelled
+                # status, then re-raise for settle_agent_run to turn into a
+                # returned Run(status="cancelled").
+                tracing.emit_run_finished(agent_span, status="cancelled")
             else:
                 tracing.emit_run_finished(
                     agent_span, status="failed", error_type=type(exc).__name__
@@ -2175,7 +2255,9 @@ async def _arun_agent_uncached(
 # --- streaming -------------------------------------------------------------
 
 
-def _stream_run(run_thunk: Callable[[], Run[Any]]) -> RunStream:
+def _stream_run(
+    run_thunk: Callable[[], Run[Any]], *, cancel: threading.Event | None = None
+) -> RunStream:
     """Run ``run_thunk`` on a background thread against a fresh, private bus.
 
     The generic engine behind every ``.stream(...)`` in composeai --
@@ -2199,14 +2281,47 @@ def _stream_run(run_thunk: Callable[[], Run[Any]]) -> RunStream:
             try:
                 run = run_thunk()
             except BaseException as exc:
-                run_stream._set_outcome(run=None, exception=exc)
+                if getattr(exc, "_compose_cancel", False):
+                    # v0.9.0: centralize the cooperative-cancel conversion here
+                    # so ALL three `_run_agent` branches converge on a returned
+                    # `Run(status="cancelled")`. `settle_agent_run` (runs.py)
+                    # only converts `_Cancelled` on the trace-root *standalone*
+                    # path; the enclosing-span (direct `_run_agent_uncached`)
+                    # and in-flow (`_run_agent_journaled`) paths bypass it, so
+                    # without this the `_Cancelled` BaseException would escape
+                    # into the outcome and both iteration and `.run` would
+                    # re-raise it -- violating the documented contract that
+                    # `.run` returns the cancelled `Run` WITHOUT raising. Mirror
+                    # exactly the cancelled `Run` `settle_agent_run` builds (zero
+                    # usage, no output/messages/pending) with the ambient trace,
+                    # which is always set on these two paths (both run under an
+                    # enclosing span/flow). Store it as the NORMAL outcome so
+                    # iteration ends cleanly and `.run` returns it. A genuine
+                    # error or `_Pause` (no `_compose_cancel`) is stored as the
+                    # exception exactly as before. Pipeline/Aggregate streams
+                    # also reach here but never tag `_compose_cancel`, so this
+                    # `getattr` guard leaves their no-op `.cancel()` untouched.
+                    trace = tracing.current_trace()
+                    assert trace is not None
+                    cancelled_run: Run[Any] = Run(
+                        id=new_ulid(),
+                        status="cancelled",
+                        output=None,
+                        usage=Usage(),
+                        trace=trace,
+                        messages=[],
+                        pending=None,
+                    )
+                    run_stream._set_outcome(run=cancelled_run, exception=None)
+                else:
+                    run_stream._set_outcome(run=None, exception=exc)
             else:
                 run_stream._set_outcome(run=run, exception=None)
             finally:
                 subscription.close()
 
     thread = threading.Thread(target=tracing.propagate(_worker), daemon=True)
-    run_stream = RunStream(subscription, thread)
+    run_stream = RunStream(subscription, thread, cancel=cancel)
     thread.start()
     return run_stream
 
@@ -2223,6 +2338,7 @@ def _stream_agent(
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> RunStream:
+    cancel = threading.Event()
     return _stream_run(
         lambda: _run_agent(
             agent_fn,
@@ -2235,7 +2351,9 @@ def _stream_agent(
             approver=approver,
             context_manager=context_manager,
             seed_conversation=seed_conversation,
-        )
+            cancel=cancel,
+        ),
+        cancel=cancel,
     )
 
 

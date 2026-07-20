@@ -12,6 +12,7 @@ Multi-agent workflows as the typed Python functions you already write — wiring
 - **Chats persist.** `compose.chat(agent)` keeps a conversation going across sends — and across processes (`load_chat(id)`) — with inline tool approval (`approver=`), per-chat `system=`/`model=` overrides, and a `context_manager=` hook for compaction. Each send is an ordinary traced, budgeted run.
 - **Every run can carry a spend cap.** `Budget(usd=..., tokens=...)` is enforced after every LLM call in a run's subtree, and stays cumulative across `resume()` — a run can't dodge its budget by crashing and getting resumed.
 - **Streaming and tracing are the same event bus.** `.stream()` yields `text_delta`/`thinking_delta`/`tool_call_started`/`tool_args_delta` interleaved with the very `span_started`/`span_finished`/`run_finished` events the trace is built from — on agents, pipelines, and flows alike, so a live UI and the trace can never disagree.
+- **Streams cancel cooperatively.** `RunStream.cancel()` (0.9.0) stops a `.stream()` in progress — no new tool calls, in-flight LLM stream aborted, run ends `Run(status="cancelled")` — and `stream.run` returns it without raising. See [agents](docs/agents.md#runstreamcancel).
 - **Sync and async surfaces over one engine.** `.arun()`/`.astream()`, `aresume`, `amap`, `anow`/`arandom`, and async `@tool`/`@task`/`@agent`/`@flow` bodies mirror the sync API exactly — the same engine, driven either from composeai's own background thread or directly on your already-running event loop.
 - **MCP servers plug straight into `tools=`.** `compose.mcp_tools(command=..., ...)` connects to a Model Context Protocol server (stdio or streamable HTTP) and turns its tools into ordinary composeai `Tool` objects — indistinguishable from `@compose.tool` ones, including the same `requires_approval=` pause/resume.
 
@@ -118,6 +119,7 @@ The contracts composeai holds you to — and the ones it holds itself to:
 - OpenTelemetry exporter (the span model already tracks `gen_ai.*` attribute conventions)
 - OpenAI request-side reasoning niceties (`reasoning.summary`, `encrypted_content` round-trip) -- 0.6.0 shipped `effort` passthrough; these remain unshipped
 - Anthropic extended-thinking token budgets -- 0.8.0 shipped `thinking_budget` passthrough (`1024 ≤ budget_tokens < max_tokens`); no-op on OpenAI and other providers
+- Streaming cancellation -- 0.9.0 shipped cooperative cancellation for sync `RunStream` (`RunStream.cancel()`); `AsyncRunStream.cancel()` remains unshipped
 - TypeScript sibling package
 - Consolidate the MCP bridge onto the runtime loop (each MCP server currently owns its own dedicated event-loop thread rather than sharing composeai's)
 - Span-persistence queue tuning under streaming storms (the store's single writer thread is a FIFO queue; a very high-rate `.stream()`/`.astream()` workload hasn't been load-tested against it)

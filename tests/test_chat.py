@@ -1,5 +1,7 @@
 """compose.chat sessions (0.7.0)."""
 
+import threading
+
 import pytest
 
 from composeai import runs
@@ -269,6 +271,46 @@ def test_chat_stream_absorbs_only_once():
     _ = stream.run
     _ = stream.run
     assert len(c.messages) == 2
+
+
+def test_chat_stream_cancel_reaches_the_wrapped_run_stream():
+    """ChatStream.cancel() (v0.9.0) delegates to the wrapped RunStream: a
+    cancel set through the chat surface still aborts an in-flight run and
+    drains cleanly, without either iteration or `.run` raising."""
+    entered = threading.Event()
+    release = threading.Event()
+
+    @tool
+    def gate() -> str:
+        """Block until released (proves an in-flight tool runs to completion)."""
+        entered.set()
+        release.wait(timeout=5)
+        return "gate-done"
+
+    model = FakeModel(
+        [
+            {"tool_calls": [{"name": "gate", "arguments": {}, "id": "g1"}]},
+            "should-not-happen",
+        ]
+    )
+
+    @agent(model=model, tools=[gate], max_turns=10)
+    def buddy() -> str:
+        """You are Buddy."""
+        return "unused"
+
+    c = chat(buddy)
+    stream = c.stream("hello")
+    entered.wait(timeout=5)  # the gate tool is executing
+    stream.cancel()  # cancel through the ChatStream surface (not _inner)
+    release.set()  # let the in-flight tool finish (cooperative)
+
+    events = list(stream)  # drain to completion; must NOT raise
+    assert stream.run.status == "cancelled"  # must NOT raise either
+    finished = [e for e in events if e.kind == "run_finished"]
+    assert len(finished) == 1
+    assert finished[0].data == {"status": "cancelled"}
+    assert len(model.requests) == 1  # no second turn started
 
 
 def test_context_manager_survives_chat_resume():

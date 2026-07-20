@@ -17,7 +17,7 @@ from .models.prices import ModelPrice, register_price
 from .runs import Budget, Run
 from .tools import tool
 
-__version__ = "0.8.0"
+__version__ = "0.9.0"
 
 __all__ = [
     "Budget",

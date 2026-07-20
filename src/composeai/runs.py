@@ -83,7 +83,7 @@ class Run(Generic[R]):
     """
 
     id: str
-    status: Literal["completed", "paused", "failed"]
+    status: Literal["completed", "paused", "failed", "cancelled"]
     output: R
     usage: Usage
     trace: Trace
@@ -109,11 +109,22 @@ class RunStream(Generic[R]):
     the run's exception if it failed).
     """
 
-    def __init__(self, subscription: Subscription, thread: threading.Thread) -> None:
+    def __init__(
+        self,
+        subscription: Subscription,
+        thread: threading.Thread,
+        cancel: threading.Event | None = None,
+    ) -> None:
         self._subscription = subscription
         self._thread = thread
         self._run: Run[R] | None = None
         self._exception: BaseException | None = None
+        # Cooperative-cancellation signal (0.9.0). Created at `.stream()` time
+        # and threaded into the run loop so `cancel()` can stop it between
+        # turns / tool calls and abort the in-flight LLM stream. A private,
+        # unwired Event is used when a caller (e.g. Pipeline/Aggregate.stream)
+        # does not supply one -- their `.cancel()` is a no-op in 0.9.0.
+        self._cancel = cancel if cancel is not None else threading.Event()
 
     def __iter__(self) -> Iterator[Event]:
         yield from self._subscription
@@ -128,6 +139,20 @@ class RunStream(Generic[R]):
         (still joinable via :attr:`run` regardless).
         """
         self._subscription.close()
+
+    def cancel(self) -> None:
+        """Cooperatively cancel the streaming run (v0.9.0).
+
+        Sets the shared cancel :class:`threading.Event` the run loop checks
+        at turn boundaries, before each new tool call, and between provider
+        stream events. No new work starts, the in-flight LLM stream is
+        aborted, and the run ends as ``Run(status="cancelled")`` -- iteration
+        stops cleanly after the terminal ``run_finished`` event and
+        :attr:`run` returns that cancelled ``Run`` *without* raising. A tool
+        already executing runs to completion (cancellation is cooperative).
+        Safe to call more than once and from any thread.
+        """
+        self._cancel.set()
 
     def _set_outcome(self, *, run: Run[R] | None, exception: BaseException | None) -> None:
         """Record the worker thread's result. Called once, by that thread itself."""
@@ -1903,6 +1928,25 @@ def settle_agent_run(store: RunStore, run_id: str, thunk: Callable[[], Run[Any]]
                 trace=trace,
                 messages=[],
                 pending=interrupt,
+            )
+        if getattr(exc, "_compose_cancel", False):
+            # v0.9.0 cooperative cancel: a clean terminal stop, not a failure.
+            # Mark the durable row "cancelled" (free-form status TEXT column,
+            # already in _UPDATABLE_RUN_COLUMNS -- no schema/_SCHEMA_VERSION
+            # change) and RETURN the cancelled Run without re-raising, so
+            # `.run`/iteration never raise (unlike a failed run). No interrupt
+            # and no resume snapshot: cancel is terminal, not resumable.
+            worker_for(store).call_blocking("update_run", run_id, status="cancelled")
+            trace = tracing.current_trace()
+            assert trace is not None
+            return Run(
+                id=run_id,
+                status="cancelled",
+                output=None,
+                usage=Usage(),
+                trace=trace,
+                messages=[],
+                pending=None,
             )
         worker_for(store).call_blocking(
             "update_run",

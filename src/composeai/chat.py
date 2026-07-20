@@ -154,6 +154,18 @@ class ChatStream:
     def close(self) -> None:
         self._inner.close()
 
+    def cancel(self) -> None:
+        """Cooperatively cancel the in-flight chat send (v0.9.0).
+
+        Delegates to the underlying :class:`RunStream.cancel` -- no new
+        turn/tool work starts, the in-flight LLM stream is aborted, and the
+        run ends as ``Run(status="cancelled")``; iteration stops cleanly and
+        :attr:`run` returns the cancelled ``Run`` without raising. A tool
+        already executing runs to completion (cancellation is cooperative).
+        Safe to call from another thread.
+        """
+        self._inner.cancel()
+
     @property
     def run(self) -> Run[Any]:
         run = self._inner.run

@@ -145,6 +145,21 @@ stream.run.trace.print()   # blocks until settled; the full trace, same events
 
 The full vocabulary an event's `kind` can take (`composeai.events.Event.kind`) is `span_started`, `text_delta`, `thinking_delta`, `tool_call_started`, `tool_args_delta`, `tool_call_finished`, `span_finished`, `paused`, and `run_finished` — the same events tracing is built from, on agents, pipelines, and flows alike, so a live UI and `compose trace` can never disagree about what happened.
 
+### `RunStream.cancel()`
+
+`stream.cancel()` cooperatively cancels a streaming run — safe to call from any thread (typically the consumer thread driving the `for event in stream:` loop), and safe to call more than once. No new turn or tool work starts, the in-flight LLM stream is aborted, and the run ends as `Run(status="cancelled")`: iteration stops cleanly after the terminal `run_finished(status="cancelled")` event, and `stream.run` returns that cancelled `Run` **without raising** — unlike a failed run, which re-raises.
+
+```python
+rs = my_agent.stream("...")
+for event in rs:
+    if some_condition(event):
+        rs.cancel()          # from the consumer thread
+
+assert rs.run.status == "cancelled"   # no exception
+```
+
+Cancellation is cooperative, not preemptive: a tool call already executing runs to completion (Python threads can't be force-stopped) — `cancel()` only prevents *new* tool calls from starting, stops the loop between turns, and aborts the in-flight stream between provider events. In 0.9.0 this is sync `RunStream` only; `AsyncRunStream.cancel()` is future work.
+
 ## Per-call overrides
 
 `.run()`, `.arun()`, `.stream()`, and `.astream()` all accept four keyword-only overrides, applied to that one call without touching the decoration:

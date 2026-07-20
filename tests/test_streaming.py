@@ -22,6 +22,7 @@ from composeai.agentfn import agent
 from composeai.errors import ModelRefusalError
 from composeai.messages import Message, StopReason, Usage
 from composeai.models.base import ModelRequest, ModelResponse
+from composeai.runs import RunStream
 from composeai.testing import FakeModel
 from composeai.tools import tool
 
@@ -381,3 +382,300 @@ def test_stream_propagates_enclosing_span_context():
     agent_span = next(s for s in result.trace.spans if s.kind == "agent")
     assert agent_span.parent_span_id == outer.span_id
     assert agent_span.trace_id == outer.trace_id
+
+
+def test_run_stream_has_cancel_that_is_idempotent_and_stores_the_event():
+    model = FakeModel(["short"])
+
+    @agent(model=model, max_turns=3)
+    def runner() -> str:
+        """Runner."""
+        return "go"
+
+    run_stream = runner.stream()
+    assert hasattr(run_stream, "cancel") and callable(run_stream.cancel)
+    # The Event is created at `.stream()` time and stored on the RunStream.
+    assert isinstance(run_stream._cancel, threading.Event)
+    assert not run_stream._cancel.is_set()
+    run_stream.cancel()
+    run_stream.cancel()  # idempotent -- must not raise
+    assert run_stream._cancel.is_set()
+    # v0.9.0: the checks are now live, but this single fast turn races the
+    # cancel -- it either finished before the cancel landed (completed) or the
+    # turn-top guard tripped first (cancelled). Either way `.run` never raises.
+    assert run_stream.run.status in ("completed", "cancelled")
+
+
+def test_cancel_plumbing_is_wired_to_checks():
+    import inspect
+
+    from composeai import agentfn
+
+    # The Event reaches the innermost model-invocation function.
+    assert "cancel" in inspect.signature(agentfn._ainvoke_model).parameters
+    assert "cancel" in inspect.signature(agentfn._arun_agent_uncached).parameters
+    assert "cancel" in inspect.signature(agentfn._aprocess_tool_use).parameters
+
+    model = FakeModel(["short"])
+
+    @agent(model=model, max_turns=3)
+    def runner() -> str:
+        """Runner."""
+        return "go"
+
+    run_stream = runner.stream()
+    # v0.9.0: the checks are now live -- a cancel set before the first turn
+    # boundary trips the turn-top guard on turn 1, so no model request is ever
+    # made and the run ends cancelled (no output).
+    run_stream.cancel()
+    assert run_stream.run.status == "cancelled"
+    assert run_stream.run.output is None
+    assert len(model.requests) == 0
+
+
+def test_cancel_between_turns_returns_cancelled_run_and_completes_in_flight_tool():
+    entered = threading.Event()
+    release = threading.Event()
+
+    @tool
+    def gate() -> str:
+        """Block until released (proves an in-flight tool runs to completion)."""
+        entered.set()
+        release.wait(timeout=5)
+        return "gate-done"
+
+    # turn 1 -> call gate; turn 2 would call `gate` again (must never happen).
+    model = FakeModel(
+        [
+            {"tool_calls": [{"name": "gate", "arguments": {}, "id": "g1"}]},
+            {"tool_calls": [{"name": "gate", "arguments": {}, "id": "g2"}]},
+            "done",
+        ]
+    )
+
+    @agent(model=model, tools=[gate], max_turns=10)
+    def runner() -> str:
+        """Runner."""
+        return "go"
+
+    run_stream = runner.stream()
+    entered.wait(timeout=5)          # turn 1's gate tool is executing
+    run_stream.cancel()             # cancel while a tool is in flight
+    release.set()                   # let the in-flight tool finish (cooperative)
+
+    events = list(run_stream)       # drain to completion; must NOT raise
+    run = run_stream.run            # must NOT raise
+    assert run.status == "cancelled"
+    assert run.output is None
+    finished = [e for e in events if e.kind == "run_finished"]
+    assert len(finished) == 1
+    assert finished[0].data == {"status": "cancelled"}
+    # No NEW turn started: only turn 1's model request was ever made.
+    assert len(model.requests) == 1
+
+
+def test_cancel_before_tool_batch_prevents_the_tool_from_running():
+    ready = threading.Event()
+    holder: dict[str, RunStream[str]] = {}
+    ran = []
+
+    @tool
+    def marker() -> str:
+        """Records that it ran (it must not, once cancel is set)."""
+        ran.append(1)
+        return "ok"
+
+    def turn1(request):
+        ready.wait(timeout=5)           # wait until the test has the RunStream
+        holder["rs"].cancel()          # set cancel DURING the model turn
+        return {"tool_calls": [{"name": "marker", "arguments": {}, "id": "m1"}]}
+
+    model = FakeModel([turn1, "should-not-happen"])
+
+    @agent(model=model, tools=[marker], max_turns=10)
+    def runner() -> str:
+        """Runner."""
+        return "go"
+
+    run_stream = runner.stream()
+    holder["rs"] = run_stream
+    ready.set()
+
+    run = run_stream.run
+    assert run.status == "cancelled"
+    assert ran == []                   # the pre-tool guard stopped the batch
+    assert len(model.requests) == 1    # no second turn
+
+
+def test_cancelled_run_does_not_raise_from_iteration_or_run():
+    ready = threading.Event()
+    holder: dict[str, RunStream[str]] = {}
+
+    def turn1(request):
+        ready.wait(timeout=5)
+        holder["rs"].cancel()
+        return {"tool_calls": [{"name": "noop", "arguments": {}, "id": "n1"}]}
+
+    model = FakeModel([turn1, "never"])
+
+    @agent(model=model, tools=[noop], max_turns=10)
+    def runner() -> str:
+        """Runner."""
+        return "go"
+
+    run_stream = runner.stream()
+    holder["rs"] = run_stream
+    ready.set()
+
+    list(run_stream)                   # no exception on iteration (unlike a failed run)
+    assert run_stream.run.status == "cancelled"
+
+
+def test_cancel_aborts_in_flight_stream_and_closes_the_adapter_iterator():
+    import asyncio
+
+    from composeai.messages import Message, StopReason, Usage
+    from composeai.models.base import ModelRequest, ModelResponse, RawStreamEvent
+
+    class BlockingStreamModel:
+        """Async-streaming fake that parks mid-stream and records aclose()."""
+
+        def __init__(self) -> None:
+            self.first_yielded = threading.Event()
+            self.release = threading.Event()
+            self.closed = False
+            self._resp = ModelResponse(
+                message=Message.assistant("one two"),
+                stop_reason=StopReason.END_TURN,
+                raw_stop_reason="end_turn",
+                usage=Usage(input_tokens=1, output_tokens=2),
+                model_id="blocking",
+            )
+
+        def complete(self, request: ModelRequest) -> ModelResponse:  # Model protocol
+            return self._resp
+
+        async def astream(self, request: ModelRequest):
+            self.closed = False
+            try:
+                yield RawStreamEvent(kind="text_delta", text="one")
+                self.first_yielded.set()
+                # Park without blocking the loop until the test releases us.
+                while not self.release.is_set():
+                    await asyncio.sleep(0.005)
+                yield RawStreamEvent(kind="text_delta", text="two")
+                yield RawStreamEvent(kind="response_done", response=self._resp)
+            finally:
+                # Reached only if the generator is *finalized* (aclose throws
+                # GeneratorExit here) -- a bare break would NOT run this now.
+                self.closed = True
+
+    model = BlockingStreamModel()
+
+    @agent(model=model, max_turns=3)
+    def runner() -> str:
+        """Runner."""
+        return "go"
+
+    run_stream = runner.stream()
+    it = iter(run_stream)
+    # consume up to the first token delta emitted from event "one"
+    for ev in it:
+        if ev.kind == "text_delta":
+            break
+    model.first_yielded.wait(timeout=5)   # generator is parked mid-stream
+    run_stream.cancel()                   # set cancel while the stream is in flight
+    model.release.set()                   # let it yield "two"; loop's check then trips
+
+    run = run_stream.run
+    assert run.status == "cancelled"
+    # The adapter generator was DETERMINISTICALLY finalized (aclose ran), not
+    # left for GC -- this is the crux the explicit close() guarantees.
+    assert model.closed is True
+
+
+def test_cancel_under_enclosing_span_returns_cancelled_run_without_raising():
+    # Regression guard (v0.9.0): a cancel that lands while an enclosing
+    # `tracing.span` is active drives the run down the DIRECT
+    # `_run_agent_uncached` branch (tracing.current_span() is not None), not the
+    # trace-root standalone path -- so it bypasses `settle_agent_run`'s
+    # `_Cancelled`->cancelled-Run conversion. The centralized conversion in
+    # `_stream_run`'s worker must still turn it into a returned
+    # `Run(status="cancelled")`, so neither iteration nor `.run` re-raise the
+    # `_Cancelled` BaseException (the leak this test guards against).
+    ready = threading.Event()
+    holder: dict[str, RunStream[str]] = {}
+
+    def turn1(request):
+        ready.wait(timeout=5)
+        holder["rs"].cancel()
+        return {"tool_calls": [{"name": "noop", "arguments": {}, "id": "n1"}]}
+
+    model = FakeModel([turn1, "never"])
+
+    @agent(model=model, tools=[noop], max_turns=10)
+    def runner() -> str:
+        """Runner."""
+        return "go"
+
+    with tracing.span("flow", "outer"):
+        run_stream = runner.stream()
+        holder["rs"] = run_stream
+        ready.set()
+        events = list(run_stream)      # must NOT raise (pre-fix: leaked _Cancelled)
+        run = run_stream.run           # must NOT raise
+
+    assert run.status == "cancelled"
+    assert run.output is None
+    # Iteration actually streamed and drained cleanly. There is no
+    # `run_finished` here: this is a nested run (the agent span parents to
+    # "outer"), and `tracing.emit_run_finished` fires only for the root run.
+    assert events
+    assert not [e for e in events if e.kind == "run_finished"]
+
+
+def test_cancel_inside_a_flow_returns_cancelled_run_without_raising():
+    # Regression guard (v0.9.0): streaming a nested @agent inside an active
+    # @flow body drives the run down `_run_agent_journaled` (runs.current_run_
+    # context() is not None), which ALSO bypasses `settle_agent_run`. The same
+    # centralized worker conversion must apply, so draining the stream and
+    # reading `.run` from inside the flow body never re-raise `_Cancelled`.
+    from composeai.events import Event
+    from composeai.flow import flow
+
+    ready = threading.Event()
+    holder: dict[str, RunStream[str]] = {}
+    captured_events: list[Event] = []
+
+    def turn1(request):
+        ready.wait(timeout=5)
+        holder["rs"].cancel()
+        return {"tool_calls": [{"name": "noop", "arguments": {}, "id": "n1"}]}
+
+    model = FakeModel([turn1, "never"])
+
+    @agent(model=model, tools=[noop], max_turns=10)
+    def nested() -> str:
+        """Nested streaming agent."""
+        return "go"
+
+    @flow
+    def streaming_flow() -> str:
+        run_stream = nested.stream()
+        holder["rs"] = run_stream
+        ready.set()
+        captured_events.extend(run_stream)   # must NOT raise (pre-fix: leaked)
+        assert run_stream.run.status == "cancelled"  # must NOT raise, in-flow
+        return "flow-done"
+
+    streaming_flow.run()
+
+    cancelled = holder["rs"].run
+    assert cancelled.status == "cancelled"
+    assert cancelled.output is None
+    # The stream drained and `.run` returned from inside the flow body without
+    # re-raising `_Cancelled` (the leak this guards against). No `run_finished`
+    # here either -- the nested agent's span parents to the flow span, so it is
+    # not the root run.
+    assert captured_events
+    assert not [e for e in captured_events if e.kind == "run_finished"]

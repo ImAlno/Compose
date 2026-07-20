@@ -31,8 +31,8 @@ from .errors import SerializationError
 from .messages import Usage
 
 SpanKind = Literal["flow", "task", "agent", "llm", "tool", "pause", "pipe", "aggregate"]
-SpanStatus = Literal["running", "ok", "error", "paused"]
-TraceStatus = Literal["ok", "error", "paused", "running"]
+SpanStatus = Literal["running", "ok", "error", "paused", "cancelled"]
+TraceStatus = Literal["ok", "error", "paused", "running", "cancelled"]
 
 P = ParamSpec("P")
 R = TypeVar("R")
@@ -168,6 +168,8 @@ class Trace:
         roots = self.roots()
         if any(r.status == "error" for r in roots):
             return "error"
+        if any(s.status == "cancelled" for s in self.spans):
+            return "cancelled"
         if any(s.status == "paused" for s in self.spans):
             return "paused"
         if any(r.status == "running" for r in roots):
@@ -423,6 +425,10 @@ def span(
         # module for `span()` itself -- an import the other way would cycle).
         if getattr(exc, "_compose_pause", False):
             new_span.status = "paused"
+        elif getattr(exc, "_compose_cancel", False):
+            # v0.9.0: a cooperative cancel is control flow, not a failure --
+            # mark "cancelled" with no ErrorInfo (duck-typed, same as pause).
+            new_span.status = "cancelled"
         else:
             new_span.status = "error"
             new_span.error = ErrorInfo(
@@ -586,6 +592,8 @@ def _status_decoration(node: Span, use_color: bool) -> str:
         decoration += _colorize(text, "31", use_color)
     elif node.status == "paused":
         decoration += _colorize(" ⏸ paused", "33", use_color)
+    elif node.status == "cancelled":
+        decoration += _colorize(" ⊘ cancelled", "33", use_color)
     if node.replayed:
         decoration += _colorize(" (replayed)", "2", use_color)
     return decoration
