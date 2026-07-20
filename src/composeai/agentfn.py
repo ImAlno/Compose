@@ -42,7 +42,7 @@ from .errors import (
     ModelRefusalError,
     ProviderError,
 )
-from .hitl import Interrupt, _Pause
+from .hitl import ApprovalReply, Interrupt, _Pause
 from .messages import Message, StopReason, ToolCallPart, ToolResultPart, Usage
 from .models import registry
 from .models.base import Model, ModelRequest, ModelResponse, ToolSpec
@@ -200,7 +200,7 @@ class AgentFunction(Generic[P, R]):
         budget: Budget | None = None,
         system: str | None = None,
         model: str | Model | None = None,
-        approver: Callable[[Interrupt], bool] | None = None,
+        approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
         context_manager: Callable[[list[Message], int], list[Message]] | None = None,
         **kwargs: Any,
     ) -> Run[R]:
@@ -221,7 +221,7 @@ class AgentFunction(Generic[P, R]):
         budget: Budget | None = None,
         system: str | None = None,
         model: str | Model | None = None,
-        approver: Callable[[Interrupt], bool] | None = None,
+        approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
         context_manager: Callable[[list[Message], int], list[Message]] | None = None,
         **kwargs: Any,
     ) -> Run[R]:
@@ -242,7 +242,7 @@ class AgentFunction(Generic[P, R]):
         budget: Budget | None = None,
         system: str | None = None,
         model: str | Model | None = None,
-        approver: Callable[[Interrupt], bool] | None = None,
+        approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
         context_manager: Callable[[list[Message], int], list[Message]] | None = None,
         **kwargs: Any,
     ) -> RunStream[R]:
@@ -263,7 +263,7 @@ class AgentFunction(Generic[P, R]):
         budget: Budget | None = None,
         system: str | None = None,
         model: str | Model | None = None,
-        approver: Callable[[Interrupt], bool] | None = None,
+        approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
         context_manager: Callable[[list[Message], int], list[Message]] | None = None,
         **kwargs: Any,
     ) -> AsyncRunStream[R]:
@@ -1031,10 +1031,11 @@ def _approval_interrupt_id(call: ToolCallPart) -> str:
     return f"tool:{call.name}:{call.id}"
 
 
-def _deny_tool_call(call: ToolCallPart) -> ToolResultPart:
+def _deny_tool_call(call: ToolCallPart, message: str | None = None) -> ToolResultPart:
+    content = message if message is not None else "denied by user"
     with tracing.span("tool", call.name, input=call.arguments) as tool_span:
-        tool_span.set_output("denied by user")
-    return ToolResultPart(tool_call_id=call.id, content="denied by user", is_error=True)
+        tool_span.set_output(content)
+    return ToolResultPart(tool_call_id=call.id, content=content, is_error=True)
 
 
 def _pause_for_unanswered_approval(call: ToolCallPart) -> _Pause:
@@ -1071,7 +1072,7 @@ async def _aprocess_tool_use(
     scope_key: str,
     seed_results: dict[str, ToolResultPart] | None = None,
     *,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     cancel: threading.Event | None = None,
 ) -> Message:
     """Execute one tool-call batch, pausing if an approval-gated call is
@@ -1163,6 +1164,7 @@ async def _aprocess_tool_use(
     for call in approval_calls:
         if call.id in results:
             continue
+        message: str | None = None
         interrupt_id = _approval_interrupt_id(call)
         hit, value = runs.interrupt_lookup(f"__interrupt__:{interrupt_id}")
         if not hit and approver is not None:
@@ -1171,7 +1173,11 @@ async def _aprocess_tool_use(
                 kind="approval",
                 payload={"tool": call.name, "arguments": call.arguments},
             )
-            decision = bool(await asyncio.to_thread(approver, interrupt))
+            raw = await asyncio.to_thread(approver, interrupt)
+            if isinstance(raw, ApprovalReply):
+                decision, message = raw.allow, raw.message
+            else:
+                decision = bool(raw)
             if run_id is not None:
                 await worker_for(runs.open_default()).call(
                     "journal_put",
@@ -1195,7 +1201,7 @@ async def _aprocess_tool_use(
                     pause_exc = exc
                 continue
         else:
-            results[call.id] = _deny_tool_call(call)
+            results[call.id] = _deny_tool_call(call, message)
 
     if pause_exc is not None:
         if run_id is not None:
@@ -1335,7 +1341,7 @@ def _run_agent(
     budget: Budget | None = None,
     system_override: str | None = None,
     model_override: str | Model | None = None,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
     cancel: threading.Event | None = None,
@@ -1414,7 +1420,7 @@ async def _arun_agent(
     budget: Budget | None = None,
     system_override: str | None = None,
     model_override: str | Model | None = None,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
@@ -1501,7 +1507,7 @@ async def _arun_agent_on_callers_loop(
     budget: Budget | None = None,
     system_override: str | None = None,
     model_override: str | Model | None = None,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
@@ -1586,7 +1592,7 @@ def _run_agent_journaled(
     budget: Budget | None,
     system_override: str | None = None,
     model_override: str | Model | None = None,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
     cancel: threading.Event | None = None,
@@ -1658,7 +1664,7 @@ async def _arun_agent_journaled(
     budget: Budget | None,
     system_override: str | None = None,
     model_override: str | Model | None = None,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
@@ -1742,7 +1748,7 @@ def resume_standalone_agent(
     answers: dict[str, Any] | None = None,
     budget: Budget | None = None,
     *,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Resume a paused (or crashed) standalone ``@agent`` run.
@@ -1847,7 +1853,7 @@ async def aresume_standalone_agent(
     answers: dict[str, Any] | None = None,
     budget: Budget | None = None,
     *,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Async twin of :func:`resume_standalone_agent` (v0.4.0 Plan B, Task 7)
@@ -1938,7 +1944,7 @@ def _run_agent_uncached(
     step_key: str | None = None,
     system_override: str | None = None,
     model_override: str | Model | None = None,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
     cancel: threading.Event | None = None,
@@ -1991,7 +1997,7 @@ async def _arun_agent_uncached(
     step_key: str | None = None,
     system_override: str | None = None,
     model_override: str | Model | None = None,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
     cancel: threading.Event | None = None,
@@ -2334,7 +2340,7 @@ def _stream_agent(
     budget: Budget | None = None,
     system_override: str | None = None,
     model_override: str | Model | None = None,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> RunStream:
@@ -2415,7 +2421,7 @@ def _astream_agent(
     budget: Budget | None = None,
     system_override: str | None = None,
     model_override: str | Model | None = None,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> AsyncRunStream:

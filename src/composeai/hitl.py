@@ -48,6 +48,25 @@ class Interrupt(BaseModel):
     payload: Any = None
 
 
+class ApprovalReply(BaseModel):
+    """A structured approver reply that can carry a denial message.
+
+    Returned (instead of a bare ``bool``) from an ``approver=`` callable for
+    an approval-gated ``@tool`` call. ``allow`` decides whether the call runs;
+    when a denial (``allow=False``) supplies a ``message``, the agent sees that
+    text as the denied tool's result instead of the default ``"denied by
+    user"`` -- a live-approver-only channel for feedback (a resumed/journaled
+    denial has no message; see ``_aprocess_tool_use``). A plain ``True``/
+    ``False`` return stays fully supported and behaves identically. For an
+    allow, ``message`` is currently ignored (only denials carry feedback).
+    """
+
+    model_config = ConfigDict(frozen=True)
+
+    allow: bool
+    message: str | None = None
+
+
 class _Pause(BaseException):
     """Internal control-flow signal carrying the :class:`Interrupt` that caused it.
 
@@ -110,4 +129,4 @@ def ask_human(id: str, question: str, payload: Any = None) -> Any:
         raise _Pause(Interrupt(id=id, kind="question", question=question, payload=payload))
 
 
-__all__ = ["Interrupt", "approve", "ask_human"]
+__all__ = ["ApprovalReply", "Interrupt", "approve", "ask_human"]

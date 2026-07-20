@@ -63,7 +63,7 @@ from .runs import (
 from .runs import open_default as _open_default_store
 
 if TYPE_CHECKING:
-    from .hitl import Interrupt
+    from .hitl import ApprovalReply, Interrupt
     from .messages import Message
 
 # --- typing: `Task[P, R]` / `Flow[P, R]` generics (v0.5.0 Plan B, Task 5) -----
@@ -1022,7 +1022,7 @@ def resume(
     *,
     budget: Budget | None = None,
     allow_code_change: bool = False,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Resume a durable run (``@flow`` or standalone ``@agent``) by ``run_id``.
@@ -1141,7 +1141,7 @@ async def aresume(
     *,
     budget: Budget | None = None,
     allow_code_change: bool = False,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Async twin of :func:`resume` (v0.4.0 Plan B, Task 7) -- same

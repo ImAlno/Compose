@@ -45,7 +45,12 @@ c = compose.chat(buddy, approver=ask, context_manager=compact,
 ```
 
 - `approver=` is called synchronously for `requires_approval` tools instead of
-  pausing; return `True`/`False`. Without it, a gated send returns a paused
+  pausing; return `True`/`False`, or an `ApprovalReply(allow: bool, message:
+  str | None = None)` — a denial with a `message` is shown to the agent as
+  the denied tool's result instead of the default `"denied by user"`. This
+  is **live-approver only**: a paused `resume({"tool:<name>:<call_id>":
+  False})` denial is journaled as a plain `bool` and always falls back to
+  `"denied by user"`. Without it, a gated send returns a paused
   `Run` — answer via `c.resume({"tool:<name>:<call_id>": True})`.
 - `context_manager=` receives `(messages, last_input_tokens)` before every
   provider call; whatever it returns is what gets sent (and becomes the

@@ -22,7 +22,7 @@ from .flow import resume as _resume
 from .messages import Message
 
 if TYPE_CHECKING:
-    from .hitl import Interrupt
+    from .hitl import ApprovalReply, Interrupt
     from .models.base import Model
     from .runs import Budget, Run
 
@@ -44,7 +44,7 @@ class Chat:
         messages: list[Message] | None = None,
         system: str | None = None,
         model: str | Model | None = None,
-        approver: Callable[[Interrupt], bool] | None = None,
+        approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
         context_manager: Callable[[list[Message], int], list[Message]] | None = None,
         created_at: float | None = None,
     ) -> None:
@@ -184,7 +184,7 @@ def chat(
     *,
     system: str | None = None,
     model: str | Model | None = None,
-    approver: Callable[[Interrupt], bool] | None = None,
+    approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Chat:
     """Start a new persistent chat over an @agent function."""

@@ -166,7 +166,16 @@ Cancellation is cooperative, not preemptive: a tool call already executing runs 
 
 - `system=` replaces the agent's docstring/system prompt for this run.
 - `model=` swaps the model (a `"provider/model-id"` string or a `Model` instance).
-- `approver=` is called synchronously for `requires_approval` tools instead of pausing — return `True`/`False`.
+- `approver=` is called synchronously for `requires_approval` tools instead of pausing — return `True`/`False`, or an `ApprovalReply(allow: bool, message: str | None = None)` for finer control. A denial with a `message` (`ApprovalReply(allow=False, message="…")`) is shown to the agent as the denied tool's result **in place of** the default `"denied by user"`, so the agent can adapt; a bare `False` (or `ApprovalReply(allow=False)` with no message) still yields `"denied by user"`. `ApprovalReply(allow=True, …)` runs the tool — the message is ignored for an allow. **Live-approver only:** the message is available only when an inline `approver=` is consulted synchronously; a pause→`resume(..., {id: False})` denial reads the journaled `bool` and falls back to `"denied by user"`, since the durably stored answer is a plain `bool` by design.
+
+  ```python
+  def approver(interrupt):
+      if is_risky(interrupt):
+          return ApprovalReply(allow=False, message="Use the read-only variant instead.")
+      return True
+
+  run = my_agent.run(approver=approver)
+  ```
 - `context_manager=` receives `(messages, last_input_tokens)` before every provider call and returns the messages actually sent.
 
 These are the same four knobs `compose.chat` takes; see [chats](chats.md) for the full semantics of `approver=` and `context_manager=`.
