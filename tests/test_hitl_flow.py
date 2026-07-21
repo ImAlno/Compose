@@ -361,7 +361,7 @@ def test_resume_rejects_callbacks_for_flow_runs():
 
     with pytest.raises(
         ConfigError,
-        match="approver= and context_manager= apply only to standalone agent runs",
+        match="apply only to standalone agent runs",
     ):
         resume(run.id, {"publish": True}, context_manager=lambda messages, tokens: messages)
 

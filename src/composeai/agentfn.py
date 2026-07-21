@@ -43,6 +43,7 @@ from .errors import (
     ProviderError,
 )
 from .hitl import ApprovalReply, Interrupt, _Pause
+from .interception import BeforeTool, ToolInterceptor
 from .messages import Message, StopReason, ToolCallPart, ToolResultPart, Usage
 from .models import registry
 from .models.base import Model, ModelRequest, ModelResponse, ToolSpec
@@ -201,6 +202,7 @@ class AgentFunction(Generic[P, R]):
         system: str | None = None,
         model: str | Model | None = None,
         approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+        tool_interceptor: ToolInterceptor | None = None,
         context_manager: Callable[[list[Message], int], list[Message]] | None = None,
         **kwargs: Any,
     ) -> Run[R]:
@@ -212,6 +214,7 @@ class AgentFunction(Generic[P, R]):
             system_override=system,
             model_override=model,
             approver=approver,
+            tool_interceptor=tool_interceptor,
             context_manager=context_manager,
         )
 
@@ -222,6 +225,7 @@ class AgentFunction(Generic[P, R]):
         system: str | None = None,
         model: str | Model | None = None,
         approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+        tool_interceptor: ToolInterceptor | None = None,
         context_manager: Callable[[list[Message], int], list[Message]] | None = None,
         **kwargs: Any,
     ) -> Run[R]:
@@ -233,6 +237,7 @@ class AgentFunction(Generic[P, R]):
             system_override=system,
             model_override=model,
             approver=approver,
+            tool_interceptor=tool_interceptor,
             context_manager=context_manager,
         )
 
@@ -243,6 +248,7 @@ class AgentFunction(Generic[P, R]):
         system: str | None = None,
         model: str | Model | None = None,
         approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+        tool_interceptor: ToolInterceptor | None = None,
         context_manager: Callable[[list[Message], int], list[Message]] | None = None,
         **kwargs: Any,
     ) -> RunStream[R]:
@@ -254,6 +260,7 @@ class AgentFunction(Generic[P, R]):
             system_override=system,
             model_override=model,
             approver=approver,
+            tool_interceptor=tool_interceptor,
             context_manager=context_manager,
         )
 
@@ -264,6 +271,7 @@ class AgentFunction(Generic[P, R]):
         system: str | None = None,
         model: str | Model | None = None,
         approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+        tool_interceptor: ToolInterceptor | None = None,
         context_manager: Callable[[list[Message], int], list[Message]] | None = None,
         **kwargs: Any,
     ) -> AsyncRunStream[R]:
@@ -275,6 +283,7 @@ class AgentFunction(Generic[P, R]):
             system_override=system,
             model_override=model,
             approver=approver,
+            tool_interceptor=tool_interceptor,
             context_manager=context_manager,
         )
 
@@ -1022,6 +1031,27 @@ async def _aexecute_one_tool(agent_fn: AgentFunction, call: ToolCallPart) -> Too
     return ToolResultPart(tool_call_id=call.id, content=content)
 
 
+async def _aexecute_with_after(
+    agent_fn: AgentFunction,
+    call: ToolCallPart,
+    interceptor: ToolInterceptor | None,
+) -> ToolResultPart:
+    """Run one tool call, then let ``interceptor.after`` optionally replace its result.
+
+    A non-``None`` return from ``after`` (a fresh ``ToolResultPart``) replaces
+    the live result; ``None`` (or no interceptor) leaves it unchanged. Only
+    wraps the live execution path -- results already present from a resumed
+    run's ``seed_results`` never reach this function, so ``after`` does not
+    re-fire for tools that executed before a pause.
+    """
+    result = await _aexecute_one_tool(agent_fn, call)
+    if interceptor is not None:
+        replaced = interceptor.after(call, result)
+        if replaced is not None:
+            return replaced
+    return result
+
+
 def _tool_requires_approval(agent_fn: AgentFunction, call: ToolCallPart) -> bool:
     tool_obj = agent_fn._tools_by_name.get(call.name)
     return tool_obj is not None and tool_obj.spec.requires_approval
@@ -1036,6 +1066,35 @@ def _deny_tool_call(call: ToolCallPart, message: str | None = None) -> ToolResul
     with tracing.span("tool", call.name, input=call.arguments) as tool_span:
         tool_span.set_output(content)
     return ToolResultPart(tool_call_id=call.id, content=content, is_error=True)
+
+
+def _apply_tool_before(
+    interceptor: ToolInterceptor,
+    calls: list[ToolCallPart],
+    results: dict[str, ToolResultPart],
+) -> list[ToolCallPart]:
+    """Run interceptor.before over each not-yet-resolved call.
+
+    A deny seeds a denied ``ToolResultPart`` into ``results`` (both the normal
+    fan-out and the approval loop skip calls already in ``results``). A proceed
+    with modified ``arguments`` replaces the frozen call. Returns the (possibly
+    rewritten) call list.
+    """
+    out: list[ToolCallPart] = []
+    for call in calls:
+        if call.id in results:
+            out.append(call)
+            continue
+        before: BeforeTool | None = interceptor.before(call)
+        if before is None or before.action == "proceed":
+            if before is not None and before.arguments is not None:
+                call = call.model_copy(update={"arguments": before.arguments})
+            out.append(call)
+        else:  # deny
+            message = before.message or "blocked by tool interceptor"
+            results[call.id] = _deny_tool_call(call, message)
+            out.append(call)
+    return out
 
 
 def _pause_for_unanswered_approval(call: ToolCallPart) -> _Pause:
@@ -1073,6 +1132,7 @@ async def _aprocess_tool_use(
     seed_results: dict[str, ToolResultPart] | None = None,
     *,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     cancel: threading.Event | None = None,
 ) -> Message:
     """Execute one tool-call batch, pausing if an approval-gated call is
@@ -1127,6 +1187,12 @@ async def _aprocess_tool_use(
     normal_calls = [c for c in calls if c.id not in approval_ids and c.id not in results]
     approval_calls = [c for c in calls if c.id in approval_ids]
 
+    if tool_interceptor is not None:
+        calls = _apply_tool_before(tool_interceptor, calls, results)
+        approval_ids = {call.id for call in calls if _tool_requires_approval(agent_fn, call)}
+        normal_calls = [c for c in calls if c.id not in approval_ids and c.id not in results]
+        approval_calls = [c for c in calls if c.id in approval_ids]
+
     pause_exc: _Pause | None = None
     pending_interrupts: list[Interrupt] = []
 
@@ -1137,7 +1203,11 @@ async def _aprocess_tool_use(
         ) -> tuple[str, ToolResultPart | None, BaseException | None]:
             try:
                 with runs.push_scope(f"tool:{call.id}"):
-                    return call.id, await _aexecute_one_tool(agent_fn, call), None
+                    return (
+                        call.id,
+                        await _aexecute_with_after(agent_fn, call, tool_interceptor),
+                        None,
+                    )
             except BaseException as exc:  # noqa: BLE001 -- _Pause (or worse) settled below
                 return call.id, None, exc
 
@@ -1195,7 +1265,7 @@ async def _aprocess_tool_use(
         if bool(value):
             try:
                 with runs.push_scope(f"tool:{call.id}"):
-                    results[call.id] = await _aexecute_one_tool(agent_fn, call)
+                    results[call.id] = await _aexecute_with_after(agent_fn, call, tool_interceptor)
             except _Pause as exc:
                 if pause_exc is None:
                     pause_exc = exc
@@ -1342,6 +1412,7 @@ def _run_agent(
     system_override: str | None = None,
     model_override: str | Model | None = None,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
     cancel: threading.Event | None = None,
@@ -1368,6 +1439,7 @@ def _run_agent(
             system_override=system_override,
             model_override=model_override,
             approver=approver,
+            tool_interceptor=tool_interceptor,
             context_manager=context_manager,
             seed_conversation=seed_conversation,
             cancel=cancel,
@@ -1389,6 +1461,7 @@ def _run_agent(
                 system_override=system_override,
                 model_override=model_override,
                 approver=approver,
+                tool_interceptor=tool_interceptor,
                 context_manager=context_manager,
                 seed_conversation=seed_conversation,
                 cancel=cancel,
@@ -1405,6 +1478,7 @@ def _run_agent(
         system_override=system_override,
         model_override=model_override,
         approver=approver,
+        tool_interceptor=tool_interceptor,
         context_manager=context_manager,
         seed_conversation=seed_conversation,
         cancel=cancel,
@@ -1421,6 +1495,7 @@ async def _arun_agent(
     system_override: str | None = None,
     model_override: str | Model | None = None,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
@@ -1458,6 +1533,7 @@ async def _arun_agent(
             system_override=system_override,
             model_override=model_override,
             approver=approver,
+            tool_interceptor=tool_interceptor,
             context_manager=context_manager,
             seed_conversation=seed_conversation,
         )
@@ -1478,6 +1554,7 @@ async def _arun_agent(
                 system_override=system_override,
                 model_override=model_override,
                 approver=approver,
+                tool_interceptor=tool_interceptor,
                 context_manager=context_manager,
                 seed_conversation=seed_conversation,
             ),
@@ -1493,6 +1570,7 @@ async def _arun_agent(
         system_override=system_override,
         model_override=model_override,
         approver=approver,
+        tool_interceptor=tool_interceptor,
         context_manager=context_manager,
         seed_conversation=seed_conversation,
     )
@@ -1508,6 +1586,7 @@ async def _arun_agent_on_callers_loop(
     system_override: str | None = None,
     model_override: str | Model | None = None,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
@@ -1542,6 +1621,7 @@ async def _arun_agent_on_callers_loop(
             system_override=system_override,
             model_override=model_override,
             approver=approver,
+            tool_interceptor=tool_interceptor,
             context_manager=context_manager,
             seed_conversation=seed_conversation,
         )
@@ -1562,6 +1642,7 @@ async def _arun_agent_on_callers_loop(
                 system_override=system_override,
                 model_override=model_override,
                 approver=approver,
+                tool_interceptor=tool_interceptor,
                 context_manager=context_manager,
                 seed_conversation=seed_conversation,
             ),
@@ -1577,6 +1658,7 @@ async def _arun_agent_on_callers_loop(
         system_override=system_override,
         model_override=model_override,
         approver=approver,
+        tool_interceptor=tool_interceptor,
         context_manager=context_manager,
         seed_conversation=seed_conversation,
     )
@@ -1593,6 +1675,7 @@ def _run_agent_journaled(
     system_override: str | None = None,
     model_override: str | Model | None = None,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
     cancel: threading.Event | None = None,
@@ -1645,6 +1728,7 @@ def _run_agent_journaled(
         system_override=system_override,
         model_override=model_override,
         approver=approver,
+        tool_interceptor=tool_interceptor,
         context_manager=context_manager,
         seed_conversation=seed_conversation,
         cancel=cancel,
@@ -1665,6 +1749,7 @@ async def _arun_agent_journaled(
     system_override: str | None = None,
     model_override: str | Model | None = None,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> Run[Any]:
@@ -1734,6 +1819,7 @@ async def _arun_agent_journaled(
         system_override=system_override,
         model_override=model_override,
         approver=approver,
+        tool_interceptor=tool_interceptor,
         context_manager=context_manager,
         seed_conversation=seed_conversation,
     )
@@ -1749,6 +1835,7 @@ def resume_standalone_agent(
     budget: Budget | None = None,
     *,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Resume a paused (or crashed) standalone ``@agent`` run.
@@ -1842,6 +1929,7 @@ def resume_standalone_agent(
                 system_override=saved_system,
                 model_override=saved_model,
                 approver=approver,
+                tool_interceptor=tool_interceptor,
                 context_manager=context_manager,
             ),
         )
@@ -1854,6 +1942,7 @@ async def aresume_standalone_agent(
     budget: Budget | None = None,
     *,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Async twin of :func:`resume_standalone_agent` (v0.4.0 Plan B, Task 7)
@@ -1927,6 +2016,7 @@ async def aresume_standalone_agent(
                 system_override=saved_system,
                 model_override=saved_model,
                 approver=approver,
+                tool_interceptor=tool_interceptor,
                 context_manager=context_manager,
             ),
         )
@@ -1945,6 +2035,7 @@ def _run_agent_uncached(
     system_override: str | None = None,
     model_override: str | Model | None = None,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
     cancel: threading.Event | None = None,
@@ -1978,6 +2069,7 @@ def _run_agent_uncached(
             system_override=system_override,
             model_override=model_override,
             approver=approver,
+            tool_interceptor=tool_interceptor,
             context_manager=context_manager,
             seed_conversation=seed_conversation,
             cancel=cancel,
@@ -1998,6 +2090,7 @@ async def _arun_agent_uncached(
     system_override: str | None = None,
     model_override: str | Model | None = None,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
     cancel: threading.Event | None = None,
@@ -2082,6 +2175,7 @@ async def _arun_agent_uncached(
                         scope_key,
                         seed_results=restored.partial_results,
                         approver=approver,
+                        tool_interceptor=tool_interceptor,
                         cancel=cancel,
                     )
                     conversation.append(tool_message)
@@ -2157,6 +2251,7 @@ async def _arun_agent_uncached(
                         run_id,
                         scope_key,
                         approver=approver,
+                        tool_interceptor=tool_interceptor,
                         cancel=cancel,
                     )
                     conversation.append(tool_message)
@@ -2341,6 +2436,7 @@ def _stream_agent(
     system_override: str | None = None,
     model_override: str | Model | None = None,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> RunStream:
@@ -2355,6 +2451,7 @@ def _stream_agent(
             system_override=system_override,
             model_override=model_override,
             approver=approver,
+            tool_interceptor=tool_interceptor,
             context_manager=context_manager,
             seed_conversation=seed_conversation,
             cancel=cancel,
@@ -2422,6 +2519,7 @@ def _astream_agent(
     system_override: str | None = None,
     model_override: str | Model | None = None,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
     seed_conversation: list[Message] | None = None,
 ) -> AsyncRunStream:
@@ -2435,6 +2533,7 @@ def _astream_agent(
             system_override=system_override,
             model_override=model_override,
             approver=approver,
+            tool_interceptor=tool_interceptor,
             context_manager=context_manager,
             seed_conversation=seed_conversation,
         )

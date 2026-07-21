@@ -23,6 +23,7 @@ from .messages import Message
 
 if TYPE_CHECKING:
     from .hitl import ApprovalReply, Interrupt
+    from .interception import ToolInterceptor
     from .models.base import Model
     from .runs import Budget, Run
 
@@ -45,6 +46,7 @@ class Chat:
         system: str | None = None,
         model: str | Model | None = None,
         approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+        tool_interceptor: ToolInterceptor | None = None,
         context_manager: Callable[[list[Message], int], list[Message]] | None = None,
         created_at: float | None = None,
     ) -> None:
@@ -54,6 +56,7 @@ class Chat:
         self._system = system
         self._model = model
         self._approver = approver
+        self._tool_interceptor = tool_interceptor
         self._context_manager = context_manager
         self._created_at = created_at if created_at is not None else time.time()
         self._pending: Interrupt | None = None
@@ -77,6 +80,7 @@ class Chat:
             system_override=self._system,
             model_override=self._model,
             approver=self._approver,
+            tool_interceptor=self._tool_interceptor,
             context_manager=self._context_manager,
             seed_conversation=seed,
         )
@@ -97,6 +101,7 @@ class Chat:
             answers,
             budget=budget,
             approver=self._approver,
+            tool_interceptor=self._tool_interceptor,
             context_manager=self._context_manager,
         )
         self._absorb(run)
@@ -112,6 +117,7 @@ class Chat:
             system_override=self._system,
             model_override=self._model,
             approver=self._approver,
+            tool_interceptor=self._tool_interceptor,
             context_manager=self._context_manager,
             seed_conversation=seed,
         )
@@ -185,6 +191,7 @@ def chat(
     system: str | None = None,
     model: str | Model | None = None,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Chat:
     """Start a new persistent chat over an @agent function."""
@@ -193,6 +200,7 @@ def chat(
         system=system,
         model=model,
         approver=approver,
+        tool_interceptor=tool_interceptor,
         context_manager=context_manager,
     )
 

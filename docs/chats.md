@@ -52,14 +52,21 @@ c = compose.chat(buddy, approver=ask, context_manager=compact,
   False})` denial is journaled as a plain `bool` and always falls back to
   `"denied by user"`. Without it, a gated send returns a paused
   `Run` — answer via `c.resume({"tool:<name>:<call_id>": True})`.
+- `tool_interceptor=` is a `composeai.ToolInterceptor` with `before(call)`/
+  `after(call, result)` hooks that fire around every tool call, before the
+  approver; see [agents](agents.md#per-call-overrides) for the full contract.
+  Like `approver=`, it is not journaled, but the chat carries it through
+  `c.resume(...)` automatically (see below), so it keeps firing on turns after
+  a pause.
 - `context_manager=` receives `(messages, last_input_tokens)` before every
   provider call; whatever it returns is what gets sent (and becomes the
   ongoing history — compaction persists).
-- `c.resume(...)` re-supplies the chat's `approver`/`context_manager` to the
-  resumed run, so inline approval and compaction keep working on every turn
-  after a pause, not just the ones before it.
+- `c.resume(...)` re-supplies the chat's `approver`/`tool_interceptor`/
+  `context_manager` to the resumed run, so inline approval, interception,
+  and compaction keep working on every turn after a pause, not just the
+  ones before it.
 - `system=`/`model=` override the decoration defaults for this chat only.
-  All four are also accepted directly by `.run()`/`.stream()` on any agent.
+  All five are also accepted directly by `.run()`/`.stream()` on any agent.
 
 ## Streaming
 

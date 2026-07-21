@@ -11,22 +11,25 @@ from .chat import Chat, chat, load_chat
 from .combinators import MapResult, aggregate, amap, map, pipe
 from .flow import anow, arandom, aresume, flow, now, random, resume, task
 from .hitl import ApprovalReply, Interrupt, approve, ask_human
+from .interception import BeforeTool, ToolInterceptor
 from .mcp import mcp_tools
 from .models.compatible import openai_compatible
 from .models.prices import ModelPrice, register_price
 from .runs import Budget, Run
 from .tools import tool
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"
 
 __all__ = [
     "ApprovalReply",
+    "BeforeTool",
     "Budget",
     "Chat",
     "Interrupt",
     "MapResult",
     "ModelPrice",
     "Run",
+    "ToolInterceptor",
     "agent",
     "aggregate",
     "amap",

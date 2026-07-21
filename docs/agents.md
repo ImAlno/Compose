@@ -162,7 +162,7 @@ Cancellation is cooperative, not preemptive: a tool call already executing runs 
 
 ## Per-call overrides
 
-`.run()`, `.arun()`, `.stream()`, and `.astream()` all accept four keyword-only overrides, applied to that one call without touching the decoration:
+`.run()`, `.arun()`, `.stream()`, and `.astream()` all accept five keyword-only overrides, applied to that one call without touching the decoration:
 
 - `system=` replaces the agent's docstring/system prompt for this run.
 - `model=` swaps the model (a `"provider/model-id"` string or a `Model` instance).
@@ -176,9 +176,22 @@ Cancellation is cooperative, not preemptive: a tool call already executing runs 
 
   run = my_agent.run(approver=approver)
   ```
+- `tool_interceptor=` is a `composeai.ToolInterceptor` — an object with `before(call) -> BeforeTool | None` and `after(call, result) -> ToolResultPart | None` — that fires around **every** tool call, gated or not, before the approver even sees it. `before` returning `None` (or a default `BeforeTool()`) proceeds unchanged; `BeforeTool(arguments={...})` proceeds with modified arguments; `BeforeTool(action="deny", message="...")` skips both execution and the approver, feeding `message` back as the denied tool's error result. `after` returning `None` leaves the tool's result unchanged; returning a `ToolResultPart` replaces it. `None` (the default) is a complete no-op — byte-identical behavior to not passing `tool_interceptor=` at all. It is **not journaled**: on a resumed run, `after` does not re-fire for tools that already executed before the pause, and the interceptor itself is re-supplied to the free `resume(run_id, answers, tool_interceptor=…)` to keep firing on the newly-answered calls (a `Chat` carries its own construction-time `tool_interceptor` through `c.resume()` automatically — that method takes no `tool_interceptor` argument).
+
+  ```python
+  class AuditingInterceptor:
+      def before(self, call):
+          return None  # inspect, but don't change anything
+
+      def after(self, call, result):
+          log(call.name, result.content)
+          return None
+
+  run = my_agent.run(tool_interceptor=AuditingInterceptor())
+  ```
 - `context_manager=` receives `(messages, last_input_tokens)` before every provider call and returns the messages actually sent.
 
-These are the same four knobs `compose.chat` takes; see [chats](chats.md) for the full semantics of `approver=` and `context_manager=`.
+These are the same five knobs `compose.chat` takes; see [chats](chats.md) for the full semantics of `approver=`, `tool_interceptor=`, and `context_manager=`.
 
 ## `.arun()` and `.astream()`
 

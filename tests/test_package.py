@@ -4,7 +4,7 @@ from composeai.testing import FakeModel
 
 
 def test_version():
-    assert composeai.__version__ == "0.10.0"
+    assert composeai.__version__ == "0.11.0"
 
 
 def test_openai_compatible_is_exported():
@@ -59,4 +59,4 @@ def test_chat_surface_is_exported():
     assert "Chat" in composeai.__all__
     assert "chat" in composeai.__all__
     assert "load_chat" in composeai.__all__
-    assert composeai.__version__ == "0.10.0"
+    assert composeai.__version__ == "0.11.0"

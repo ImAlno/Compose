@@ -64,6 +64,7 @@ from .runs import open_default as _open_default_store
 
 if TYPE_CHECKING:
     from .hitl import ApprovalReply, Interrupt
+    from .interception import ToolInterceptor
     from .messages import Message
 
 # --- typing: `Task[P, R]` / `Flow[P, R]` generics (v0.5.0 Plan B, Task 5) -----
@@ -1023,6 +1024,7 @@ def resume(
     budget: Budget | None = None,
     allow_code_change: bool = False,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Resume a durable run (``@flow`` or standalone ``@agent``) by ``run_id``.
@@ -1080,11 +1082,13 @@ def resume(
             budget=budget,
             approver=approver,
             context_manager=context_manager,
+            tool_interceptor=tool_interceptor,
         )
 
-    if approver is not None or context_manager is not None:
+    if approver is not None or context_manager is not None or tool_interceptor is not None:
         raise ConfigError(
-            "approver= and context_manager= apply only to standalone agent runs, not @flow runs"
+            "approver=, context_manager= and tool_interceptor= apply only to "
+            "standalone agent runs, not @flow runs"
         )
 
     flow_obj = _FLOW_REGISTRY.get(row["name"])
@@ -1142,6 +1146,7 @@ async def aresume(
     budget: Budget | None = None,
     allow_code_change: bool = False,
     approver: Callable[[Interrupt], bool | ApprovalReply] | None = None,
+    tool_interceptor: ToolInterceptor | None = None,
     context_manager: Callable[[list[Message], int], list[Message]] | None = None,
 ) -> Run[Any]:
     """Async twin of :func:`resume` (v0.4.0 Plan B, Task 7) -- same
@@ -1178,11 +1183,13 @@ async def aresume(
             budget=budget,
             approver=approver,
             context_manager=context_manager,
+            tool_interceptor=tool_interceptor,
         )
 
-    if approver is not None or context_manager is not None:
+    if approver is not None or context_manager is not None or tool_interceptor is not None:
         raise ConfigError(
-            "approver= and context_manager= apply only to standalone agent runs, not @flow runs"
+            "approver=, context_manager= and tool_interceptor= apply only to "
+            "standalone agent runs, not @flow runs"
         )
 
     flow_obj = _FLOW_REGISTRY.get(row["name"])
